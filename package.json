@@ -1,0 +1,8 @@
+{
+  "name": "nesypapergraph",
+  "scripts": {
+    "start": "cd frontend && npm install && npm start",
+    "install-deps": "cd backend && pip install -r requirements.txt && cd ../frontend && npm install",
+    "dev": "concurrently \"cd backend && uvicorn main:app --reload\" \"cd frontend && npm start\""
+  }
+}
