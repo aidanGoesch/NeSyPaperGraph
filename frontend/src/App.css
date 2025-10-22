@@ -1,88 +1,156 @@
+body {
+  margin: 0;
+  padding: 0;
+}
+
 .app {
   height: 100vh;
   display: flex;
   flex-direction: column;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
-  transition: all 0.3s ease;
+  transition: all 0.5s ease;
 }
 
 .app.light {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: white;
+  color: #333;
 }
 
 .app.dark {
-  background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+  background: #2a2a2a;
+  color: #ccc;
 }
 
 .theme-toggle {
   position: fixed;
-  top: 20px;
-  right: 20px;
+  bottom: 10px;
+  left: 10px;
   z-index: 1000;
 }
 
 .theme-toggle button {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(0, 0, 0, 0.1);
   border: none;
   border-radius: 50%;
-  width: 50px;
-  height: 50px;
-  font-size: 20px;
+  width: 40px;
+  height: 40px;
+  font-size: 16px;
   cursor: pointer;
-  backdrop-filter: blur(10px);
   transition: all 0.3s ease;
 }
 
 .theme-toggle button:hover {
-  background: rgba(255, 255, 255, 0.3);
-  transform: scale(1.1);
+  background: rgba(0, 0, 0, 0.2);
 }
 
 .app-header {
-  padding: 20px;
-  text-align: center;
-  background: rgba(255, 255, 255, 0.1);
-  backdrop-filter: blur(10px);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  height: 60px;
+  padding: 0 20px;
+  background: rgba(0, 0, 0, 0.05);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  position: relative;
+  z-index: 100;
+  transition: all 0.5s ease;
+}
+
+.app.dark .app-header {
+  background: rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .app-header h1 {
   margin: 0;
-  font-size: 2.5rem;
-  font-weight: 300;
-  color: white;
-  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-  letter-spacing: -0.5px;
+  font-size: 1.5rem;
+  font-weight: 500;
+  transition: color 0.5s ease;
+}
+
+.upload-button {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  background: rgba(0, 0, 0, 0.05);
+  color: #333;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  padding: 12px 20px;
+  font-size: 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.5s ease;
+  z-index: 1000;
+}
+
+.app.dark .upload-button {
+  background: rgba(255, 255, 255, 0.05);
+  color: #ccc;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.upload-button:hover {
+  background: rgba(0, 0, 0, 0.1);
+}
+
+.app.dark .upload-button:hover {
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .app-main {
   flex: 1;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  padding: 20px;
   overflow: hidden;
+}
+
+.search-bar {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.05);
+  color: #333;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  padding: 12px 20px;
+  font-size: 14px;
+  border-radius: 6px;
+  width: 300px;
+  transition: all 0.3s ease;
+  z-index: 1000;
+}
+
+.search-bar.expanded {
+  width: 500px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.app.dark .search-bar {
+  background: rgba(255, 255, 255, 0.05);
+  color: #ccc;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.search-bar:focus {
+  outline: none;
+  background: rgba(0, 0, 0, 0.1);
+}
+
+.app.dark .search-bar:focus {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.search-bar::placeholder {
+  color: #999;
+}
+
+.app.dark .search-bar::placeholder {
+  color: #666;
 }
 
 .loading {
-  color: white;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
   font-size: 1.2rem;
-  text-align: center;
-}
-
-.graph-container {
-  width: 100%;
-  height: 100%;
-  border-radius: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-  overflow: hidden;
-  transition: all 0.3s ease;
-}
-
-.light .graph-container {
-  background: rgba(255, 255, 255, 0.95);
-}
-
-.dark .graph-container {
-  background: rgba(30, 30, 30, 0.95);
+  transition: color 0.5s ease;
 }

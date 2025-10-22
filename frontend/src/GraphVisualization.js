@@ -1,42 +1,71 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as d3 from 'd3';
 
-const GraphVisualization = ({ data }) => {
+const GraphVisualization = ({ data, isDarkMode }) => {
   const svgRef = useRef();
   const containerRef = useRef();
   const [selectedPaper, setSelectedPaper] = useState(null);
   const [panelPosition, setPanelPosition] = useState({ x: 0, y: 0 });
   const selectedNodeRef = useRef(null);
+  const simulationRef = useRef(null);
+  const nodesRef = useRef([]);
 
   useEffect(() => {
     if (!data) return;
 
     const container = containerRef.current;
     const svg = d3.select(svgRef.current);
-    svg.selectAll("*").remove();
+    
+    // Only clear if this is the first render or data changed
+    if (!simulationRef.current) {
+      svg.selectAll("*").remove();
+    }
 
     const width = container.clientWidth;
     const height = container.clientHeight;
 
-    svg.attr("width", width).attr("height", height);
+    svg.attr("width", width).attr("height", height)
+      .style("background-color", isDarkMode ? "#2a2a2a" : "white")
+      .style("transition", "background-color 0.5s ease");
+
+    // Update existing elements if simulation exists
+    if (simulationRef.current) {
+      svg.selectAll("line")
+        .transition()
+        .duration(500)
+        .attr("stroke", d => d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000"));
+      
+      svg.selectAll("text")
+        .transition()
+        .duration(500)
+        .attr("fill", isDarkMode ? "#ccc" : "#333");
+      
+      return;
+    }
 
     const nodes = [
       ...data.papers.map(paper => ({ id: paper.title, type: 'paper', ...paper })),
       ...data.topics.map(topic => ({ id: topic, type: 'topic' }))
     ];
 
-    const links = [];
-    data.papers.forEach(paper => {
-      paper.topics.forEach(topic => {
-        links.push({ source: paper.title, target: topic });
+    const links = data.edges || [];
+    // Fallback: if no edges provided, create topic links
+    if (links.length === 0) {
+      data.papers.forEach(paper => {
+        paper.topics.forEach(topic => {
+          links.push({ source: paper.title, target: topic });
+        });
       });
-    });
+    }
 
     const simulation = d3.forceSimulation(nodes)
       .force("link", d3.forceLink(links).id(d => d.id).distance(120))
       .force("charge", d3.forceManyBody().strength(-400))
       .force("center", d3.forceCenter(width / 2, height / 2))
       .force("collision", d3.forceCollide().radius(30));
+
+    simulationRef.current = simulation;
+    nodesRef.current = nodes;
 
     const g = svg.append("g");
 
@@ -56,9 +85,16 @@ const GraphVisualization = ({ data }) => {
       .selectAll("line")
       .data(links)
       .enter().append("line")
-      .attr("stroke", "#999")
-      .attr("stroke-width", 2)
-      .attr("stroke-opacity", 0.6);
+      .attr("stroke", d => d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000"))
+      .attr("stroke-width", d => d.type === 'semantic' ? ((d.weight - 0.25) * 5) : 5)
+      .attr("stroke-opacity", 0.6)
+      .style("cursor", d => d.type === 'semantic' ? "pointer" : "default")
+      .on("click", function(event, d) {
+        if (d.type === 'semantic') {
+          event.stopPropagation();
+          alert(`Semantic connection between "${d.source.id || d.source}" and "${d.target.id || d.target}" (similarity: ${d.weight?.toFixed(3) || 'N/A'})`);
+        }
+      });
 
     const node = g.append("g")
       .selectAll("circle")
@@ -116,10 +152,11 @@ const GraphVisualization = ({ data }) => {
       .text(d => d.id)
       .attr("font-size", 12)
       .attr("font-family", "Arial, sans-serif")
-      .attr("fill", "#333")
+      .attr("fill", isDarkMode ? "#ccc" : "#333")
       .attr("text-anchor", "middle")
       .attr("dy", -20)
-      .style("pointer-events", "none");
+      .style("pointer-events", "none")
+      .style("transition", "fill 0.5s ease");
 
     simulation.on("tick", () => {
       link
@@ -181,8 +218,27 @@ const GraphVisualization = ({ data }) => {
     };
 
     window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (simulationRef.current) {
+        simulationRef.current.stop();
+      }
+    };
   }, [data]);
+
+  // Separate effect for theme changes
+  useEffect(() => {
+    if (!simulationRef.current) return;
+    
+    const svg = d3.select(svgRef.current);
+    svg.style("background-color", isDarkMode ? "#2a2a2a" : "white");
+    
+    svg.selectAll("line")
+      .attr("stroke", d => d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000"));
+    
+    svg.selectAll("text")
+      .attr("fill", isDarkMode ? "#ccc" : "#333");
+  }, [isDarkMode]);
 
 
 

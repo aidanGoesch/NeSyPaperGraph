@@ -53,17 +53,29 @@ class GraphBuilder:
 
 
 def create_dummy_graph() -> PaperGraph:
-    """Creates a dummy graph with 3 topics and 5 papers"""
+    """Creates a dummy graph with semantically similar papers"""
+    
+    # Create similar embeddings for papers that should be semantically related
+    similar_embedding_1 = [0.8, 0.6, 0.2, 0.1, 0.3]
+    similar_embedding_2 = [0.85, 0.65, 0.25, 0.15, 0.35]  # Very similar to embedding_1
+    
     papers = [
-        Paper(title="Paper A", file_path="path/a.pdf", text="text", topics=["Topic 1", "Topic 2"]),
-        Paper(title="Paper B", file_path="path/b.pdf", text="text", topics=["Topic 1"]),
-        Paper(title="Paper C", file_path="path/c.pdf", text="text", topics=["Topic 2", "Topic 3"]),
-        Paper(title="Paper D", file_path="path/d.pdf", text="text", topics=["Topic 3"]),
-        Paper(title="Paper E", file_path="path/e.pdf", text="text", topics=["Topic 1", "Topic 3"])
+        Paper(title="Neural Networks in AI", file_path="path/a.pdf", text="Deep learning and neural networks", 
+              topics=["Machine Learning", "AI"], embedding=similar_embedding_1),
+        Paper(title="Deep Learning Applications", file_path="path/b.pdf", text="Applications of deep learning", 
+              topics=["Machine Learning"], embedding=similar_embedding_2),
+        Paper(title="Quantum Computing", file_path="path/c.pdf", text="Quantum algorithms and computing", 
+              topics=["Quantum Physics", "Computing"], embedding=[0.1, 0.2, 0.9, 0.8, 0.1]),
+        Paper(title="Blockchain Security", file_path="path/d.pdf", text="Distributed ledger security", 
+              topics=["Cryptography", "Cyber Security"], embedding=[0.3, 0.1, 0.4, 0.7, 0.9]),
+        Paper(title="Computer Vision", file_path="path/e.pdf", text="Image processing and recognition", 
+              topics=["Machine Learning", "Computer Vision"], embedding=[0.7, 0.5, 0.3, 0.2, 0.4])
     ]
     
     graph = PaperGraph()
     for paper in papers:
         graph.add_paper(paper)
+    
+    graph.add_semantic_edges()
     
     return graph

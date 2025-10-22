@@ -11,6 +11,7 @@ def get_dummy_graph():
     # Extract papers and topics from NetworkX graph
     papers = []
     topics = set()
+    edges = []
     
     for node, data in graph.graph.nodes(data=True):
         if data.get('type') == 'paper':
@@ -23,7 +24,17 @@ def get_dummy_graph():
         elif data.get('type') == 'topic':
             topics.add(node)
     
+    # Extract all edges
+    for source, target, edge_data in graph.graph.edges(data=True):
+        edges.append({
+            "source": source,
+            "target": target,
+            "type": edge_data.get('type', 'topic'),
+            "weight": edge_data.get('weight', 1.0)
+        })
+    
     return {
         "papers": papers,
-        "topics": list(topics)
+        "topics": list(topics),
+        "edges": edges
     }
