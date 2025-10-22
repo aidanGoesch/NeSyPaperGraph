@@ -5,18 +5,24 @@ function App() {
   const [graphData, setGraphData] = useState(null);
 
   useEffect(() => {
-    // Create fully connected graph - every paper connects to every topic
-    const dummyData = {
-      papers: [
-        { title: "Paper A", topics: ["Topic 1", "Topic 2", "Topic 3"] },
-        { title: "Paper B", topics: ["Topic 1", "Topic 2", "Topic 3"] },
-        { title: "Paper C", topics: ["Topic 1", "Topic 2", "Topic 3"] },
-        { title: "Paper D", topics: ["Topic 1", "Topic 2", "Topic 3"] },
-        { title: "Paper E", topics: ["Topic 1", "Topic 2", "Topic 3"] }
-      ],
-      topics: ["Topic 1", "Topic 2", "Topic 3"]
-    };
-    setGraphData(dummyData);
+    fetch('http://localhost:8000/api/graph/dummy')
+      .then(response => response.json())
+      .then(data => setGraphData(data))
+      .catch(error => {
+        console.error('Error:', error);
+        // Fallback to dummy data if backend is not running
+        const fallbackData = {
+          papers: [
+            { title: "Paper A", topics: ["Topic 1", "Topic 2", "Topic 3"] },
+            { title: "Paper B", topics: ["Topic 1", "Topic 2", "Topic 3"] },
+            { title: "Paper C", topics: ["Topic 1", "Topic 2", "Topic 3"] },
+            { title: "Paper D", topics: ["Topic 1", "Topic 2", "Topic 3"] },
+            { title: "Paper E", topics: ["Topic 1", "Topic 2", "Topic 3"] }
+          ],
+          topics: ["Topic 1", "Topic 2", "Topic 3"]
+        };
+        setGraphData(fallbackData);
+      });
   }, []);
 
   return (

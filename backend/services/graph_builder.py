@@ -1,8 +1,8 @@
-from ..models.graph import PaperGraph
-from ..models.paper import Paper
-from ..models.topic import Topic
-from .llm_service import TopicExtractor, HuggingFaceLLMClient
-from .pdf_preprocessor import extract_text_from_pdf
+from models.graph import PaperGraph
+from models.paper import Paper
+from models.topic import Topic
+from services.llm_service import TopicExtractor, HuggingFaceLLMClient
+from services.pdf_preprocessor import extract_text_from_pdf
 import os
 from pathlib import Path
 
@@ -55,11 +55,11 @@ class GraphBuilder:
 def create_dummy_graph() -> PaperGraph:
     """Creates a dummy graph with 3 topics and 5 papers"""
     papers = [
-        Paper("Paper A", "path/a.pdf", "text", ["Topic 1", "Topic 2"]),
-        Paper("Paper B", "path/b.pdf", "text", ["Topic 1"]),
-        Paper("Paper C", "path/c.pdf", "text", ["Topic 2", "Topic 3"]),
-        Paper("Paper D", "path/d.pdf", "text", ["Topic 3"]),
-        Paper("Paper E", "path/e.pdf", "text", ["Topic 1", "Topic 3"])
+        Paper(title="Paper A", file_path="path/a.pdf", text="text", topics=["Topic 1", "Topic 2"]),
+        Paper(title="Paper B", file_path="path/b.pdf", text="text", topics=["Topic 1"]),
+        Paper(title="Paper C", file_path="path/c.pdf", text="text", topics=["Topic 2", "Topic 3"]),
+        Paper(title="Paper D", file_path="path/d.pdf", text="text", topics=["Topic 3"]),
+        Paper(title="Paper E", file_path="path/e.pdf", text="text", topics=["Topic 1", "Topic 3"])
     ]
     
     graph = PaperGraph()
