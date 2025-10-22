@@ -2,7 +2,10 @@
 import boto3
 import json
 import os
+import re
+import ast
 from botocore.config import Config
+from transformers import pipeline
 
 class LLMClient:
     def __init__(self, model_id, region='us-east-1'):
@@ -40,22 +43,73 @@ class LLMClient:
         return response_body['content'][0]['text']
 
 
+class HuggingFaceLLMClient:
+    def __init__(self, model_name="Qwen/Qwen2.5-0.5B"):
+        self.generator = pipeline("text-generation", model=model_name, max_length=512)
+
+    def generate(self, prompt):
+        result = self.generator(prompt, max_new_tokens=2000, do_sample=True, temperature=0.7)
+        return result[0]['generated_text'][len(prompt):].strip()
+
+
 class TopicExtractor:
     def __init__(self, llm_client):
         self.llm_client = llm_client
 
     def extract_topics(self, text, current_topics=None):
-        prompt = f"Extract the main topics from the following text. If the topics already exist in the list of existing topics, please use those, rather than adding new topics. Please give the list of topics for the following text in the form of a python list (for example ['LLMs', 'Reinforcement Learning', 'Big Data']) \nExisting Topics: {current_topics}\n\nText:\n\n{text}\n\nTopics:"
-        response = self.llm_client.generate(prompt)
-        topics = response.strip().split('\n')
-        return [topic.strip() for topic in topics if topic.strip()]
+        prompt = f"""
+    You are a precise text classifier. Your task is to extract the main topics from the given text.
+
+    Follow these strict rules:
+    1. Use topics from the existing list if they are relevant.
+    2. Add new topics only if necessary, using 1–3 word noun phrases.
+    3. Respond with **only** a valid Python list literal (e.g. ['LLMs', 'Reinforcement Learning']).
+    4. Do **not** include any commentary, explanation, or text outside the list.
+    5. The response must start with '[' and end with ']'. Nothing else is allowed.
+
+    Example of a valid output:
+    ['Machine Learning', 'Bayesian Models', 'Cognitive Science']
+
+    Existing Topics: {current_topics}
+
+    Text:
+    {text}
+
+    Output only the Python list:
+    """
+
+        response = self.llm_client.generate(prompt).strip()
+
+        # Extract first list-looking structure
+        match = re.search(r'\[.*?\]', response, re.DOTALL)
+        if not match:
+            # fallback: if model ignored format, return empty
+            return []
+
+        list_str = match.group(0)
+
+        # Safely parse the Python list
+        try:
+            topics = ast.literal_eval(list_str)
+            if isinstance(topics, list):
+                return [t.strip() for t in topics if isinstance(t, str)]
+        except Exception:
+            pass
+
+        return []
+
 
 
 if __name__ == "__main__":
-    # Example usage:
-    model_id = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
-    llm_client = LLMClient(model_id=model_id)
-    topic_extractor = TopicExtractor(llm_client)
+    # Example usage with AWS Bedrock:
+    # model_id = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    # bedrock_client = LLMClient(model_id=model_id)
+    
+    # Example usage with HuggingFace:
+    hf_client = HuggingFaceLLMClient(model_name="Qwen/Qwen2.5-0.5B")
+    
+    # Both clients work interchangeably with TopicExtractor
+    topic_extractor = TopicExtractor(hf_client)  # or bedrock_client
 
     sample_text = "Artificial Intelligence and Machine Learning are transforming the tech industry. Cloud computing provides scalable resources for AI applications."
     extracted_topics = topic_extractor.extract_topics(sample_text, current_topics=["Artificial Intelligence", "Cloud Computing", "Data Science"])
