@@ -1,19 +1,32 @@
 import React, { useState, useEffect } from 'react';
+import GraphVisualization from './GraphVisualization';
 
 function App() {
-  const [data, setData] = useState('');
+  const [graphData, setGraphData] = useState(null);
 
   useEffect(() => {
-    fetch('http://localhost:8000/api/data')
-      .then(response => response.json())
-      .then(data => setData(data.data))
-      .catch(error => console.error('Error:', error));
+    // Create fully connected graph - every paper connects to every topic
+    const dummyData = {
+      papers: [
+        { title: "Paper A", topics: ["Topic 1", "Topic 2", "Topic 3"] },
+        { title: "Paper B", topics: ["Topic 1", "Topic 2", "Topic 3"] },
+        { title: "Paper C", topics: ["Topic 1", "Topic 2", "Topic 3"] },
+        { title: "Paper D", topics: ["Topic 1", "Topic 2", "Topic 3"] },
+        { title: "Paper E", topics: ["Topic 1", "Topic 2", "Topic 3"] }
+      ],
+      topics: ["Topic 1", "Topic 2", "Topic 3"]
+    };
+    setGraphData(dummyData);
   }, []);
 
   return (
     <div style={{ padding: '20px' }}>
-      <h1>React + FastAPI App</h1>
-      <p>Data from backend: {data}</p>
+      <h1>Paper Graph Visualization</h1>
+      {graphData ? (
+        <GraphVisualization data={graphData} />
+      ) : (
+        <p>Loading graph...</p>
+      )}
     </div>
   );
 }
