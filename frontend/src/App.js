@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import GraphVisualization from './GraphVisualization';
+import './App.css';
 
 function App() {
   const [graphData, setGraphData] = useState(null);
+  const [isDarkMode, setIsDarkMode] = useState(false);
 
   useEffect(() => {
     fetch('http://localhost:8000/api/graph/dummy')
@@ -26,13 +28,22 @@ function App() {
   }, []);
 
   return (
-    <div style={{ padding: '20px' }}>
-      <h1>Paper Graph Visualization</h1>
-      {graphData ? (
-        <GraphVisualization data={graphData} />
-      ) : (
-        <p>Loading graph...</p>
-      )}
+    <div className={`app ${isDarkMode ? 'dark' : 'light'}`}>
+      <div className="theme-toggle">
+        <button onClick={() => setIsDarkMode(!isDarkMode)}>
+          {isDarkMode ? '☀️' : '🌙'}
+        </button>
+      </div>
+      <header className="app-header">
+        <h1>Paper Graph Visualization</h1>
+      </header>
+      <main className="app-main">
+        {graphData ? (
+          <GraphVisualization data={graphData} />
+        ) : (
+          <div className="loading">Loading graph...</div>
+        )}
+      </main>
     </div>
   );
 }
