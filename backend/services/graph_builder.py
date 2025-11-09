@@ -1,7 +1,7 @@
 from models.graph import PaperGraph
 from models.paper import Paper
 from models.topic import Topic
-from services.llm_service import TopicExtractor, HuggingFaceLLMClient
+from services.llm_service import TopicExtractor, OpenAILLMClient
 from services.pdf_preprocessor import extract_text_from_pdf
 import os
 from pathlib import Path
@@ -20,7 +20,7 @@ class GraphBuilder:
         self.get_papers(file_path)
 
         # get the topics from the papers
-        client = HuggingFaceLLMClient()
+        client = OpenAILLMClient()
         extractor = TopicExtractor(client)
         for paper in self.papers:
             topics = extractor.extract_topics(paper.text)

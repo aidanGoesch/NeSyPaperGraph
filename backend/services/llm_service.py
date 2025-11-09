@@ -6,6 +6,7 @@ import re
 import ast
 from botocore.config import Config
 from transformers import pipeline
+from openai import OpenAI
 
 class LLMClient:
     def __init__(self, model_id, region='us-east-1'):
@@ -50,6 +51,42 @@ class HuggingFaceLLMClient:
     def generate(self, prompt):
         result = self.generator(prompt, max_new_tokens=2000, do_sample=True, temperature=0.7)
         return result[0]['generated_text'][len(prompt):].strip()
+
+
+class OpenAILLMClient:
+    def __init__(self, model_name="gpt-4o-mini", api_key=None):
+        """
+        Initialize OpenAI client.
+        
+        Args:
+            model_name: The OpenAI model to use (default: gpt-4o-mini)
+            api_key: OpenAI API key. If None, will use OPENAI_API_KEY environment variable.
+        """
+        self.model_name = model_name
+        api_key = api_key or os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
+        self.client = OpenAI(api_key=api_key)
+
+    def generate(self, prompt):
+        """
+        Generate text using OpenAI API.
+        
+        Args:
+            prompt: The prompt text
+            
+        Returns:
+            str: The generated text response
+        """
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2000
+        )
+        return response.choices[0].message.content.strip()
 
 
 class TopicExtractor:
