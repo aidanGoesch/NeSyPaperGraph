@@ -6,6 +6,9 @@ const GraphVisualization = ({ data, isDarkMode }) => {
   const containerRef = useRef();
   const [selectedPaper, setSelectedPaper] = useState(null);
   const [panelPosition, setPanelPosition] = useState({ x: 0, y: 0 });
+  const [showSemanticEdges, setShowSemanticEdges] = useState(true);
+  const [showMenu, setShowMenu] = useState(false);
+  const [semanticThreshold, setSemanticThreshold] = useState(0.25);
   const selectedNodeRef = useRef(null);
   const simulationRef = useRef(null);
   const nodesRef = useRef([]);
@@ -86,7 +89,12 @@ const GraphVisualization = ({ data, isDarkMode }) => {
       .enter().append("line")
       .attr("stroke", d => d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000"))
       .attr("stroke-width", d => d.type === 'semantic' ? ((d.weight - 0.25) * 5) : 5)
-      .attr("stroke-opacity", 0.6)
+      .attr("stroke-opacity", d => {
+        if (d.type === 'semantic') {
+          return (d.weight >= semanticThreshold && showSemanticEdges) ? 0.6 : 0;
+        }
+        return 0.6;
+      })
       .style("cursor", d => d.type === 'semantic' ? "pointer" : "default")
       .on("click", function(event, d) {
         if (d.type === 'semantic') {
@@ -104,6 +112,18 @@ const GraphVisualization = ({ data, isDarkMode }) => {
       .attr("stroke", "#fff")
       .attr("stroke-width", 2)
       .style("cursor", "pointer")
+      .on("mouseover", function(event, d) {
+        if (d.type === 'paper') {
+          label.filter(labelData => labelData.id === d.id)
+            .style("opacity", 1);
+        }
+      })
+      .on("mouseout", function(event, d) {
+        if (d.type === 'paper') {
+          label.filter(labelData => labelData.id === d.id)
+            .style("opacity", 0);
+        }
+      })
       .on("click", function(event, d) {
         event.stopPropagation();
         if (d.type !== 'paper') return;
@@ -148,14 +168,19 @@ const GraphVisualization = ({ data, isDarkMode }) => {
       .selectAll("text")
       .data(nodes)
       .enter().append("text")
-      .text(d => d.id)
-      .attr("font-size", 12)
+      .text(d => d.type === 'topic' ? d.id : (d.id.length > 30 ? d.id.substring(0, 30) + '...' : d.id))
+      .attr("font-size", d => d.type === 'topic' ? 14 : 10)
       .attr("font-family", "Arial, sans-serif")
       .attr("fill", isDarkMode ? "#ccc" : "#333")
       .attr("text-anchor", "middle")
-      .attr("dy", -20)
+      .attr("dy", d => d.type === 'topic' ? 5 : -20)
       .style("pointer-events", "none")
-      .style("transition", "fill 0.5s ease");
+      .style("opacity", d => d.type === 'topic' ? 1 : 0)
+      .style("transition", "opacity 0.3s ease, fill 0.5s ease")
+      .style("paint-order", "stroke fill")
+      .style("stroke", isDarkMode ? "#2a2a2a" : "white")
+      .style("stroke-width", "3px")
+      .style("stroke-linejoin", "round");
 
     simulation.on("tick", () => {
       link
@@ -236,13 +261,113 @@ const GraphVisualization = ({ data, isDarkMode }) => {
       .attr("stroke", d => d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000"));
     
     svg.selectAll("text")
-      .attr("fill", isDarkMode ? "#ccc" : "#333");
+      .attr("fill", isDarkMode ? "#ccc" : "#333")
+      .style("stroke", isDarkMode ? "#2a2a2a" : "white");
   }, [isDarkMode]);
+
+  // Effect for semantic edges toggle and threshold
+  useEffect(() => {
+    if (!simulationRef.current || !data) return;
+    
+    const svg = d3.select(svgRef.current);
+    svg.select("g").selectAll("line")
+      .attr("stroke-opacity", d => {
+        if (d.type === 'semantic') {
+          return (d.weight >= semanticThreshold && showSemanticEdges) ? 0.6 : 0;
+        }
+        return 0.6;
+      });
+    
+    // Update simulation forces only for layout
+    const links = data.edges || [];
+    if (links.length === 0) {
+      data.papers.forEach(paper => {
+        paper.topics.forEach(topic => {
+          links.push({ source: paper.title, target: topic });
+        });
+      });
+    }
+    
+    const activeLinks = showSemanticEdges ? 
+      links.filter(d => d.type !== 'semantic' || d.weight >= semanticThreshold) : 
+      links.filter(link => link.type !== 'semantic');
+    
+    simulationRef.current.force("link").links(activeLinks);
+    simulationRef.current.alpha(0.3).restart();
+  }, [semanticThreshold, showSemanticEdges, data, isDarkMode]);
 
 
 
   return (
     <div ref={containerRef} style={{ width: '100%', height: '100vh', position: 'relative', backgroundColor: 'white' }}>
+      <div style={{ position: 'absolute', top: '20px', right: '20px', zIndex: 1001 }}>
+        <button
+          onClick={() => setShowMenu(!showMenu)}
+          style={{
+            background: isDarkMode ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.05)',
+            color: isDarkMode ? '#ccc' : '#333',
+            border: isDarkMode ? '1px solid rgba(255, 255, 255, 0.1)' : '1px solid rgba(0, 0, 0, 0.1)',
+            padding: '12px',
+            borderRadius: '6px',
+            cursor: 'pointer',
+            fontSize: '16px',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: '44px',
+            height: '44px',
+            transition: 'all 0.5s ease'
+          }}
+          onMouseEnter={(e) => {
+            e.target.style.background = isDarkMode ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)';
+          }}
+          onMouseLeave={(e) => {
+            e.target.style.background = isDarkMode ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.05)';
+          }}
+        >
+          <div style={{ width: '16px', height: '2px', backgroundColor: isDarkMode ? '#ccc' : '#333', margin: '2px 0' }}></div>
+          <div style={{ width: '16px', height: '2px', backgroundColor: isDarkMode ? '#ccc' : '#333', margin: '2px 0' }}></div>
+          <div style={{ width: '16px', height: '2px', backgroundColor: isDarkMode ? '#ccc' : '#333', margin: '2px 0' }}></div>
+        </button>
+        {showMenu && (
+          <div style={{
+            position: 'absolute',
+            top: '50px',
+            right: '0',
+            backgroundColor: 'white',
+            border: '1px solid #ccc',
+            borderRadius: '4px',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+            padding: '10px',
+            minWidth: '200px'
+          }}>
+            <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', marginBottom: '15px' }}>
+              <input
+                type="checkbox"
+                checked={showSemanticEdges}
+                onChange={(e) => setShowSemanticEdges(e.target.checked)}
+                style={{ marginRight: '8px' }}
+              />
+              Show Semantic Edges
+            </label>
+            <div style={{ marginBottom: '10px' }}>
+              <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>
+                Semantic Threshold: {semanticThreshold.toFixed(2)}
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={semanticThreshold}
+                onChange={(e) => setSemanticThreshold(parseFloat(e.target.value))}
+                style={{ width: '100%' }}
+              />
+            </div>
+          </div>
+        )}
+      </div>
       <svg ref={svgRef}></svg>
       {selectedPaper && (
         <div className="info-panel" style={{

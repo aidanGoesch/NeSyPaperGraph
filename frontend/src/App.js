@@ -30,6 +30,25 @@ function App() {
       });
   }, []);
 
+  const handleSearch = async (query) => {
+    if (!query.trim()) return;
+    
+    try {
+      const response = await fetch('http://localhost:8000/api/search', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query }),
+      });
+      
+      const data = await response.json();
+      console.log('Search response:', data);
+    } catch (error) {
+      console.error('Search error:', error);
+    }
+  };
+
   const handleFileUpload = async (event) => {
     const files = event.target.files;
     if (files.length > 0) {
@@ -102,6 +121,12 @@ function App() {
           placeholder="Ask a Question..."
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              handleSearch(searchTerm);
+              setSearchTerm('');
+            }
+          }}
           onFocus={() => setIsSearchExpanded(true)}
           onBlur={() => setIsSearchExpanded(false)}
           className={`search-bar ${isSearchExpanded ? 'expanded' : ''}`}
