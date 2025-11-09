@@ -4,7 +4,10 @@ from models.topic import Topic
 from services.llm_service import TopicExtractor, OpenAILLMClient
 from services.pdf_preprocessor import extract_text_from_pdf
 import os
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class GraphBuilder:
@@ -17,15 +20,31 @@ class GraphBuilder:
         """
         Builds a graph from the given file path of pdfs
         """
+        # Reset state for new build
+        self.papers = []
+        self.topics = set()
+        
         self.get_papers(file_path)
 
         # get the topics from the papers
+        # Use OpenAI assistant (reads assistant_id from environment)
         client = OpenAILLMClient()
         extractor = TopicExtractor(client)
-        for paper in self.papers:
-            topics = extractor.extract_topics(paper.text)
+        
+        logger.info(f"Processing {len(self.papers)} papers for topic extraction...")
+        for i, paper in enumerate(self.papers, 1):
+            # Truncate very long texts to avoid excessive processing time
+            # Keep first 50000 characters (enough for topic extraction)
+            text_for_extraction = paper.text[:50000] if len(paper.text) > 50000 else paper.text
+            if len(paper.text) > 50000:
+                logger.info(f"Paper {i}/{len(self.papers)}: '{paper.title}' - truncated from {len(paper.text)} to 50000 chars")
+            else:
+                logger.info(f"Paper {i}/{len(self.papers)}: '{paper.title}' ({len(paper.text)} chars)")
+            
+            topics = extractor.extract_topics(text_for_extraction)
             paper.topics = topics
             self.topics.update(set(topics)) # add the topics to the set of topics member variable
+            logger.info(f"  Extracted {len(topics)} topics: {topics}")
         
         # build the graph
         graph = PaperGraph()

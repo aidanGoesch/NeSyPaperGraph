@@ -54,23 +54,32 @@ class HuggingFaceLLMClient:
 
 
 class OpenAILLMClient:
-    def __init__(self, model_name="gpt-4o-mini", api_key=None):
+    def __init__(self, api_key=None, assistant_id=None):
         """
-        Initialize OpenAI client.
+        Initialize OpenAI client with Assistant support only.
         
         Args:
-            model_name: The OpenAI model to use (default: gpt-4o-mini)
             api_key: OpenAI API key. If None, will use OPENAI_API_KEY environment variable.
+            assistant_id: OpenAI Assistant ID. If None, will use OPENAI_ASSISTANT_ID environment variable.
         """
-        self.model_name = model_name
         api_key = api_key or os.getenv('OPENAI_API_KEY')
         if not api_key:
             raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
-        self.client = OpenAI(api_key=api_key)
+        
+        self.assistant_id = assistant_id or os.getenv('OPENAI_ASSISTANT_ID')
+        if not self.assistant_id:
+            raise ValueError("OpenAI Assistant ID is required. Set OPENAI_ASSISTANT_ID environment variable or pass assistant_id parameter.")
+        
+        # Use Assistants API v2 (v1 is deprecated)
+        # Set default headers with v2 beta header
+        self.client = OpenAI(
+            api_key=api_key,
+            default_headers={"OpenAI-Beta": "assistants=v2"}
+        )
 
     def generate(self, prompt):
         """
-        Generate text using OpenAI API.
+        Generate text using OpenAI Assistants API.
         
         Args:
             prompt: The prompt text
@@ -78,15 +87,112 @@ class OpenAILLMClient:
         Returns:
             str: The generated text response
         """
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=2000
-        )
-        return response.choices[0].message.content.strip()
+        return self._generate_with_assistant(prompt)
+    
+    def _generate_with_assistant(self, prompt):
+        """
+        Generate text using OpenAI Assistants API.
+        
+        Args:
+            prompt: The prompt text
+            
+        Returns:
+            str: The generated text response
+        """
+        import time
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        
+        # Create a thread (v2 header is set in client default_headers)
+        thread = self.client.beta.threads.create()
+        
+        try:
+            # Add message to thread
+            self.client.beta.threads.messages.create(
+                thread_id=thread.id,
+                role="user",
+                content=prompt
+            )
+            
+            # Run the assistant
+            run = self.client.beta.threads.runs.create(
+                thread_id=thread.id,
+                assistant_id=self.assistant_id
+            )
+            
+            # Poll for completion with timeout and progress logging
+            max_wait_time = 180  # 3 minutes max per request
+            start_time = time.time()
+            poll_count = 0
+            last_log_time = start_time
+            
+            while run.status in ['queued', 'in_progress', 'cancelling']:
+                elapsed = time.time() - start_time
+                if elapsed > max_wait_time:
+                    raise TimeoutError(f"Assistant run timed out after {max_wait_time} seconds")
+                
+                # Log progress every 10 seconds to reduce spam
+                if time.time() - last_log_time >= 10:
+                    logger.info(f"Assistant run status: {run.status} (elapsed: {elapsed:.1f}s)")
+                    last_log_time = time.time()
+                
+                time.sleep(1.0)  # Poll every 1 second instead of 0.5
+                poll_count += 1
+                run = self.client.beta.threads.runs.retrieve(
+                    thread_id=thread.id,
+                    run_id=run.id
+                )
+            
+            if poll_count > 0:
+                logger.info(f"Assistant run completed in {time.time() - start_time:.1f}s after {poll_count} polls")
+            
+            # Check if run requires action (tool calls, etc.)
+            if run.status == 'requires_action':
+                logger.warning(f"Assistant run requires action: {run.required_action}")
+                raise RuntimeError(f"Assistant run requires action: {run.required_action}")
+            
+            if run.status == 'completed':
+                # Retrieve the messages
+                messages = self.client.beta.threads.messages.list(
+                    thread_id=thread.id,
+                    order="asc"  # Get messages in chronological order
+                )
+                
+                # Get the assistant's response (last message should be assistant's response)
+                assistant_messages = [msg for msg in messages.data if msg.role == 'assistant']
+                if not assistant_messages:
+                    raise ValueError("No assistant response found in thread messages")
+                
+                # Get the most recent assistant message
+                latest_message = assistant_messages[-1]
+                
+                # Extract text content from the message
+                if latest_message.content:
+                    text_parts = []
+                    for content_item in latest_message.content:
+                        if content_item.type == 'text':
+                            text_parts.append(content_item.text.value)
+                        elif content_item.type == 'tool_use':
+                            # Assistant is using tools - log this
+                            logger.warning(f"Assistant used tool: {content_item.tool_use.name}")
+                    
+                    if text_parts:
+                        return "\n".join(text_parts)
+                
+                raise ValueError(f"Assistant response has no text content. Content types: {[c.type for c in latest_message.content]}")
+            elif run.status == 'failed':
+                error_info = run.last_error if run.last_error else "Unknown error"
+                raise RuntimeError(f"Assistant run failed: {error_info}")
+            else:
+                raise RuntimeError(f"Assistant run ended with unexpected status: {run.status}. Error: {run.last_error}")
+        
+        finally:
+            # Clean up: delete the thread (optional, but good practice)
+            try:
+                self.client.beta.threads.delete(thread.id)
+            except:
+                pass  # Ignore cleanup errors
 
 
 class TopicExtractor:
@@ -100,40 +206,72 @@ class TopicExtractor:
     Follow these strict rules:
     1. Use topics from the existing list if they are relevant.
     2. Add new topics only if necessary, using 1–3 word noun phrases.
-    3. Respond with **only** a valid Python list literal (e.g. ['LLMs', 'Reinforcement Learning']).
-    4. Do **not** include any commentary, explanation, or text outside the list.
-    5. The response must start with '[' and end with ']'. Nothing else is allowed.
+    3. Respond with **only** valid JSON containing a "topics" array (e.g. {{"topics": ["LLMs", "Reinforcement Learning"]}}).
+    4. Do **not** include any commentary, explanation, or text outside the JSON.
 
     Example of a valid output:
-    ['Machine Learning', 'Bayesian Models', 'Cognitive Science']
+    {{"topics": ["Machine Learning", "Bayesian Models", "Cognitive Science"]}}
 
     Existing Topics: {current_topics}
 
     Text:
     {text}
 
-    Output only the Python list:
+    Output only the JSON:
     """
 
         response = self.llm_client.generate(prompt).strip()
+        
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Log the response to debug why topics aren't being extracted
+        logger.info(f"Assistant response (first 500 chars): {response[:500]}")
+        logger.info(f"Assistant response length: {len(response)} chars")
 
-        # Extract first list-looking structure
-        match = re.search(r'\[.*?\]', response, re.DOTALL)
-        if not match:
-            # fallback: if model ignored format, return empty
-            return []
-
-        list_str = match.group(0)
-
-        # Safely parse the Python list
+        # Try to parse JSON response
         try:
-            topics = ast.literal_eval(list_str)
+            # First, try to extract JSON from the response (in case there's extra text)
+            # Look for JSON object pattern
+            json_match = re.search(r'\{[^{}]*"topics"[^{}]*\[[^\]]*\][^{}]*\}', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+            else:
+                # Try to find any JSON object
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                else:
+                    json_str = response
+            
+            # Parse the JSON
+            data = json.loads(json_str)
+            
+            # Extract topics from the JSON
+            if isinstance(data, dict) and "topics" in data:
+                topics = data["topics"]
+            elif isinstance(data, list):
+                # If it's just a list, use it directly
+                topics = data
+            else:
+                logger.warning(f"⚠️ Unexpected JSON structure: {data}")
+                return []
+            
+            # Validate and clean topics
             if isinstance(topics, list):
-                return [t.strip() for t in topics if isinstance(t, str)]
-        except Exception:
-            pass
-
-        return []
+                cleaned_topics = [str(t).strip() for t in topics if t]
+                logger.info(f"Successfully extracted {len(cleaned_topics)} topics from JSON")
+                return cleaned_topics
+            else:
+                logger.warning(f"⚠️ Topics is not a list: {type(topics)}")
+                return []
+                
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ Failed to parse JSON: {e}. Response: {response[:1000]}")
+            return []
+        except Exception as e:
+            logger.warning(f"⚠️ Error parsing response: {e}. Response: {response[:1000]}")
+            return []
 
 
 
