@@ -44,11 +44,13 @@ class LLMClient:
 
 
 class HuggingFaceLLMClient:
-    def __init__(self, model_name="Qwen/Qwen2.5-0.5B"):
-        self.generator = pipeline("text-generation", model=model_name, max_length=512)
+    def __init__(self, model_name="distilgpt2"):
+        import torch
+        self.generator = pipeline("text-generation", model=model_name, max_length=1024, 
+                                device="mps", torch_dtype=torch.float16)
 
     def generate(self, prompt):
-        result = self.generator(prompt, max_new_tokens=2000, do_sample=True, temperature=0.7)
+        result = self.generator(prompt, max_new_tokens=200, do_sample=False, pad_token_id=self.generator.tokenizer.eos_token_id)
         return result[0]['generated_text'][len(prompt):].strip()
 
 
@@ -56,7 +58,19 @@ class TopicExtractor:
     def __init__(self, llm_client):
         self.llm_client = llm_client
 
-    def extract_topics(self, text, current_topics=None):
+    def extract_topics(self, text, current_topics=None, max_chars=2000):
+        # Chunk text if too large
+        if len(text) > max_chars:
+            chunks = [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
+            all_topics = set()
+            for chunk in chunks:
+                topics = self._extract_from_chunk(chunk, current_topics)
+                all_topics.update(topics)
+            return list(all_topics)
+        
+        return self._extract_from_chunk(text, current_topics)
+    
+    def _extract_from_chunk(self, text, current_topics):
         prompt = f"""
     You are a precise text classifier. Your task is to extract the main topics from the given text.
 
@@ -83,12 +97,10 @@ class TopicExtractor:
         # Extract first list-looking structure
         match = re.search(r'\[.*?\]', response, re.DOTALL)
         if not match:
-            # fallback: if model ignored format, return empty
             return []
 
         list_str = match.group(0)
 
-        # Safely parse the Python list
         try:
             topics = ast.literal_eval(list_str)
             if isinstance(topics, list):
