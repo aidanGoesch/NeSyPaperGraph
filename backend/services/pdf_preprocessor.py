@@ -21,9 +21,3 @@ def extract_text_from_pdf(pdf_source):
     for page in reader.pages:
         extracted_text += page.extract_text() + "\n"
     return extracted_text
-
-if __name__ == "__main__":
-    # Example usage:
-    pdf_file = "Aidan Goeschel - CV.pdf"  # Replace with the path to your PDF file
-    text_content = extract_text_from_pdf(pdf_file)
-    print(text_content)

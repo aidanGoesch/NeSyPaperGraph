@@ -16,10 +16,9 @@ const GraphVisualization = ({ data, isDarkMode }) => {
     const container = containerRef.current;
     const svg = d3.select(svgRef.current);
     
-    // Only clear if this is the first render or data changed
-    if (!simulationRef.current) {
-      svg.selectAll("*").remove();
-    }
+    // Always clear and recreate when data changes
+    svg.selectAll("*").remove();
+    simulationRef.current = null;
 
     const width = container.clientWidth;
     const height = container.clientHeight;
