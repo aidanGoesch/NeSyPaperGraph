@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import GraphVisualization from './GraphVisualization';
+import mermaid from 'mermaid';
 import './App.css';
 
 function App() {
@@ -8,6 +9,20 @@ function App() {
   const [searchTerm, setSearchTerm] = useState('');
   const [isSearchExpanded, setIsSearchExpanded] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [showMermaid, setShowMermaid] = useState(false);
+  const [mermaidDiagram, setMermaidDiagram] = useState('');
+  const mermaidRef = useRef();
+
+  useEffect(() => {
+    mermaid.initialize({ startOnLoad: true });
+  }, []);
+
+  useEffect(() => {
+    if (showMermaid && mermaidDiagram && mermaidRef.current) {
+      mermaidRef.current.innerHTML = mermaidDiagram;
+      mermaid.init(undefined, mermaidRef.current);
+    }
+  }, [showMermaid, mermaidDiagram]);
 
   useEffect(() => {
     fetch('http://localhost:8000/api/graph/dummy')
@@ -29,6 +44,19 @@ function App() {
         setGraphData(fallbackData);
       });
   }, []);
+
+  const showAgentArchitecture = async () => {
+    try {
+      const response = await fetch('http://localhost:8000/api/agent/architecture');
+      const data = await response.json();
+      if (data.mermaid) {
+        setMermaidDiagram(data.mermaid);
+        setShowMermaid(true);
+      }
+    } catch (error) {
+      console.error('Error fetching architecture:', error);
+    }
+  };
 
   const handleSearch = async (query) => {
     if (!query.trim()) return;
@@ -97,7 +125,7 @@ function App() {
       </header>
       <main className="app-main">
         {graphData ? (
-          <GraphVisualization data={graphData} isDarkMode={isDarkMode} />
+          <GraphVisualization data={graphData} isDarkMode={isDarkMode} onShowArchitecture={showAgentArchitecture} />
         ) : (
           <div className="loading">Loading graph...</div>
         )}
@@ -131,6 +159,39 @@ function App() {
           onBlur={() => setIsSearchExpanded(false)}
           className={`search-bar ${isSearchExpanded ? 'expanded' : ''}`}
         />
+        {showMermaid && (
+          <div style={{
+            position: 'fixed',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            backgroundColor: 'white',
+            padding: '20px',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            zIndex: 2000,
+            maxWidth: '80vw',
+            maxHeight: '80vh',
+            overflow: 'auto'
+          }}>
+            <button
+              onClick={() => setShowMermaid(false)}
+              style={{
+                position: 'absolute',
+                top: '10px',
+                right: '10px',
+                background: 'none',
+                border: 'none',
+                fontSize: '24px',
+                cursor: 'pointer'
+              }}
+            >
+              ×
+            </button>
+            <h3>Agent Architecture</h3>
+            <div ref={mermaidRef}></div>
+          </div>
+        )}
       </main>
     </div>
   );

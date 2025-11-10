@@ -5,7 +5,7 @@ import os
 import re
 import ast
 from botocore.config import Config
-from transformers import pipeline
+# from transformers import pipeline  # Commented out due to version conflicts
 
 class LLMClient:
     def __init__(self, model_id, region='us-east-1'):
@@ -45,13 +45,10 @@ class LLMClient:
 
 class HuggingFaceLLMClient:
     def __init__(self, model_name="distilgpt2"):
-        import torch
-        self.generator = pipeline("text-generation", model=model_name, max_length=1024, 
-                                device="mps", torch_dtype=torch.float16)
+        raise NotImplementedError("HuggingFace client temporarily disabled due to dependency conflicts")
 
     def generate(self, prompt):
-        result = self.generator(prompt, max_new_tokens=200, do_sample=False, pad_token_id=self.generator.tokenizer.eos_token_id)
-        return result[0]['generated_text'][len(prompt):].strip()
+        raise NotImplementedError("HuggingFace client temporarily disabled due to dependency conflicts")
 
 
 class TopicExtractor:
@@ -114,14 +111,14 @@ class TopicExtractor:
 
 if __name__ == "__main__":
     # Example usage with AWS Bedrock:
-    # model_id = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
-    # bedrock_client = LLMClient(model_id=model_id)
+    model_id = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    bedrock_client = LLMClient(model_id=model_id)
     
-    # Example usage with HuggingFace:
-    hf_client = HuggingFaceLLMClient(model_name="Qwen/Qwen2.5-0.5B")
+    # HuggingFace client temporarily disabled
+    # hf_client = HuggingFaceLLMClient(model_name="Qwen/Qwen2.5-0.5B")
     
-    # Both clients work interchangeably with TopicExtractor
-    topic_extractor = TopicExtractor(hf_client)  # or bedrock_client
+    # Use Bedrock client with TopicExtractor
+    topic_extractor = TopicExtractor(bedrock_client)
 
     sample_text = "Artificial Intelligence and Machine Learning are transforming the tech industry. Cloud computing provides scalable resources for AI applications."
     extracted_topics = topic_extractor.extract_topics(sample_text, current_topics=["Artificial Intelligence", "Cloud Computing", "Data Science"])

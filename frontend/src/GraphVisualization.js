@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as d3 from 'd3';
 
-const GraphVisualization = ({ data, isDarkMode }) => {
+const GraphVisualization = ({ data, isDarkMode, onShowArchitecture }) => {
   const svgRef = useRef();
   const containerRef = useRef();
   const [selectedPaper, setSelectedPaper] = useState(null);
@@ -351,7 +351,7 @@ const GraphVisualization = ({ data, isDarkMode }) => {
               />
               Show Semantic Edges
             </label>
-            <div style={{ marginBottom: '10px' }}>
+            <div style={{ marginBottom: '15px' }}>
               <label style={{ display: 'block', marginBottom: '5px', fontSize: '14px' }}>
                 Semantic Threshold: {semanticThreshold.toFixed(2)}
               </label>
@@ -365,6 +365,21 @@ const GraphVisualization = ({ data, isDarkMode }) => {
                 style={{ width: '100%' }}
               />
             </div>
+            <button
+              onClick={onShowArchitecture}
+              style={{
+                width: '100%',
+                padding: '8px 12px',
+                backgroundColor: '#4CAF50',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '14px'
+              }}
+            >
+              Show Agent Architecture
+            </button>
           </div>
         )}
       </div>

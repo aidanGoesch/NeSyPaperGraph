@@ -1,7 +1,7 @@
 from models.graph import PaperGraph
 from models.paper import Paper
 from models.topic import Topic
-from services.llm_service import TopicExtractor, HuggingFaceLLMClient
+from services.llm_service import TopicExtractor, LLMClient
 from services.pdf_preprocessor import extract_text_from_pdf
 import os
 from pathlib import Path

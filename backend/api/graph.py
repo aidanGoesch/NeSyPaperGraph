@@ -27,7 +27,7 @@ async def build_graph_from_files(files: List[UploadFile] = File(...)):
         
         from models.paper import Paper
         from services.pdf_preprocessor import extract_text_from_pdf
-        from services.llm_service import TopicExtractor, HuggingFaceLLMClient
+        from services.llm_service import TopicExtractor, LLMClient
         
         # Initialize LLM for topic extraction
         client = HuggingFaceLLMClient()
