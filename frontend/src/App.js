@@ -11,7 +11,12 @@ function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [showMermaid, setShowMermaid] = useState(false);
   const [mermaidDiagram, setMermaidDiagram] = useState('');
+  const [showChatPanel, setShowChatPanel] = useState(false);
+  const [chatHistory, setChatHistory] = useState([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [followUpQuestion, setFollowUpQuestion] = useState('');
   const mermaidRef = useRef();
+  const chatContentRef = useRef();
 
   useEffect(() => {
     mermaid.initialize({ startOnLoad: true });
@@ -23,6 +28,13 @@ function App() {
       mermaid.init(undefined, mermaidRef.current);
     }
   }, [showMermaid, mermaidDiagram]);
+
+  useEffect(() => {
+    // Auto-scroll to bottom when chat history updates
+    if (chatContentRef.current) {
+      chatContentRef.current.scrollTop = chatContentRef.current.scrollHeight;
+    }
+  }, [chatHistory]);
 
   useEffect(() => {
     fetch('http://localhost:8000/api/graph/dummy')
@@ -61,6 +73,17 @@ function App() {
   const handleSearch = async (query) => {
     if (!query.trim()) return;
     
+    setIsSearching(true);
+    setShowChatPanel(true);
+    
+    // Add question to chat history immediately with loading state
+    const questionEntry = {
+      question: query,
+      answer: null, // null indicates loading
+      timestamp: new Date().toLocaleTimeString()
+    };
+    setChatHistory(prev => [...prev, questionEntry]);
+    
     try {
       const response = await fetch('http://localhost:8000/api/search', {
         method: 'POST',
@@ -72,8 +95,29 @@ function App() {
       
       const data = await response.json();
       console.log('Search response:', data);
+      
+      // Update the last entry with the answer
+      setChatHistory(prev => {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          ...updated[updated.length - 1],
+          answer: data.answer || data.error || 'No response'
+        };
+        return updated;
+      });
     } catch (error) {
       console.error('Search error:', error);
+      // Update the last entry with error
+      setChatHistory(prev => {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          ...updated[updated.length - 1],
+          answer: 'Error: Could not connect to server'
+        };
+        return updated;
+      });
+    } finally {
+      setIsSearching(false);
     }
   };
 
@@ -144,21 +188,76 @@ function App() {
         >
           📁 Upload Papers
         </button>
-        <input
-          type="text"
-          placeholder="Ask a Question..."
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              handleSearch(searchTerm);
-              setSearchTerm('');
-            }
-          }}
-          onFocus={() => setIsSearchExpanded(true)}
-          onBlur={() => setIsSearchExpanded(false)}
-          className={`search-bar ${isSearchExpanded ? 'expanded' : ''}`}
-        />
+        {!showChatPanel && (
+          <input
+            type="text"
+            placeholder="Ask a Question..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                handleSearch(searchTerm);
+                setSearchTerm('');
+              }
+            }}
+            onFocus={() => setIsSearchExpanded(true)}
+            onBlur={() => setIsSearchExpanded(false)}
+            className={`search-bar ${isSearchExpanded ? 'expanded' : ''}`}
+          />
+        )}
+        {showChatPanel && (
+          <div className={`chat-panel-wrapper ${isDarkMode ? 'dark' : 'light'}`}>
+            <div className={`chat-panel ${isDarkMode ? 'dark' : 'light'}`}>
+              
+              {/* X CLOSE BUTTON — now in top right corner */}
+              <button 
+                onClick={() => setShowChatPanel(false)}
+                className="close-button"
+              >
+                ×
+              </button>
+
+              {/* Scrollable content */}
+              <div className="chat-content" ref={chatContentRef}>
+                {chatHistory.map((entry, index) => (
+                  <div key={index} className="chat-entry">
+                    <div className="question">
+                      <strong>Q:</strong> {entry.question}
+                      <span className="timestamp">{entry.timestamp}</span>
+                    </div>
+                    <div className="answer">
+                      <strong>A:</strong> 
+                      {entry.answer === null ? (
+                        <div className="loading-dots">
+                          <span></span><span></span><span></span>
+                        </div>
+                      ) : (
+                        <span> {entry.answer}</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="chat-input-area">
+              <input
+                type="text"
+                placeholder="Ask a follow-up question..."
+                value={followUpQuestion}
+                onChange={(e) => setFollowUpQuestion(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !isSearching) {
+                    handleSearch(followUpQuestion);
+                    setFollowUpQuestion('');
+                  }
+                }}
+                disabled={isSearching}
+                className={`chat-input ${isDarkMode ? 'dark' : 'light'}`}
+              />
+            </div>
+          </div>
+        )}
         {showMermaid && (
           <div style={{
             position: 'fixed',
