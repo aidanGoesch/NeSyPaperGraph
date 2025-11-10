@@ -7,6 +7,7 @@ import ast
 from botocore.config import Config
 from transformers import pipeline
 from openai import OpenAI
+from services.topic_extraction_prompts import build_topic_extraction_prompt, get_topic_reuse_additional_instructions
 
 class LLMClient:
     def __init__(self, model_id, region='us-east-1'):
@@ -77,19 +78,20 @@ class OpenAILLMClient:
             default_headers={"OpenAI-Beta": "assistants=v2"}
         )
 
-    def generate(self, prompt):
+    def generate(self, prompt, additional_instructions=None):
         """
         Generate text using OpenAI Assistants API.
         
         Args:
             prompt: The prompt text
+            additional_instructions: Optional additional instructions to pass to the assistant run
             
         Returns:
             str: The generated text response
         """
-        return self._generate_with_assistant(prompt)
+        return self._generate_with_assistant(prompt, additional_instructions)
     
-    def _generate_with_assistant(self, prompt):
+    def _generate_with_assistant(self, prompt, additional_instructions=None):
         """
         Generate text using OpenAI Assistants API.
         
@@ -115,37 +117,30 @@ class OpenAILLMClient:
                 content=prompt
             )
             
-            # Run the assistant
-            run = self.client.beta.threads.runs.create(
-                thread_id=thread.id,
-                assistant_id=self.assistant_id
-            )
+            # Run the assistant with additional instructions if provided
+            run_params = {
+                "thread_id": thread.id,
+                "assistant_id": self.assistant_id
+            }
+            if additional_instructions:
+                run_params["additional_instructions"] = additional_instructions
             
-            # Poll for completion with timeout and progress logging
+            run = self.client.beta.threads.runs.create(**run_params)
+            
+            # Poll for completion with timeout
             max_wait_time = 180  # 3 minutes max per request
             start_time = time.time()
-            poll_count = 0
-            last_log_time = start_time
             
             while run.status in ['queued', 'in_progress', 'cancelling']:
                 elapsed = time.time() - start_time
                 if elapsed > max_wait_time:
                     raise TimeoutError(f"Assistant run timed out after {max_wait_time} seconds")
                 
-                # Log progress every 10 seconds to reduce spam
-                if time.time() - last_log_time >= 10:
-                    logger.info(f"Assistant run status: {run.status} (elapsed: {elapsed:.1f}s)")
-                    last_log_time = time.time()
-                
-                time.sleep(1.0)  # Poll every 1 second instead of 0.5
-                poll_count += 1
+                time.sleep(1.0)
                 run = self.client.beta.threads.runs.retrieve(
                     thread_id=thread.id,
                     run_id=run.id
                 )
-            
-            if poll_count > 0:
-                logger.info(f"Assistant run completed in {time.time() - start_time:.1f}s after {poll_count} polls")
             
             # Check if run requires action (tool calls, etc.)
             if run.status == 'requires_action':
@@ -174,8 +169,8 @@ class OpenAILLMClient:
                         if content_item.type == 'text':
                             text_parts.append(content_item.text.value)
                         elif content_item.type == 'tool_use':
-                            # Assistant is using tools - log this
-                            logger.warning(f"Assistant used tool: {content_item.tool_use.name}")
+                            # Assistant is using tools - this shouldn't happen for topic extraction
+                            pass
                     
                     if text_parts:
                         return "\n".join(text_parts)
@@ -200,34 +195,17 @@ class TopicExtractor:
         self.llm_client = llm_client
 
     def extract_topics(self, text, current_topics=None):
-        prompt = f"""
-    You are a precise text classifier. Your task is to extract the main topics from the given text.
-
-    Follow these strict rules:
-    1. Use topics from the existing list if they are relevant.
-    2. Add new topics only if necessary, using 1–3 word noun phrases.
-    3. Respond with **only** valid JSON containing a "topics" array (e.g. {{"topics": ["LLMs", "Reinforcement Learning"]}}).
-    4. Do **not** include any commentary, explanation, or text outside the JSON.
-
-    Example of a valid output:
-    {{"topics": ["Machine Learning", "Bayesian Models", "Cognitive Science"]}}
-
-    Existing Topics: {current_topics}
-
-    Text:
-    {text}
-
-    Output only the JSON:
-    """
-
-        response = self.llm_client.generate(prompt).strip()
+        # Build user message prompt (simplified since assistant has main instructions)
+        prompt = build_topic_extraction_prompt(text, current_topics)
+        
+        # Get additional instructions focused on topic reuse
+        additional_instructions = get_topic_reuse_additional_instructions(current_topics)
+        
+        # Generate response with additional instructions
+        response = self.llm_client.generate(prompt, additional_instructions=additional_instructions).strip()
         
         import logging
         logger = logging.getLogger(__name__)
-        
-        # Log the response to debug why topics aren't being extracted
-        logger.info(f"Assistant response (first 500 chars): {response[:500]}")
-        logger.info(f"Assistant response length: {len(response)} chars")
 
         # Try to parse JSON response
         try:
@@ -260,7 +238,6 @@ class TopicExtractor:
             # Validate and clean topics
             if isinstance(topics, list):
                 cleaned_topics = [str(t).strip() for t in topics if t]
-                logger.info(f"Successfully extracted {len(cleaned_topics)} topics from JSON")
                 return cleaned_topics
             else:
                 logger.warning(f"⚠️ Topics is not a list: {type(topics)}")
