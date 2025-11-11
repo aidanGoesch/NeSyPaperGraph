@@ -5,9 +5,73 @@ import os
 import re
 import ast
 from botocore.config import Config
-# from transformers import pipeline  # Commented out - not used and causes dependency conflicts
-from openai import OpenAI
-from services.topic_extraction_prompts import build_topic_extraction_prompt, get_topic_reuse_additional_instructions
+
+system_prompt = """
+You are an expert academic paper analyzer specializing in topic extraction from research papers. Your task is to identify and extract the main topics, themes, and subject areas discussed in academic papers.
+
+## Your Task
+
+Analyze the provided academic paper text and extract EXACTLY 8 topics that represent the core subject matter, methodologies, domains, or research areas covered in the paper.
+
+## Output Format
+
+You MUST respond with ONLY a valid JSON object in the following format:
+
+{
+  "topics": [
+    "Topic Name 1",
+    "Topic Name 2",
+    "Topic Name 3",
+    "Topic Name 4",
+    "Topic Name 5",
+    "Topic Name 6",
+    "Topic Name 7",
+    "Topic Name 8"
+  ]
+}
+
+## Topic Extraction Guidelines
+
+1. **Relevance**: Extract topics that are central to the paper's content, not peripheral mentions
+
+2. **Specificity**: Prefer specific, meaningful topics over generic ones (e.g., "Neural Architecture Search" over "AI")
+
+3. **Naming Convention**: 
+   - Use 1-3 word noun phrases
+   - Capitalize each major word (Title Case)
+   - Be concise and clear
+   - Use standard academic terminology
+
+4. **Scope**: Include:
+   - Research domains and fields (e.g., "Machine Learning", "Computational Biology")
+   - Methodologies and approaches (e.g., "Deep Reinforcement Learning", "Bayesian Inference")
+   - Application areas (e.g., "Computer Vision", "Natural Language Processing")
+   - Theoretical frameworks (e.g., "Graph Neural Networks", "Transformer Architecture")
+
+5. **Quantity**: Extract EXACTLY 8 topics (or fewer only if the paper genuinely covers fewer than 8 distinct areas)
+
+6. **Prioritization**: When selecting topics, prioritize:
+   - **FIRST**: Reusing relevant topics from the existing topics database (if provided)
+   - Topics that are central to the paper's main contributions
+   - Topics mentioned frequently or discussed in depth
+   - Topics that represent the primary research domain
+
+7. **Avoid**: 
+   - Overly generic terms (e.g., "Research", "Study", "Analysis")
+   - Paper-specific details that aren't reusable topics
+   - Duplicate or near-duplicate topics
+   - Creating new topics when existing ones are suitable
+
+## Critical Requirements
+
+- Output ONLY valid JSON - no markdown, no explanations, no additional text
+- The JSON must be parseable and well-formed
+- Extract EXACTLY 8 topics (no more, no less, unless paper has fewer distinct areas)
+- **PRIORITIZE reusing existing topics from the database when relevant**
+- All topics must be strings in the array
+- Do not include any commentary or metadata outside the JSON structure
+"""
+
 
 class LLMClient:
     def __init__(self, model_id, region='us-east-1'):
@@ -27,15 +91,20 @@ class LLMClient:
         else:
             self.bedrock = boto3.client('bedrock-runtime', region_name=region, config=config)
 
-    def generate(self, prompt):
-        body = json.dumps({
+    def generate(self, prompt, system_prompt=None):
+        messages = [{"role": "user", "content": prompt}]
+        
+        body = {
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 1000,
-            "messages": [{"role": "user", "content": prompt}]
-        })
+            "messages": messages
+        }
+        
+        if system_prompt:
+            body["system"] = system_prompt
         
         response = self.bedrock.invoke_model(
-            body=body,
+            body=json.dumps(body),
             modelId=self.model_id,
             accept='application/json',
             contentType='application/json'
@@ -45,210 +114,150 @@ class LLMClient:
         return response_body['content'][0]['text']
 
 
-class HuggingFaceLLMClient:
-    def __init__(self, model_name="distilgpt2"):
-        raise NotImplementedError("HuggingFace client temporarily disabled due to dependency conflicts")
-
-    def generate(self, prompt):
-        raise NotImplementedError("HuggingFace client temporarily disabled due to dependency conflicts")
-
-
 class OpenAILLMClient:
     def __init__(self, api_key=None, assistant_id=None):
         """
-        Initialize OpenAI client with Assistant support only.
+        Initialize OpenAI LLM client.
         
         Args:
-            api_key: OpenAI API key. If None, will use OPENAI_API_KEY environment variable.
-            assistant_id: OpenAI Assistant ID. If None, will use OPENAI_ASSISTANT_ID environment variable.
+            api_key: OpenAI API key (if None, will use OPENAI_API_KEY env var)
+            assistant_id: OpenAI Assistant ID (if None, will use OPENAI_ASSISTANT_ID env var)
         """
-        api_key = api_key or os.getenv('OPENAI_API_KEY')
-        if not api_key:
+        import openai
+        
+        self.api_key = api_key or os.getenv('OPENAI_API_KEY')
+        if not self.api_key:
             raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
         
         self.assistant_id = assistant_id or os.getenv('OPENAI_ASSISTANT_ID')
-        if not self.assistant_id:
-            raise ValueError("OpenAI Assistant ID is required. Set OPENAI_ASSISTANT_ID environment variable or pass assistant_id parameter.")
         
-        # Use Assistants API v2 (v1 is deprecated)
-        # Set default headers with v2 beta header
-        self.client = OpenAI(
-            api_key=api_key,
+        # Initialize OpenAI client
+        self.client = openai.OpenAI(
+            api_key=self.api_key,
             default_headers={"OpenAI-Beta": "assistants=v2"}
         )
 
-    def generate(self, prompt, additional_instructions=None):
+    def generate(self, prompt, system_prompt=None):
         """
-        Generate text using OpenAI Assistants API.
+        Generate text using OpenAI.
         
         Args:
-            prompt: The prompt text
-            additional_instructions: Optional additional instructions to pass to the assistant run
+            prompt: The input prompt
+            system_prompt: System instructions for the assistant
             
         Returns:
             str: The generated text response
         """
-        return self._generate_with_assistant(prompt, additional_instructions)
+        return self._generate_with_api(prompt, system_prompt)
     
-    def _generate_with_assistant(self, prompt, additional_instructions=None):
+    def _generate_with_api(self, prompt, system_prompt=None):
         """
-        Generate text using OpenAI Assistants API.
+        Generate text using OpenAI Chat Completions API.
         
         Args:
             prompt: The prompt text
+            system_prompt: System instructions (optional)
             
         Returns:
             str: The generated text response
         """
-        import time
-        import logging
+        messages = []
         
-        logger = logging.getLogger(__name__)
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
         
-        # Create a thread (v2 header is set in client default_headers)
-        thread = self.client.beta.threads.create()
+        messages.append({"role": "user", "content": prompt})
         
         try:
-            # Add message to thread
-            self.client.beta.threads.messages.create(
-                thread_id=thread.id,
-                role="user",
-                content=prompt
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",  # Faster and cheaper than gpt-3.5-turbo
+                messages=messages,
+                temperature=0.2,
+                max_tokens=1000
             )
             
-            # Run the assistant with additional instructions if provided
-            run_params = {
-                "thread_id": thread.id,
-                "assistant_id": self.assistant_id
-            }
-            if additional_instructions:
-                run_params["additional_instructions"] = additional_instructions
+            return response.choices[0].message.content
             
-            run = self.client.beta.threads.runs.create(**run_params)
-            
-            # Poll for completion with timeout
-            max_wait_time = 180  # 3 minutes max per request
-            start_time = time.time()
-            
-            while run.status in ['queued', 'in_progress', 'cancelling']:
-                elapsed = time.time() - start_time
-                if elapsed > max_wait_time:
-                    raise TimeoutError(f"Assistant run timed out after {max_wait_time} seconds")
-                
-                time.sleep(1.0)
-                run = self.client.beta.threads.runs.retrieve(
-                    thread_id=thread.id,
-                    run_id=run.id
-                )
-            
-            # Check if run requires action (tool calls, etc.)
-            if run.status == 'requires_action':
-                logger.warning(f"Assistant run requires action: {run.required_action}")
-                raise RuntimeError(f"Assistant run requires action: {run.required_action}")
-            
-            if run.status == 'completed':
-                # Retrieve the messages
-                messages = self.client.beta.threads.messages.list(
-                    thread_id=thread.id,
-                    order="asc"  # Get messages in chronological order
-                )
-                
-                # Get the assistant's response (last message should be assistant's response)
-                assistant_messages = [msg for msg in messages.data if msg.role == 'assistant']
-                if not assistant_messages:
-                    raise ValueError("No assistant response found in thread messages")
-                
-                # Get the most recent assistant message
-                latest_message = assistant_messages[-1]
-                
-                # Extract text content from the message
-                if latest_message.content:
-                    text_parts = []
-                    for content_item in latest_message.content:
-                        if content_item.type == 'text':
-                            text_parts.append(content_item.text.value)
-                        elif content_item.type == 'tool_use':
-                            # Assistant is using tools - this shouldn't happen for topic extraction
-                            pass
-                    
-                    if text_parts:
-                        return "\n".join(text_parts)
-                
-                raise ValueError(f"Assistant response has no text content. Content types: {[c.type for c in latest_message.content]}")
-            elif run.status == 'failed':
-                error_info = run.last_error if run.last_error else "Unknown error"
-                raise RuntimeError(f"Assistant run failed: {error_info}")
-            else:
-                raise RuntimeError(f"Assistant run ended with unexpected status: {run.status}. Error: {run.last_error}")
-        
-        finally:
-            # Clean up: delete the thread (optional, but good practice)
-            try:
-                self.client.beta.threads.delete(thread.id)
-            except:
-                pass  # Ignore cleanup errors
+        except Exception as e:
+            raise RuntimeError(f"OpenAI API error: {str(e)}")
 
 
 class TopicExtractor:
     def __init__(self, llm_client):
         self.llm_client = llm_client
 
-    def extract_topics(self, text, current_topics=None):
-        # Build user message prompt (simplified since assistant has main instructions)
-        prompt = build_topic_extraction_prompt(text, current_topics)
+    def extract_topics(self, text, current_topics=None, max_chars=8000):
+        """
+        Extract exactly 8 topics from text.
         
-        # Get additional instructions focused on topic reuse
-        additional_instructions = get_topic_reuse_additional_instructions(current_topics)
+        Args:
+            text: Paper text to analyze
+            current_topics: List of existing topics to reuse when relevant
+            max_chars: Maximum characters to send to LLM (increased from 2000)
         
-        # Generate response with additional instructions
-        response = self.llm_client.generate(prompt, additional_instructions=additional_instructions).strip()
+        Returns:
+            List of extracted topics (max 8)
+        """
+        # Truncate text if too large instead of chunking
+        # This prevents duplicate topic extraction and is faster
+        if len(text) > max_chars:
+            # Take beginning and end of paper for better context
+            chunk_size = max_chars // 2
+            text = text[:chunk_size] + "\n...\n" + text[-chunk_size:]
         
-        import logging
-        logger = logging.getLogger(__name__)
+        return self._extract_from_text(text, current_topics)
+    
+    def _extract_from_text(self, text, current_topics):
+        """
+        Extract topics from text using JSON output format.
+        """
+        # Build prompt with existing topics if provided
+        existing_topics_str = ""
+        if current_topics:
+            # Convert to list if it's a set
+            topics_list = list(current_topics) if isinstance(current_topics, set) else current_topics
+            existing_topics_str = f"\n\nExisting Topics Database:\n{json.dumps(topics_list, indent=2)}\n\nPlease prioritize reusing these topics when relevant."
+        
+        prompt = f"""{existing_topics_str}
 
-        # Try to parse JSON response
+Academic Paper Text:
+{text}
+
+Extract EXACTLY 8 topics in JSON format."""
+
         try:
-            # First, try to extract JSON from the response (in case there's extra text)
-            # Look for JSON object pattern
-            json_match = re.search(r'\{[^{}]*"topics"[^{}]*\[[^\]]*\][^{}]*\}', response, re.DOTALL)
+            response = self.llm_client.generate(prompt, system_prompt=system_prompt).strip()
+            
+            # Try to extract JSON from response
+            # Handle cases where LLM wraps JSON in markdown code blocks
+            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL)
             if json_match:
-                json_str = json_match.group(0)
+                json_str = json_match.group(1)
             else:
-                # Try to find any JSON object
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                # Try to find JSON object directly
+                json_match = re.search(r'\{.*?\}', response, re.DOTALL)
                 if json_match:
                     json_str = json_match.group(0)
                 else:
                     json_str = response
             
-            # Parse the JSON
-            data = json.loads(json_str)
+            # Parse JSON
+            result = json.loads(json_str)
+            topics = result.get('topics', [])
             
-            # Extract topics from the JSON
-            if isinstance(data, dict) and "topics" in data:
-                topics = data["topics"]
-            elif isinstance(data, list):
-                # If it's just a list, use it directly
-                topics = data
-            else:
-                logger.warning(f"⚠️ Unexpected JSON structure: {data}")
-                return []
-            
-            # Validate and clean topics
+            # Ensure we return at most 8 topics
             if isinstance(topics, list):
-                cleaned_topics = [str(t).strip() for t in topics if t]
-                return cleaned_topics
-            else:
-                logger.warning(f"⚠️ Topics is not a list: {type(topics)}")
-                return []
-                
+                return [str(t).strip() for t in topics[:8] if t]
+            
+            return []
+            
         except json.JSONDecodeError as e:
-            logger.warning(f"⚠️ Failed to parse JSON: {e}. Response: {response[:1000]}")
+            print(f"JSON parsing error: {e}")
+            print(f"Response was: {response}")
             return []
         except Exception as e:
-            logger.warning(f"⚠️ Error parsing response: {e}. Response: {response[:1000]}")
+            print(f"Error extracting topics: {e}")
             return []
-
 
 
 if __name__ == "__main__":
@@ -256,12 +265,25 @@ if __name__ == "__main__":
     model_id = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
     bedrock_client = LLMClient(model_id=model_id)
     
-    # HuggingFace client temporarily disabled
-    # hf_client = HuggingFaceLLMClient(model_name="distilgpt2")
-    
     # Use Bedrock client with TopicExtractor
     topic_extractor = TopicExtractor(bedrock_client)
 
-    sample_text = "Artificial Intelligence and Machine Learning are transforming the tech industry. Cloud computing provides scalable resources for AI applications."
-    extracted_topics = topic_extractor.extract_topics(sample_text, current_topics=["Artificial Intelligence", "Cloud Computing", "Data Science"])
+    sample_text = """
+    This paper presents a novel approach to neural architecture search using 
+    reinforcement learning techniques. We develop a deep learning framework 
+    that automatically discovers optimal network architectures for computer 
+    vision tasks. Our method leverages transfer learning and attention mechanisms 
+    to improve model performance on image classification benchmarks. We evaluate 
+    our approach on CIFAR-10 and ImageNet datasets, demonstrating significant 
+    improvements over manually designed architectures.
+    """
+    
+    existing_topics = ["Machine Learning", "Computer Vision", "Deep Learning", "Reinforcement Learning"]
+    
+    extracted_topics = topic_extractor.extract_topics(
+        sample_text, 
+        current_topics=existing_topics
+    )
+    
     print("Extracted Topics:", extracted_topics)
+    print(f"Number of topics: {len(extracted_topics)}")

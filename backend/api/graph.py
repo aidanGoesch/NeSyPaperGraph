@@ -69,8 +69,9 @@ async def upload_papers(files: List[UploadFile] = File(...)):
         # Read all files into memory (don't save to disk)
         files_data = []
         for file in files:
-            if not file.filename or not file.filename.endswith('.pdf'):
-                raise HTTPException(status_code=400, detail=f"File {file.filename} is not a PDF")
+            # Skip hidden files and non-PDF files
+            if not file.filename or file.filename.startswith('.') or not file.filename.endswith('.pdf'):
+                continue
             
             # Read file content asynchronously into memory
             contents = await file.read()

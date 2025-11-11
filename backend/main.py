@@ -1,3 +1,5 @@
+import signal
+import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,6 +10,12 @@ import os
 
 # Load environment variables from .env file
 load_dotenv()
+
+def signal_handler(sig, frame):
+    print('\nShutting down gracefully...')
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
 
 class SearchRequest(BaseModel):
     query: str
