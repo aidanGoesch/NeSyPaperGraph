@@ -1,126 +1,18 @@
-from fastapi import APIRouter
-from pydantic import BaseModel
-from services.graph_builder import create_dummy_graph, GraphBuilder
-
-router = APIRouter()
-
-class FileList(BaseModel):
-    files: list[str]
-
-from fastapi import APIRouter, File, UploadFile
-from pydantic import BaseModel
-from services.graph_builder import create_dummy_graph, GraphBuilder
+from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from services.graph_builder import create_dummy_graph, GraphBuilder, get_all_topics_seen
+import traceback
+import logging
 from typing import List
-import tempfile
-import os
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-class FileList(BaseModel):
-    files: list[str]
-
-@router.post("/graph/build")
-async def build_graph_from_files(files: List[UploadFile] = File(...)):
-    """Build graph from uploaded PDF files"""
-    try:
-        print(f"Received {len(files)} files")
-        
-        from models.paper import Paper
-        from services.pdf_preprocessor import extract_text_from_pdf
-        from services.llm_service import TopicExtractor, LLMClient
-        
-        # Initialize LLM for topic extraction
-        client = HuggingFaceLLMClient()
-        extractor = TopicExtractor(client)
-        
-        papers = []
-        
-        # Process each uploaded PDF file
-        for uploaded_file in files[:5]:  # Limit to 5 files
-            if not uploaded_file.filename.endswith('.pdf'):
-                continue
-                
-            try:
-                # Save uploaded file temporarily
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-                    content = await uploaded_file.read()
-                    temp_file.write(content)
-                    temp_path = temp_file.name
-                
-                # Extract text from PDF
-                text = extract_text_from_pdf(temp_path)
-                file_name = uploaded_file.filename.replace('.pdf', '')
-                
-                # Create paper with extracted text
-                paper = Paper(
-                    title=file_name,
-                    file_path=uploaded_file.filename,
-                    text=text[:2000]  # Limit text for LLM processing
-                )
-                
-                # Extract topics using LLM
-                topics = extractor.extract_topics(paper.text)
-                paper.topics = topics if topics else ["General"]
-                
-                papers.append(paper)
-                print(f"Processed {file_name}: {len(topics)} topics extracted")
-                
-                # Clean up temp file
-                os.unlink(temp_path)
-                
-            except Exception as e:
-                print(f"Error processing {uploaded_file.filename}: {e}")
-                continue
-        
-        # Build graph from processed papers
-        from models.graph import PaperGraph
-        graph_obj = PaperGraph()
-        for paper in papers:
-            graph_obj.add_paper(paper)
-        
-        graph_obj.add_semantic_edges()
-        
-        # Format response
-        papers_data = []
-        topics = set()
-        edges = []
-        
-        for node, data in graph_obj.graph.nodes(data=True):
-            if data.get('type') == 'paper':
-                paper_data = data['data']
-                papers_data.append({
-                    "title": paper_data.title,
-                    "topics": paper_data.topics
-                })
-                topics.update(paper_data.topics)
-            elif data.get('type') == 'topic':
-                topics.add(node)
-        
-        for source, target, edge_data in graph_obj.graph.edges(data=True):
-            edges.append({
-                "source": source,
-                "target": target,
-                "type": edge_data.get('type', 'topic'),
-                "weight": edge_data.get('weight', 1.0)
-            })
-        
-        print(f"Returning {len(papers_data)} papers, {len(topics)} topics, {len(edges)} edges")
-        
-        return {
-            "papers": papers_data,
-            "topics": list(topics),
-            "edges": edges
-        }
-    except Exception as e:
-        print(f"Error: {e}")
-        return {"error": str(e)}
-
-@router.get("/graph/dummy")
-def get_dummy_graph():
-    """Get dummy graph data for frontend visualization"""
-    graph = create_dummy_graph()
-    
-    # Extract papers and topics from NetworkX graph
+def graph_to_dict(graph):
+    """Convert PaperGraph to dictionary format for frontend"""
     papers = []
     topics = set()
     edges = []
@@ -150,3 +42,63 @@ def get_dummy_graph():
         "topics": list(topics),
         "edges": edges
     }
+
+@router.get("/graph/dummy")
+def get_dummy_graph():
+    """Get dummy graph data for frontend visualization"""
+    graph = create_dummy_graph()
+    return graph_to_dict(graph)
+
+
+@router.post("/graph/upload")
+async def upload_papers(files: List[UploadFile] = File(...)):
+    """
+    Upload PDF files, process them with OpenAI, and return graph data.
+    Files are processed in memory and not stored on disk.
+    
+    Args:
+        files: List of PDF files to upload and process
+        
+    Returns:
+        Graph data in the same format as /graph/dummy endpoint
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+    
+    try:
+        # Read all files into memory (don't save to disk)
+        files_data = []
+        for file in files:
+            if not file.filename or not file.filename.endswith('.pdf'):
+                raise HTTPException(status_code=400, detail=f"File {file.filename} is not a PDF")
+            
+            # Read file content asynchronously into memory
+            contents = await file.read()
+            files_data.append((file.filename, contents))
+        
+        # Process the PDFs using GraphBuilder (which uses OpenAI)
+        builder = GraphBuilder()
+        graph = builder.build_graph(files_data=files_data)
+        
+        # Convert graph to frontend format
+        graph_data = graph_to_dict(graph)
+        
+        # Add all topics seen across all uploads to the response
+        all_topics = get_all_topics_seen()
+        graph_data["all_topics_seen"] = list(all_topics)
+        
+        return JSONResponse(content=graph_data)
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        # Log the full error for debugging
+        error_trace = traceback.format_exc()
+        logger.error(f"Error processing files: {str(e)}\n{error_trace}")
+        
+        # Return detailed error message
+        error_msg = f"Error processing files: {str(e)}"
+        if "OPENAI" in str(e).upper() or "assistant" in str(e).lower():
+            error_msg += " (Check your OPENAI_API_KEY and OPENAI_ASSISTANT_ID environment variables)"
+        raise HTTPException(status_code=500, detail=error_msg)

@@ -3,6 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from api.graph import router as graph_router
 from services.question_agent import QuestionAgent
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
 
 class SearchRequest(BaseModel):
     query: str

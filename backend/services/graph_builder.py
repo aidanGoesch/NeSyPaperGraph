@@ -1,10 +1,16 @@
 from models.graph import PaperGraph
 from models.paper import Paper
 from models.topic import Topic
-from services.llm_service import TopicExtractor, LLMClient
+from services.llm_service import TopicExtractor, OpenAILLMClient
 from services.pdf_preprocessor import extract_text_from_pdf
 import os
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Global set to store all topics seen across all uploads (in-memory, not persistent)
+_all_topics_seen = set()
 
 
 class GraphBuilder:
@@ -13,31 +19,91 @@ class GraphBuilder:
         self.topics = set()
 
 
-    def build_graph(self, file_path: str) -> PaperGraph:
+    def build_graph(self, files_data=None, file_path: str = None) -> PaperGraph:
         """
-        Builds a graph from the given file path of pdfs
-        """
-        self.get_papers(file_path)
-
-        # get the topics from the papers
-        client = HuggingFaceLLMClient()
-        extractor = TopicExtractor(client)
-        for paper in self.papers:
-            topics = extractor.extract_topics(paper.text)
-            paper.topics = topics
-            self.topics.update(set(topics)) # add the topics to the set of topics member variable
+        Builds a graph from PDF files.
+        Processes papers sequentially, adding each to the graph immediately,
+        and passing accumulated topics to the next paper's topic extraction.
         
-        # build the graph
+        Args:
+            files_data: List of tuples (filename, file_content_bytes), or None
+            file_path: Directory path to scan for PDFs (legacy support), or None
+        """
+        # Reset state for new build
+        self.papers = []
+        self.topics = set()
+        
+        if files_data is not None:
+            self.get_papers_from_data(files_data)
+        elif file_path is not None:
+            self.get_papers(file_path)
+        else:
+            raise ValueError("Either files_data or file_path must be provided")
+
+        # Initialize graph
         graph = PaperGraph()
+        
+        # Get all topics seen across all previous uploads
+        global _all_topics_seen
+        accumulated_topics = _all_topics_seen.copy()  # Start with all previously seen topics
+        
+        # Use OpenAI assistant (reads assistant_id from environment)
+        client = OpenAILLMClient()
+        extractor = TopicExtractor(client)
+        
+        # Process papers one at a time, adding each to graph immediately
         for paper in self.papers:
+            # Truncate very long texts to avoid excessive processing time
+            # Keep first 50000 characters (enough for topic extraction)
+            text_for_extraction = paper.text[:50000] if len(paper.text) > 50000 else paper.text
+            
+            # Extract topics, passing in all accumulated topics (global + from previous papers in this batch)
+            topics = extractor.extract_topics(text_for_extraction, current_topics=accumulated_topics)
+            paper.topics = topics
+            
+            # Update accumulated topics with new topics from this paper
+            new_topics = set(topics) - accumulated_topics
+            if new_topics:
+                accumulated_topics.update(new_topics)
+            
+            self.topics.update(set(topics))  # Track topics for this batch
+            
+            # Add topics to global set of all topics seen (if not already there)
+            global_new_topics = set(topics) - _all_topics_seen
+            if global_new_topics:
+                _all_topics_seen.update(global_new_topics)
+            
+            # Add paper to graph immediately after processing
             graph.add_paper(paper)
+        
+        logger.info(f"Processed {len(self.papers)} papers, {len(self.topics)} unique topics in this batch")
         
         return graph
 
 
+    def get_papers_from_data(self, files_data: list[tuple]) -> list[Paper]:
+        """
+        Creates Paper objects from file data (filename, content bytes).
+        
+        Args:
+            files_data: List of tuples (filename, file_content_bytes)
+        """
+        for filename, file_content in files_data:
+            # Extract filename without extension for title
+            title = Path(filename).stem
+            paper = Paper(
+                title=title,
+                file_path=filename,  # Keep original filename for reference
+                text=extract_text_from_pdf(file_content)
+            )
+            self.papers.append(paper)
+        
+        return self.papers
+
     def get_papers(self, file_path: str) -> list[Paper]:
         """
-        Gets all of the pdfs in the given file path and all of its sub folders
+        Gets all of the pdfs in the given file path and all of its sub folders.
+        Legacy method for backward compatibility.
         """
         path = Path(file_path)
         
@@ -50,6 +116,17 @@ class GraphBuilder:
             self.papers.append(paper)
         
         return self.papers
+
+
+def get_all_topics_seen():
+    """Get the set of all topics seen across all uploads"""
+    return _all_topics_seen.copy()
+
+
+def clear_all_topics_seen():
+    """Clear the set of all topics seen (useful for testing or reset)"""
+    global _all_topics_seen
+    _all_topics_seen.clear()
 
 
 def create_dummy_graph() -> PaperGraph:

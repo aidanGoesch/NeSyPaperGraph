@@ -3,7 +3,7 @@
 import os
 import sys
 from pathlib import Path
-from services.pdf_preprocessor import extract_text_from_pdf, extract_topics
+from services.pdf_preprocessor import extract_text_from_pdf
 
 def test_pdf_parsing(pdf_path):
     """Test PDF parsing on a single file"""
@@ -24,16 +24,10 @@ def test_pdf_parsing(pdf_path):
         return False
     
     print(f"✅ Successfully extracted {len(text)} characters")
-    print(f"📄 Full text:")
+    print(f"📄 First 500 characters:")
     print("-" * 50)
-    print(text)
+    print(text[:500])
     print("-" * 50)
-
-
-    print("Extracting topics using KeyBERT...")
-    extracted_topics = extract_topics(text)
-
-    print("Extracted Topics:", [x for x in extracted_topics])
         
     return True
     
