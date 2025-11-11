@@ -19,7 +19,7 @@ class GraphBuilder:
         self.topics = set()
 
 
-    def build_graph(self, files_data=None, file_path: str = None) -> PaperGraph:
+    def build_graph(self, files_data=None, file_path: str = None, existing_graph=None) -> PaperGraph:
         """
         Builds a graph from PDF files.
         Processes papers sequentially, adding each to the graph immediately,
@@ -28,10 +28,24 @@ class GraphBuilder:
         Args:
             files_data: List of tuples (filename, file_content_bytes), or None
             file_path: Directory path to scan for PDFs (legacy support), or None
+            existing_graph: Existing PaperGraph to update, or None to create new
         """
-        # Reset state for new build
-        self.papers = []
-        self.topics = set()
+        # Use existing graph or create new one
+        if existing_graph:
+            graph = existing_graph
+            # Extract existing papers and topics
+            self.papers = []
+            self.topics = set()
+            for node, data in graph.graph.nodes(data=True):
+                if data.get('type') == 'paper':
+                    self.papers.append(data['data'])
+                elif data.get('type') == 'topic':
+                    self.topics.add(node)
+        else:
+            # Reset state for new build
+            self.papers = []
+            self.topics = set()
+            graph = PaperGraph()
         
         if files_data is not None:
             self.get_papers_from_data(files_data)
@@ -40,8 +54,9 @@ class GraphBuilder:
         else:
             raise ValueError("Either files_data or file_path must be provided")
 
-        # Initialize graph
-        graph = PaperGraph()
+        # Initialize graph (already done above if existing_graph provided)
+        if not existing_graph:
+            graph = PaperGraph()
         
         # Get all topics seen across all previous uploads
         global _all_topics_seen

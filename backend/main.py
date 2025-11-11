@@ -23,10 +23,23 @@ class SearchRequest(BaseModel):
 def get_current_graph_data():
     """Get the most recent graph data"""
     try:
+        # Try to load saved graph first
+        import pickle
+        save_path = "storage/saved_graph.pkl"
+        if os.path.exists(save_path):
+            with open(save_path, 'rb') as f:
+                from api.graph import graph_to_dict
+                graph = pickle.load(f)
+                return graph_to_dict(graph)
+    except Exception as e:
+        print(f"Could not load saved graph: {e}")
+    
+    try:
+        # Fallback to dummy graph
         from api.graph import get_dummy_graph
         return get_dummy_graph()
     except Exception as e:
-        print(f"Could not load current graph data: {e}")
+        print(f"Could not load dummy graph: {e}")
         return {
             "papers": [
                 {"title": "Paper A", "topics": ["Topic 1", "Topic 2", "Topic 3"]},

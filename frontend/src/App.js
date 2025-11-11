@@ -37,15 +37,25 @@ function App() {
         }
     }, [chatHistory]);
 
-    // Removed initial dummy data load - graph will be empty until papers are uploaded
-    // useEffect(() => {
-    //     fetch("http://localhost:8000/api/graph/dummy")
-    //         .then((response) => response.json())
-    //         .then((data) => setGraphData(data))
-    //         .catch((error) => {
-    //             console.error("Error:", error);
-    //         });
-    // }, []);
+    // Load saved graph on startup, fallback to dummy if none exists
+    useEffect(() => {
+        // Try to load saved graph first
+        fetch("http://localhost:8000/api/graph/load")
+            .then((response) => {
+                if (response.ok) {
+                    return response.json();
+                } else {
+                    // If no saved graph, try dummy
+                    return fetch("http://localhost:8000/api/graph/dummy").then(r => r.json());
+                }
+            })
+            .then((data) => setGraphData(data))
+            .catch((error) => {
+                console.error("Error loading graph:", error);
+                // Fallback to empty state
+                setGraphData(null);
+            });
+    }, []);
 
     const showAgentArchitecture = async () => {
         try {

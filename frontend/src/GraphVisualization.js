@@ -72,7 +72,7 @@ const GraphVisualization = ({ data, isDarkMode, onShowArchitecture }) => {
     const g = svg.append("g");
 
     const zoom = d3.zoom()
-      .scaleExtent([0.5, 3])
+      .scaleExtent([0.1, 5])
       .on("zoom", (event) => {
         g.attr("transform", event.transform);
         updatePanelPosition(); // move with zoom/pan
