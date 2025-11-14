@@ -1,5 +1,5 @@
 import os
-from typing import TypedDict
+from typing import TypedDict, List, Tuple
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -13,14 +13,38 @@ class AgentState(TypedDict):
     answer: str
 
 class QuestionAgent:
-    def __init__(self, graph_data=None):
+    def __init__(self, graph_data=None, graph_obj=None):
         self.llm = ChatOpenAI(
             model="gpt-3.5-turbo",
             temperature=0.7,
             api_key=os.getenv("OPENAI_API_KEY")
         )
         self.graph_data = graph_data
+        self.graph_obj = graph_obj
         self.graph = self._build_graph()
+    
+    def _get_graph_object(self):
+        """Get the actual graph object, either from stored object or by loading from file"""
+        if self.graph_obj:
+            return self.graph_obj
+        
+        # Try to load the saved graph
+        try:
+            import pickle
+            save_path = "storage/saved_graph.pkl"
+            if os.path.exists(save_path):
+                with open(save_path, 'rb') as f:
+                    return pickle.load(f)
+        except Exception as e:
+            print(f"Could not load saved graph: {e}")
+        
+        # Fallback to dummy graph
+        try:
+            from services.graph_builder import create_dummy_graph
+            return create_dummy_graph()
+        except Exception as e:
+            print(f"Could not create dummy graph: {e}")
+            return None
     
     def _build_graph(self):
         workflow = StateGraph(AgentState)
@@ -96,8 +120,8 @@ class QuestionAgent:
         
         if start_node and end_node:
             path_result = self._find_path_in_graph(start_node, end_node)
-            state["context"] = f"Finding path between '{start_node}' and '{end_node}': {path_result}"
-            print(f"Bridge analysis: {start_node} -> {end_node} | Result: {path_result}")
+            state["context"] = path_result
+            print(f"Bridge analysis: {start_node} -> {end_node}")
         else:
             state["context"] = f"Could not identify two entities to connect in: {question}"
             print(f"Could not parse entities from bridge question: {question}")
@@ -131,12 +155,77 @@ Question: {question}
         
         return None, None
     
+    def _explain_segment(self, topic1: str, paper_content: str, paper_title: str, topic2: str) -> str:
+        """Use LLM to explain how topic1 connects to topic2 through a paper"""
+        prompt = f"""You are analyzing a research paper to understand how two topics are connected.
+
+Topic 1: {topic1}
+Topic 2: {topic2}
+
+Paper Title: {paper_title}
+
+Paper Content:
+{paper_content}
+
+Task: Explain how this paper connects "{topic1}" to "{topic2}". Focus on the key concepts, methods, or findings that bridge these two topics. Be concise but thorough.
+
+Your explanation:"""
+
+        try:
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            explanation = response.content.strip()
+            print(f"Segment explanation generated: {topic1} -> {paper_title} -> {topic2}")
+            return explanation
+        except Exception as e:
+            print(f"Error generating segment explanation: {e}")
+            return f"Unable to explain connection through {paper_title}"
+    
+    def _synthesize_chain_explanation(self, segment_explanations: List[Tuple[str, str, str, str]], 
+                                     start_entity: str, end_entity: str, path_str: str) -> str:
+        """Synthesize individual segment explanations into a coherent overall explanation"""
+        
+        # Build the synthesis prompt
+        segments_text = []
+        for i, (topic1, paper_title, topic2, explanation) in enumerate(segment_explanations, 1):
+            segments_text.append(f"Segment {i}: {topic1} → {paper_title} → {topic2}\n{explanation}")
+        
+        synthesis_prompt = f"""You have analyzed a chain of research papers connecting "{start_entity}" to "{end_entity}".
+
+Here are the individual segment explanations:
+
+{chr(10).join(segments_text)}
+
+Connection Path: {path_str}
+
+Task: Synthesize these segment explanations into a coherent, flowing explanation of how "{start_entity}" relates to "{end_entity}" through this chain of papers. Show how each connection builds on the previous one to form a complete picture.
+
+Your synthesized explanation:"""
+
+        try:
+            response = self.llm.invoke([HumanMessage(content=synthesis_prompt)])
+            synthesis = response.content.strip()
+            
+            # Add the visual path at the end
+            synthesis += f"\n\n**Connection Path:**\n{path_str}"
+            
+            print(f"Chain synthesis completed for: {start_entity} -> {end_entity}")
+            return synthesis
+        except Exception as e:
+            print(f"Error synthesizing chain explanation: {e}")
+            # Fallback: just concatenate the segments
+            fallback = f"Connection from {start_entity} to {end_entity}:\n\n"
+            for i, (_, _, _, explanation) in enumerate(segment_explanations, 1):
+                fallback += f"{i}. {explanation}\n\n"
+            fallback += f"\n**Connection Path:**\n{path_str}"
+            return fallback
+    
     def _find_path_in_graph(self, start_entity, end_entity):
-        """Find path between two entities using the graph object's pathfinding"""
+        """Find path between two entities and use chain reasoning to explain the connection"""
         try:
             # Get the actual graph object
-            from services.graph_builder import create_dummy_graph
-            graph_obj = create_dummy_graph()
+            graph_obj = self._get_graph_object()
+            if not graph_obj:
+                return "Graph not available"
             
             # Find nodes that match the entities
             start_node = None
@@ -156,15 +245,83 @@ Question: {question}
             import networkx as nx
             try:
                 path = nx.shortest_path(graph_obj.graph, start_node, end_node)
-                path_str = " -> ".join([str(node) for node in path])
-                return f"Path found: {path_str}"
+                path_str = " → ".join([str(node) for node in path])
+                
+                print(f"Path found: {path_str}")
+                print(f"Path length: {len(path)} nodes")
+                
+                # Extract segments: topic -> paper -> topic chains
+                segment_explanations = []
+                
+                i = 0
+                while i < len(path) - 1:
+                    current_node = path[i]
+                    current_data = graph_obj.graph.nodes[current_node]
+                    
+                    # Look for topic -> paper -> topic pattern
+                    if current_data.get('type') == 'topic' and i + 2 < len(path):
+                        paper_node = path[i + 1]
+                        next_topic_node = path[i + 2]
+                        
+                        paper_data = graph_obj.graph.nodes[paper_node]
+                        next_topic_data = graph_obj.graph.nodes[next_topic_node]
+                        
+                        if (paper_data.get('type') == 'paper' and 
+                            next_topic_data.get('type') == 'topic' and 
+                            'data' in paper_data):
+                            
+                            # Get full paper content
+                            paper = paper_data['data']
+                            paper_content = getattr(paper, 'text', '')
+                            
+                            # If paper text is too long, truncate but keep substantial content
+                            if len(paper_content) > 8000:
+                                paper_content = paper_content[:8000] + "... [truncated]"
+                            
+                            # Generate explanation for this segment
+                            explanation = self._explain_segment(
+                                topic1=str(current_node),
+                                paper_content=paper_content,
+                                paper_title=paper.title,
+                                topic2=str(next_topic_node)
+                            )
+                            
+                            segment_explanations.append((
+                                str(current_node),
+                                paper.title,
+                                str(next_topic_node),
+                                explanation
+                            ))
+                            
+                            # Move to next topic
+                            i += 2
+                        else:
+                            i += 1
+                    else:
+                        i += 1
+                
+                # If we have segment explanations, synthesize them
+                if segment_explanations:
+                    print(f"Generated {len(segment_explanations)} segment explanations, synthesizing...")
+                    synthesized = self._synthesize_chain_explanation(
+                        segment_explanations, 
+                        start_entity, 
+                        end_entity,
+                        path_str
+                    )
+                    return f"CHAIN_REASONING_RESULT:\n\n{synthesized}"
+                else:
+                    # Fallback to simple path description
+                    return f"Path found: {path_str}\n\nNo detailed paper content available for analysis."
+                    
             except nx.NetworkXNoPath:
                 return "Those are not related"
                 
         except Exception as e:
             print(f"Error in pathfinding: {e}")
+            import traceback
+            traceback.print_exc()
             return "Those are not related"
-
     
     def _explain_question(self, state: AgentState) -> AgentState:
         """Answers questions of 'explain y', where y could be either a topic or a paper"""
@@ -185,9 +342,12 @@ Question: {question}
         
         try:
             # Get the actual graph object
-            from services.graph_builder import create_dummy_graph
-            graph_obj = create_dummy_graph()
+            graph_obj = self._get_graph_object()
+            if not graph_obj:
+                state["context"] = "Graph not available"
+                return state
             
+            relevant_papers = []
             relevant_nodes = []
             
             # Find directly matching nodes
@@ -199,15 +359,32 @@ Question: {question}
                     if term in node_str:
                         relevant_nodes.append(str(node))
                         
-                        # Also find semantically connected nodes
+                        # If it's a paper, collect its summary
+                        if data.get('type') == 'paper' and 'data' in data:
+                            paper = data['data']
+                            summary = getattr(paper, 'summary', None) or paper.text[:1000] + "..."
+                            relevant_papers.append(f"Paper: {paper.title}\nSummary: {summary}")
+                        
+                        # Also find semantically connected papers
                         for neighbor in graph_obj.graph.neighbors(node):
+                            neighbor_data = graph_obj.graph.nodes[neighbor]
                             neighbor_str = str(neighbor)
                             if neighbor_str not in relevant_nodes:
                                 relevant_nodes.append(neighbor_str)
+                                
+                                # If neighbor is a paper, collect its summary too
+                                if neighbor_data.get('type') == 'paper' and 'data' in neighbor_data:
+                                    paper = neighbor_data['data']
+                                    summary = getattr(paper, 'summary', None) or paper.text[:1000] + "..."
+                                    relevant_papers.append(f"Paper: {paper.title}\nSummary: {summary}")
                         break
             
-            if relevant_nodes:
-                state["context"] = f"Explaining with relevant nodes: {', '.join(relevant_nodes[:10])}"  # Limit output
+            if relevant_papers:
+                # Return paper summaries for LLM grounding
+                state["context"] = f"Explaining with relevant papers: {', '.join(relevant_nodes[:10])}\n\nPaper summaries for grounding:\n\n" + "\n\n---\n\n".join(relevant_papers)
+                print(f"Explain found {len(relevant_papers)} relevant papers with summaries")
+            elif relevant_nodes:
+                state["context"] = f"Explaining with relevant nodes: {', '.join(relevant_nodes[:10])}"
                 print(f"Explain found {len(relevant_nodes)} relevant nodes: {relevant_nodes[:5]}...")
             else:
                 state["context"] = "No relevant information found in graph"
@@ -220,36 +397,51 @@ Question: {question}
         return state
     
     def _keyword_search(self, state: AgentState) -> AgentState:
-        """Finds papers according to a keyword search"""
+        """Finds papers that match keywords in title or have topics that match keywords"""
         question = state["question"]
         print(f"Processing keyword search: {question}")
         
-        # Extract keywords from question
-        keywords = question.lower().split()
+        # Extract keywords from question (remove common words)
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'about', 'what', 'how', 'find', 'search', 'show', 'me', 'papers', 'documents'}
+        keywords = [word.lower() for word in question.split() if word.lower() not in stop_words]
         
         try:
             # Get the actual graph object
-            from services.graph_builder import create_dummy_graph
-            graph_obj = create_dummy_graph()
+            graph_obj = self._get_graph_object()
+            if not graph_obj:
+                state["context"] = "Graph not available"
+                return state
             
-            matching_nodes = []
+            matching_papers = []
             
-            # Search through all nodes in the graph
+            # Search through all paper nodes in the graph
             for node, data in graph_obj.graph.nodes(data=True):
-                node_str = str(node).lower()
-                
-                # Check if any keyword matches this node
-                for keyword in keywords:
-                    if keyword in node_str:
-                        matching_nodes.append(str(node))
-                        break
+                if data.get('type') == 'paper' and 'data' in data:
+                    paper = data['data']
+                    node_str = str(node).lower()
+                    
+                    # Check if any keyword matches the paper title
+                    title_match = any(keyword in node_str for keyword in keywords)
+                    
+                    # Check if any keyword matches the paper's topics
+                    topic_match = False
+                    if hasattr(paper, 'topics') and paper.topics:
+                        for topic in paper.topics:
+                            if any(keyword in topic.lower() for keyword in keywords):
+                                topic_match = True
+                                break
+                    
+                    if title_match or topic_match:
+                        summary = getattr(paper, 'summary', None) or paper.text[:1000] + "..."
+                        matching_papers.append(f"Paper: {paper.title}\nSummary: {summary}")
             
-            if matching_nodes:
-                state["context"] = f"Found matching nodes: {', '.join(matching_nodes)}"
-                print(f"Keyword search found: {matching_nodes}")
+            if matching_papers:
+                # Return paper summaries for LLM grounding
+                state["context"] = f"Found {len(matching_papers)} matching papers for keywords: {', '.join(keywords)}\n\nPaper summaries for grounding:\n\n" + "\n\n---\n\n".join(matching_papers)
+                print(f"Keyword search found {len(matching_papers)} papers with summaries")
             else:
-                state["context"] = "No matching papers or topics found"
-                print("No matching nodes found for keywords")
+                state["context"] = f"No papers found matching keywords: {', '.join(keywords)}"
+                print("No matching papers found for keywords")
                 
         except Exception as e:
             print(f"Error in keyword search: {e}")
@@ -264,8 +456,10 @@ Question: {question}
         
         try:
             # Get the actual graph object
-            from services.graph_builder import create_dummy_graph
-            graph_obj = create_dummy_graph()
+            graph_obj = self._get_graph_object()
+            if not graph_obj:
+                state["context"] = "Graph not available"
+                return state
             
             # Extract what property is being asked about
             question_lower = question.lower()
@@ -346,12 +540,30 @@ Question: {question}
         return state
     
     def _generate_answer(self, state: AgentState) -> AgentState:
-        """Generate answer using OpenAI"""
+        """Generate answer using OpenAI, grounded only in provided context"""
         question = state["question"]
         context = state.get("context", "")
         
+        # Check if this is a chain reasoning result (already synthesized by LLM)
+        if "CHAIN_REASONING_RESULT:" in context:
+            # Extract the synthesized explanation
+            state["answer"] = context.replace("CHAIN_REASONING_RESULT:\n\n", "")
+            return state
+        
+        # Check if context contains paper summaries (for grounding)
+        if "Paper summaries for grounding:" in context:
+            system_message = """You are a helpful assistant that answers questions about research papers and academic topics. 
+            
+            IMPORTANT: You must base your response ONLY on the paper summaries provided in the context. Do not use any external knowledge or make assumptions beyond what is explicitly stated in the provided summaries. If the provided summaries don't contain enough information to answer the question, say so clearly."""
+        elif "Path found:" in context:
+            system_message = """You are a helpful assistant that answers questions about research papers and academic topics.
+
+            IMPORTANT: You must base your response ONLY on the information provided in the context. Explain the connection concisely."""
+        else:
+            system_message = "You are a helpful assistant that answers questions about research papers and academic topics."
+        
         messages = [
-            SystemMessage(content="You are a helpful assistant that answers questions about research papers and academic topics."),
+            SystemMessage(content=system_message),
             HumanMessage(content=f"Context: {context}\n\nQuestion: {question}")
         ]
         
@@ -376,10 +588,13 @@ Question: {question}
             "    generate_answer --> END([Final Answer])",
             "    generate_answer -.-> OpenAI[OpenAI GPT-3.5]",
             "    OpenAI -.-> generate_answer",
+            "    bridge_question -.-> ChainReasoning[Chain of LLM Calls]",
+            "    ChainReasoning -.-> bridge_question",
             "",
             "    style START fill:#e1f5fe",
             "    style END fill:#c8e6c9", 
             "    style OpenAI fill:#fff3e0",
+            "    style ChainReasoning fill:#fff3e0",
             "    style route_question fill:#ffecb3",
             "    style bridge_question fill:#e8f5e8",
             "    style explain_question fill:#f3e5f5",

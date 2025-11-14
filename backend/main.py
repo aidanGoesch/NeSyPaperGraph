@@ -30,14 +30,14 @@ def get_current_graph_data():
             with open(save_path, 'rb') as f:
                 from api.graph import graph_to_dict
                 graph = pickle.load(f)
-                return graph_to_dict(graph)
+                return graph_to_dict(graph), graph  # Return both dict and object
     except Exception as e:
         print(f"Could not load saved graph: {e}")
     
     try:
         # Fallback to dummy graph
         from api.graph import get_dummy_graph
-        return get_dummy_graph()
+        return get_dummy_graph(), None
     except Exception as e:
         print(f"Could not load dummy graph: {e}")
         return {
@@ -46,7 +46,7 @@ def get_current_graph_data():
                 {"title": "Paper B", "topics": ["Topic 1", "Topic 2", "Topic 3"]}
             ],
             "topics": ["Topic 1", "Topic 2", "Topic 3"]
-        }
+        }, None
 
 app = FastAPI()
 agent = None
@@ -73,8 +73,8 @@ def get_data():
 def get_agent_architecture():
     global agent
     if not agent:
-        current_graph = get_current_graph_data()
-        agent = QuestionAgent(current_graph)
+        current_graph_data, current_graph_obj = get_current_graph_data()
+        agent = QuestionAgent(current_graph_data, current_graph_obj)
     mermaid_diagram = agent.get_mermaid_diagram()
     return {"mermaid": mermaid_diagram, "status": "success"}
 
@@ -82,8 +82,8 @@ def get_agent_architecture():
 async def search(request: SearchRequest):
     global agent
     if not agent:
-        current_graph = get_current_graph_data()
-        agent = QuestionAgent(current_graph)
+        current_graph_data, current_graph_obj = get_current_graph_data()
+        agent = QuestionAgent(current_graph_data, current_graph_obj)
     
     print(f"Received search query: {request.query}")
     

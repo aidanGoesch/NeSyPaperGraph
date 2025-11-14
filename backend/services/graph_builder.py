@@ -76,6 +76,9 @@ class GraphBuilder:
             topics = extractor.extract_topics(text_for_extraction, current_topics=accumulated_topics)
             paper.topics = topics
             
+            # Generate summary
+            paper.summary = client.generate_summary(text_for_extraction)
+            
             # Update accumulated topics with new topics from this paper
             new_topics = set(topics) - accumulated_topics
             if new_topics:

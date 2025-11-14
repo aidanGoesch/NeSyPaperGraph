@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import ReactMarkdown from "react-markdown";
 import GraphVisualization from "./GraphVisualization";
 import mermaid from "mermaid";
 import "./App.css";
@@ -18,6 +19,7 @@ function App() {
     const [followUpQuestion, setFollowUpQuestion] = useState("");
     const mermaidRef = useRef();
     const chatContentRef = useRef();
+    const chatInputRef = useRef();
 
     useEffect(() => {
         mermaid.initialize({ startOnLoad: true });
@@ -241,7 +243,7 @@ function App() {
                         }}
                         onFocus={() => setIsSearchExpanded(true)}
                         onBlur={() => setIsSearchExpanded(false)}
-                        className={`search-bar ${
+                        className={`search-bar unified-input ${
                             isSearchExpanded ? "expanded" : ""
                         }`}
                     />
@@ -259,7 +261,13 @@ function App() {
                         >
                             {/* X CLOSE BUTTON — now in top right corner */}
                             <button
-                                onClick={() => setShowChatPanel(false)}
+                                onClick={() => {
+                                    setShowChatPanel(false);
+                                    setTimeout(() => {
+                                        setSearchTerm("");
+                                        setIsSearchExpanded(false);
+                                    }, 300);
+                                }}
                                 className="close-button"
                             >
                                 ×
@@ -287,7 +295,9 @@ function App() {
                                                     <span></span>
                                                 </div>
                                             ) : (
-                                                <span> {entry.answer}</span>
+                                                <div className="markdown-content">
+                                                    <ReactMarkdown>{entry.answer}</ReactMarkdown>
+                                                </div>
                                             )}
                                         </div>
                                     </div>
@@ -308,12 +318,13 @@ function App() {
                                         e.key === "Enter" &&
                                         !isSearching
                                     ) {
+                                        e.preventDefault();
                                         handleSearch(followUpQuestion);
-                                        setFollowUpQuestion("");
+                                        chatInputRef.current?.focus();
                                     }
                                 }}
-                                disabled={isSearching}
-                                className={`chat-input ${
+                                ref={chatInputRef}
+                                className={`chat-input unified-input ${
                                     isDarkMode ? "dark" : "light"
                                 }`}
                             />

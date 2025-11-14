@@ -119,6 +119,18 @@ body {
   overflow: hidden;
 }
 
+/* Unified input styling */
+.unified-input {
+  padding: 12px 20px;
+  font-size: 15px;
+  border-radius: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  background: rgba(255, 255, 255, 0.9);
+  outline: none;
+  transition: all 0.3s ease;
+  box-sizing: border-box;
+}
+
 .search-bar {
   position: fixed;
   bottom: 20px;
@@ -136,8 +148,13 @@ body {
 }
 
 .search-bar.expanded {
-  width: 500px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  width: 540px;
+  background: rgba(255, 255, 255, 0.98);
+  color: #000;
+  border: 2px solid rgba(0, 0, 0, 0.3);
+  font-size: 15px;
+  font-weight: 500;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 
 .app.dark .search-bar {
@@ -146,13 +163,27 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
+.app.dark .search-bar.expanded {
+  background: rgba(255, 255, 255, 0.98);
+  color: #000;
+  border: 2px solid rgba(0, 0, 0, 0.3);
+}
+
 .search-bar:focus {
   outline: none;
-  background: rgba(0, 0, 0, 0.1);
+  background: rgba(255, 255, 255, 1);
+  color: #000;
+  border: 2px solid rgba(0, 0, 0, 0.3);
+  font-size: 15px;
+  font-weight: 500;
+  box-shadow: 0 0 0 3px rgba(76, 175, 80, 0.3);
 }
 
 .app.dark .search-bar:focus {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 1);
+  color: #000;
+  border: 2px solid rgba(0, 0, 0, 0.3);
+  box-shadow: 0 0 0 3px rgba(76, 175, 80, 0.3);
 }
 
 .search-bar::placeholder {
@@ -160,6 +191,11 @@ body {
 }
 
 .app.dark .search-bar::placeholder {
+  color: #666;
+}
+
+.search-bar.expanded::placeholder,
+.search-bar:focus::placeholder {
   color: #666;
 }
 
@@ -181,7 +217,7 @@ body {
   height: 70vh;
   max-height: calc(100vh - 40px);
   z-index: 1500;
-  animation: slideUp 0.3s ease-out;
+  animation: none;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -189,16 +225,16 @@ body {
 
 .chat-panel {
   flex: 1;
+  animation: slideUp 0.8s ease-out;
   overflow-y: scroll;
   overflow-x: hidden;
   background: rgba(255, 255, 255, 0.98);
   backdrop-filter: blur(10px);
-  border-radius: 8px 8px 0 0;
+  border-radius: 8px;
   border: 1px solid rgba(0, 0, 0, 0.2);
-  border-bottom: none;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  box-shadow: none;
   scroll-behavior: smooth;
-  padding-bottom: 25px;
+  padding: 15px 0 25px 0;
   position: relative;
 }
 
@@ -210,11 +246,11 @@ body {
 
 @keyframes slideUp {
   from {
-    transform: translateX(-50%) translateY(100%);
+    transform: translateY(100%);
     opacity: 0;
   }
   to {
-    transform: translateX(-50%) translateY(0);
+    transform: translateY(0);
     opacity: 1;
   }
 }
@@ -240,17 +276,22 @@ body {
 }
 
 .close-button {
+  position: sticky;
+  top: -10px;
+  left: calc(100% - 35px);
+  margin-top: -15px;
   background: none;
   border: none;
-  font-size: 18px;
+  font-size: 20px;
   cursor: pointer;
   color: #666;
   padding: 0;
-  width: 20px;
-  height: 20px;
+  width: 24px;
+  height: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
+  z-index: 1502;
 }
 
 .close-button:hover {
@@ -266,8 +307,11 @@ body {
 }
 
 .chat-content {
-  padding: 0 20px 20px 20px;
+  flex: 1;
+  overflow-y: auto;
   overflow-x: hidden;
+  padding: 20px 20px 20px 20px;
+  min-height: 0;
 }
 
 /* Remove old fade */
@@ -275,48 +319,28 @@ body {
   display: none;
 }
 
-/* NEW fade placed directly above the input bar */
-.chat-input-area::before {
-  content: '';
-  position: absolute;
-  top: -100px; /* adjust to move fade closer / further */
-  left: 0;
-  right: 0;
-  height: 120px; /* thickness of fade */
-  background: linear-gradient(to bottom, transparent, rgba(255, 255, 255, 0.98));
-  pointer-events: none;
-  z-index: 1;
-}
-
-.chat-panel.dark .chat-input-area::before {
-  background: linear-gradient(to bottom, transparent, rgba(42, 42, 42, 0.98));
-}
-
 .chat-input-area {
-  padding: 16px 20px 16px 28px;
-  background: rgba(255, 255, 255, 0.98);
-  backdrop-filter: blur(10px);
-  flex-shrink: 0;
-  border: 1px solid rgba(0, 0, 0, 0.2);
-  border-top: 1px solid rgba(0, 0, 0, 0.1);
+  padding: 3px 32px;
+  background: transparent;
+  border: none;
   border-radius: 0 0 8px 8px;
   position: relative;
   z-index: 20; /* keep above fade */
-  margin-top: -1px;
+  margin-top: 0;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
 }
 
 .chat-panel.dark .chat-input-area {
-  background: rgba(42, 42, 42, 0.98);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: transparent;
+  border: none;
   border-top: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .chat-input {
   width: 100%;
-  padding: 8px 12px;
+  padding: 12px 20px;
   border: 1px solid rgba(0, 0, 0, 0.2);
-  border-radius: 4px;
+  border-radius: 6px;
   background: rgba(255, 255, 255, 0.9);
   font-size: 14px;
   outline: none;
@@ -422,4 +446,87 @@ body {
 @keyframes bounce {
   0%, 80%, 100% { transform: scale(0); }
   40% { transform: scale(1); }
+}
+
+/* Markdown content styling */
+.markdown-content {
+    margin-left: 8px;
+}
+
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4,
+.markdown-content h5,
+.markdown-content h6 {
+    margin: 16px 0 8px 0;
+    font-weight: bold;
+}
+
+.markdown-content h1 { font-size: 1.5em; }
+.markdown-content h2 { font-size: 1.3em; }
+.markdown-content h3 { font-size: 1.1em; }
+
+.markdown-content p {
+    margin: 8px 0;
+    line-height: 1.5;
+}
+
+.markdown-content ul,
+.markdown-content ol {
+    margin: 8px 0;
+    padding-left: 20px;
+}
+
+.markdown-content li {
+    margin: 4px 0;
+}
+
+.markdown-content code {
+    background-color: rgba(128, 128, 128, 0.1);
+    padding: 2px 4px;
+    border-radius: 3px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.9em;
+}
+
+.markdown-content pre {
+    background-color: rgba(128, 128, 128, 0.1);
+    padding: 12px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 8px 0;
+}
+
+.markdown-content pre code {
+    background: none;
+    padding: 0;
+}
+
+.markdown-content blockquote {
+    border-left: 4px solid #ccc;
+    margin: 8px 0;
+    padding-left: 16px;
+    font-style: italic;
+}
+
+.markdown-content strong {
+    font-weight: bold;
+}
+
+.markdown-content em {
+    font-style: italic;
+}
+
+/* Dark mode adjustments for markdown */
+.chat-panel.dark .markdown-content code {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.chat-panel.dark .markdown-content pre {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.chat-panel.dark .markdown-content blockquote {
+    border-left-color: #666;
 }

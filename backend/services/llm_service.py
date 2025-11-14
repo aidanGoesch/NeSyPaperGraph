@@ -181,6 +181,37 @@ class OpenAILLMClient:
         except Exception as e:
             raise RuntimeError(f"OpenAI API error: {str(e)}")
 
+    def generate_summary(self, text: str) -> str:
+        """Generate a summary of the paper text"""
+        try:
+            # Truncate text if too long
+            max_chars = 30000
+            if len(text) > max_chars:
+                text = text[:max_chars] + "..."
+            
+            prompt = f"""Please provide a comprehensive summary of this research paper. Include:
+1. Main research question/objective
+2. Key methodology or approach
+3. Primary findings/results
+4. Conclusions and implications
+
+Paper text:
+{text}
+
+Summary:"""
+
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.3
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            return f"Summary generation failed: {str(e)}"
+
 
 class TopicExtractor:
     def __init__(self, llm_client):

@@ -6,6 +6,7 @@ class Paper(BaseModel):
     title: str
     file_path: str
     text: str
+    summary: Optional[str] = None
     topics: List[str] = []
     embedding: Optional[List[float]] = None  # Changed from np.array to List[float] for Pydantic compatibility
     authors: Optional[str] = None
