@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
+import { marked } from "marked";
 import GraphVisualization from "./GraphVisualization";
 import mermaid from "mermaid";
 import "./App.css";
@@ -17,6 +18,51 @@ function App() {
     const [chatHistory, setChatHistory] = useState([]);
     const [isSearching, setIsSearching] = useState(false);
     const [followUpQuestion, setFollowUpQuestion] = useState("");
+    const [highlightPath, setHighlightPath] = useState(null);
+    
+    // Function to handle paper citation clicks
+    const handlePaperCitationClick = (paperTitle) => {
+        // Hide chat panel
+        setIsFadingOut(true);
+        setTimeout(() => {
+            setShowChatPanel(false);
+            setIsFadingOut(false);
+        }, 800);
+        
+        if (graphRef.current && graphData) {
+            // Find the paper in the graph data
+            const paper = graphData.papers.find(p => p.title === paperTitle);
+            if (paper) {
+                // Use the graph's focusOnPaper method if it exists, or simulate paper click
+                if (graphRef.current.focusOnPaper) {
+                    graphRef.current.focusOnPaper(paperTitle);
+                } else {
+                    // Fallback: trigger paper selection directly
+                    console.log("Opening paper info for:", paperTitle);
+                }
+            }
+        }
+    };
+
+    // Function to process citations and markdown
+    const processTextWithCitations = (text) => {
+        if (!text || !graphData) return text;
+        
+        // First convert markdown to HTML
+        let htmlText = marked(text);
+        
+        // Then process citations in the HTML
+        const paperTitles = graphData.papers.map(p => p.title);
+        
+        paperTitles.forEach(title => {
+            const bracketPattern = new RegExp(`\\[${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]`, 'g');
+            htmlText = htmlText.replace(bracketPattern, (match) => {
+                return `<span class="paper-citation" data-paper-title="${title}" style="color: #4CAF50; cursor: pointer; text-decoration: underline;">${match}</span>`;
+            });
+        });
+        
+        return htmlText;
+    };
     const mermaidRef = useRef();
     const chatContentRef = useRef();
     const [expandedResult, setExpandedResult] = useState(null);
@@ -24,6 +70,22 @@ function App() {
     const [chatHistoryIndex, setChatHistoryIndex] = useState(-1);
     const [isFadingOut, setIsFadingOut] = useState(false);
     const graphRef = useRef();
+    const searchInputRef = useRef();
+
+    // Keyboard shortcut for Cmd+G to focus search
+    useEffect(() => {
+        const handleKeyDown = (e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'g') {
+                e.preventDefault();
+                if (searchInputRef.current) {
+                    searchInputRef.current.focus();
+                }
+            }
+        };
+
+        document.addEventListener('keydown', handleKeyDown);
+        return () => document.removeEventListener('keydown', handleKeyDown);
+    }, []);
 
     useEffect(() => {
         mermaid.initialize({ startOnLoad: true });
@@ -92,6 +154,19 @@ function App() {
         };
         setChatHistory((prev) => [...prev, questionEntry]);
 
+        // Auto-scroll to bottom after adding question
+        setTimeout(() => {
+            if (chatContentRef.current) {
+                console.log("Auto-scrolling to bottom");
+                const lastChild = chatContentRef.current.lastElementChild;
+                if (lastChild) {
+                    lastChild.scrollIntoView({ behavior: 'smooth', block: 'end' });
+                }
+            } else {
+                console.log("chatContentRef.current is null");
+            }
+        }, 200);
+
         try {
             const response = await fetch("http://localhost:8000/api/search", {
                 method: "POST",
@@ -105,6 +180,13 @@ function App() {
             console.log("Search response:", data);
             console.log("Search results:", data.search_results);
 
+            // Store path information for graph highlighting
+            if (data.path && data.path.nodes) {
+                setHighlightPath(data.path);
+            } else {
+                setHighlightPath(null);
+            }
+
             // Update the last entry with the answer
             setChatHistory((prev) => {
                 const updated = [...prev];
@@ -113,6 +195,17 @@ function App() {
                     answer: data.status === "search_results" ? "SEARCH_RESULTS" : (data.answer || data.error || "No response"),
                     search_results: data.search_results || null,
                 };
+                
+                // Auto-scroll after updating chat history
+                setTimeout(() => {
+                    if (chatContentRef.current) {
+                        const lastChild = chatContentRef.current.lastElementChild;
+                        if (lastChild) {
+                            lastChild.scrollIntoView({ behavior: 'smooth', block: 'end' });
+                        }
+                    }
+                }, 50);
+                
                 return updated;
             });
         } catch (error) {
@@ -207,6 +300,7 @@ function App() {
                         data={graphData}
                         isDarkMode={isDarkMode}
                         onShowArchitecture={showAgentArchitecture}
+                        highlightPath={highlightPath}
                     />
                 ) : (
                     <div className="loading">
@@ -262,6 +356,7 @@ function App() {
                         className={`search-bar unified-input ${
                             isSearchExpanded ? "expanded" : ""
                         }`}
+                        ref={searchInputRef}
                     />
                 )}
                 {showChatPanel && (
@@ -367,9 +462,18 @@ function App() {
                                                     ))}
                                                 </div>
                                             ) : (
-                                                <div className="markdown-content">
-                                                    <ReactMarkdown>{entry.answer}</ReactMarkdown>
-                                                </div>
+                                                <div 
+                                                    className="markdown-content"
+                                                    onClick={(e) => {
+                                                        if (e.target.classList.contains('paper-citation')) {
+                                                            const paperTitle = e.target.getAttribute('data-paper-title');
+                                                            handlePaperCitationClick(paperTitle);
+                                                        }
+                                                    }}
+                                                    dangerouslySetInnerHTML={{
+                                                        __html: processTextWithCitations(entry.answer)
+                                                    }}
+                                                />
                                             )}
                                         </div>
                                     </div>
@@ -388,11 +492,15 @@ function App() {
                                 onKeyDown={(e) => {
                                     if (
                                         e.key === "Enter" &&
-                                        !isSearching
+                                        !isSearching &&
+                                        followUpQuestion.trim()
                                     ) {
                                         e.preventDefault();
+                                        console.log("Follow-up question:", followUpQuestion);
                                         handleSearch(followUpQuestion);
-                                        chatInputRef.current?.focus();
+                                        setFollowUpQuestion("");
+                                        // Focus back to this input, not chatInputRef
+                                        e.target.focus();
                                     }
                                 }}
                                 ref={chatInputRef}

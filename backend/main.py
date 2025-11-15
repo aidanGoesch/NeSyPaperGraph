@@ -103,6 +103,7 @@ async def search(request: SearchRequest):
             "query": request.query, 
             "answer": answer, 
             "mermaid": agent.get_mermaid_diagram(),
+            "path": getattr(agent, '_last_path', None),
             "status": "success"
         }
     except Exception as e:

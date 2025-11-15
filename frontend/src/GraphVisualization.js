@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle } f
 import ReactMarkdown from 'react-markdown';
 import * as d3 from 'd3';
 
-const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, onTopicClick }, ref) => {
+const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, onTopicClick, highlightPath }, ref) => {
   const svgRef = useRef();
   const containerRef = useRef();
   const [selectedPaper, setSelectedPaper] = useState(null);
@@ -68,6 +68,51 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
         name: topicName,
         papers: connectedPapers
       });
+    },
+    focusOnPaper: (paperTitle) => {
+      if (!nodesRef.current || !zoomRef.current) return;
+      
+      const paperNode = nodesRef.current.find(node => node.type === 'paper' && node.id === paperTitle);
+      if (!paperNode) return;
+      
+      selectedNodeRef.current = paperNode;
+      
+      // Navigate to paper location
+      const svg = d3.select(svgRef.current);
+      const container = containerRef.current;
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      const scale = 1.5;
+      const newX = -paperNode.x * scale + width / 2;
+      const newY = -paperNode.y * scale + height / 2;
+      
+      svg.transition()
+        .duration(750)
+        .call(zoomRef.current.transform, d3.zoomIdentity.translate(newX, newY).scale(scale));
+      
+      // Show paper panel
+      const transform = d3.zoomTransform(svg.node());
+      const [x, y] = transform.apply([paperNode.x, paperNode.y]);
+      const svgRect = svgRef.current.getBoundingClientRect();
+      
+      setPanelPosition({
+        x: svgRect.left + x + 20,
+        y: svgRect.top + y - 10,
+      });
+      
+      // Find the paper data
+      const paper = data.papers.find(p => p.title === paperTitle);
+      if (paper) {
+        setSelectedTopic(null);
+        setSelectedPaper({
+          title: paper.title,
+          authors: paper.authors || ['Dr. Jane Smith', 'Dr. John Doe', 'Dr. Alice Johnson'],
+          year: paper.year,
+          publication_date: paper.publication_date,
+          abstract: paper.abstract || 'This is a dummy abstract for the paper...',
+          topics: paper.topics || []
+        });
+      }
     }
   }));
 
@@ -147,8 +192,42 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       .selectAll("line")
       .data(links)
       .enter().append("line")
-      .attr("stroke", d => d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000"))
-      .attr("stroke-width", d => d.type === 'semantic' ? ((d.weight - 0.25) * 5) : 5)
+      .attr("stroke", d => {
+        // Highlight path edges
+        if (highlightPath && highlightPath.nodes) {
+          const sourceId = d.source.id || d.source;
+          const targetId = d.target.id || d.target;
+          const pathNodes = highlightPath.nodes;
+          
+          // Check if this edge is part of the path
+          for (let i = 0; i < pathNodes.length - 1; i++) {
+            if ((pathNodes[i] === sourceId && pathNodes[i + 1] === targetId) ||
+                (pathNodes[i] === targetId && pathNodes[i + 1] === sourceId)) {
+              return "#FFD600";
+            }
+          }
+        }
+        
+        return d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000");
+      })
+      .attr("stroke-width", d => {
+        // Thicker stroke for path edges
+        if (highlightPath && highlightPath.nodes) {
+          const sourceId = d.source.id || d.source;
+          const targetId = d.target.id || d.target;
+          const pathNodes = highlightPath.nodes;
+          
+          // Check if this edge is part of the path
+          for (let i = 0; i < pathNodes.length - 1; i++) {
+            if ((pathNodes[i] === sourceId && pathNodes[i + 1] === targetId) ||
+                (pathNodes[i] === targetId && pathNodes[i + 1] === sourceId)) {
+              return 6;
+            }
+          }
+        }
+        
+        return d.type === 'semantic' ? ((d.weight - 0.25) * 5) : 5;
+      })
       .attr("stroke-opacity", d => {
         if (d.type === 'semantic') {
           return (d.weight >= semanticThreshold && showSemanticEdges) ? 0.6 : 0;
@@ -168,9 +247,27 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       .data(nodes)
       .enter().append("circle")
       .attr("r", d => d.type === 'paper' ? 10 : 15)
-      .attr("fill", d => d.type === 'paper' ? "#4CAF50" : "#FF6B6B")
-      .attr("stroke", "#fff")
-      .attr("stroke-width", 2)
+      .attr("fill", d => {
+        // Highlight path nodes
+        if (highlightPath && highlightPath.nodes && highlightPath.nodes.includes(d.id)) {
+          return d.type === 'paper' ? "#FF6B35" : "#FF1744";
+        }
+        return d.type === 'paper' ? "#4CAF50" : "#FF6B6B";
+      })
+      .attr("stroke", d => {
+        // Highlight path nodes with thicker stroke
+        if (highlightPath && highlightPath.nodes && highlightPath.nodes.includes(d.id)) {
+          return "#FFD600";
+        }
+        return "#fff";
+      })
+      .attr("stroke-width", d => {
+        // Thicker stroke for path nodes
+        if (highlightPath && highlightPath.nodes && highlightPath.nodes.includes(d.id)) {
+          return 4;
+        }
+        return 2;
+      })
       .style("cursor", "pointer")
       .on("mouseover", function(event, d) {
         if (d.type === 'paper') {

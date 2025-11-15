@@ -22,6 +22,7 @@ class QuestionAgent:
         )
         self.graph_data = graph_data
         self.graph_obj = graph_obj
+        self.conversation_history = []  # Store conversation context
         self.graph = self._build_graph()
     
     def _get_graph_object(self):
@@ -86,11 +87,27 @@ class QuestionAgent:
         """Decide which type of question this is"""
         question = state["question"].lower()
         
+        # Check conversation history for context
+        previous_context = ""
+        if len(self.conversation_history) > 0:
+            last_entry = self.conversation_history[-1]
+            last_question = last_entry.get("question", "").lower()
+            previous_context = last_question
+            
+            # If previous question was about recommendations/gaps and current is a follow-up
+            if any(word in last_question for word in ["gaps", "missing", "recommendations", "suggest", "what could i read", "what should i read"]):
+                if any(phrase in question for phrase in ["what about", "tell me about", "about", "and"]):
+                    print(f"Detected follow-up to recommendation question, routing to properties")
+                    return "properties"
+        
         # Graph properties questions
         property_patterns = [
             "how many", "number of", "count", "connections", "degree", 
             "neighbors", "edges", "nodes", "size", "statistics",
-            "min", "max", "most", "least", "which topics", "what topics"
+            "min", "max", "most", "least", "which topics", "what topics",
+            "read most", "reading", "studied", "focus on", "interested in",
+            "gaps", "missing", "weak spots", "what could i read", "what should i read",
+            "recommendations", "suggest", "areas to explore", "underexplored"
         ]
         
         # Bridge questions - looking for relationships/connections
@@ -104,12 +121,12 @@ class QuestionAgent:
             question_type = "properties"
         elif any(pattern in question for pattern in bridge_patterns):
             question_type = "bridge"
-        elif any(word in question for word in ["explain", "what is", "define", "describe"]):
+        elif any(word in question for word in ["explain", "what is", "define", "describe", "what about", "tell me about", "about"]):
             question_type = "explain"
         else:
             question_type = "search"
         
-        print(f"Question type detected: {question_type} for question: '{state['question']}'")
+        print(f"Question type detected: {question_type} for question: '{state['question']}' (previous: '{previous_context}')")
         return question_type
     
     def _bridge_question(self, state: AgentState) -> AgentState:
@@ -122,6 +139,11 @@ class QuestionAgent:
         if start_node and end_node:
             path_result = self._find_path_in_graph(start_node, end_node)
             state["context"] = path_result
+            
+            # Store path information for mermaid diagram
+            if hasattr(self, '_last_path'):
+                state["path_info"] = self._last_path
+            
             print(f"Bridge analysis: {start_node} -> {end_node}")
         else:
             state["context"] = f"Could not identify two entities to connect in: {question}"
@@ -248,6 +270,13 @@ Your synthesized explanation:"""
                 path = nx.shortest_path(graph_obj.graph, start_node, end_node)
                 path_str = " → ".join([str(node) for node in path])
                 
+                # Store path for mermaid diagram
+                self._last_path = {
+                    "nodes": path,
+                    "start_entity": start_entity,
+                    "end_entity": end_entity
+                }
+                
                 print(f"Path found: {path_str}")
                 print(f"Path length: {len(path)} nodes")
                 
@@ -325,7 +354,7 @@ Your synthesized explanation:"""
             return "Those are not related"
     
     def _explain_question(self, state: AgentState) -> AgentState:
-        """Answers questions of 'explain y', where y could be either a topic or a paper"""
+        """Answers questions of 'explain y', grounded in actual graph content"""
         question = state["question"]
         print(f"Processing explain question: {question}")
         
@@ -341,59 +370,33 @@ Your synthesized explanation:"""
         if not explain_terms:
             explain_terms = words  # fallback to all words
         
-        try:
-            # Get the actual graph object
-            graph_obj = self._get_graph_object()
-            if not graph_obj:
-                state["context"] = "Graph not available"
-                return state
+        # Use keyword search to find relevant papers
+        search_query = " ".join(explain_terms)
+        search_state = {"question": search_query, "context": "", "search_results": []}
+        search_result = self._keyword_search(search_state)
+        
+        if search_result.get("search_results"):
+            papers = search_result["search_results"][:3]  # Use top 3 papers for explanation
             
-            relevant_papers = []
-            relevant_nodes = []
+            # Collect paper content for grounding
+            paper_content = []
+            for paper in papers:
+                content = f"Paper: {paper['title']}\n"
+                if paper.get('summary'):
+                    content += f"Summary: {paper['summary']}\n"
+                if paper.get('topics'):
+                    content += f"Topics: {', '.join(paper['topics'])}\n"
+                paper_content.append(content)
             
-            # Find directly matching nodes
-            for node, data in graph_obj.graph.nodes(data=True):
-                node_str = str(node).lower()
-                
-                # Check if any explain term matches this node
-                for term in explain_terms:
-                    if term in node_str:
-                        relevant_nodes.append(str(node))
-                        
-                        # If it's a paper, collect its summary
-                        if data.get('type') == 'paper' and 'data' in data:
-                            paper = data['data']
-                            summary = getattr(paper, 'summary', None) or paper.text[:1000] + "..."
-                            relevant_papers.append(f"Paper: {paper.title}\nSummary: {summary}")
-                        
-                        # Also find semantically connected papers
-                        for neighbor in graph_obj.graph.neighbors(node):
-                            neighbor_data = graph_obj.graph.nodes[neighbor]
-                            neighbor_str = str(neighbor)
-                            if neighbor_str not in relevant_nodes:
-                                relevant_nodes.append(neighbor_str)
-                                
-                                # If neighbor is a paper, collect its summary too
-                                if neighbor_data.get('type') == 'paper' and 'data' in neighbor_data:
-                                    paper = neighbor_data['data']
-                                    summary = getattr(paper, 'summary', None) or paper.text[:1000] + "..."
-                                    relevant_papers.append(f"Paper: {paper.title}\nSummary: {summary}")
-                        break
+            # Create grounded context
+            grounding_text = "\n\n---\n\n".join(paper_content)
+            state["context"] = f"Based on papers in your collection about '{search_query}':\n\n{grounding_text}\n\nPlease explain '{search_query}' based ONLY on the information from these papers. IMPORTANT: When citing papers, use square brackets around the exact paper title like [Paper Title]. Do not use quotes. For example: 'According to [Attention Is All You Need]...' or 'As described in [BERT: Pre-training of Deep Bidirectional Transformers]...'. Do not include information not found in these papers."
             
-            if relevant_papers:
-                # Return paper summaries for LLM grounding
-                state["context"] = f"Explaining with relevant papers: {', '.join(relevant_nodes[:10])}\n\nPaper summaries for grounding:\n\n" + "\n\n---\n\n".join(relevant_papers)
-                print(f"Explain found {len(relevant_papers)} relevant papers with summaries")
-            elif relevant_nodes:
-                state["context"] = f"Explaining with relevant nodes: {', '.join(relevant_nodes[:10])}"
-                print(f"Explain found {len(relevant_nodes)} relevant nodes: {relevant_nodes[:5]}...")
-            else:
-                state["context"] = "No relevant information found in graph"
-                print("No relevant nodes found for explanation")
-                
-        except Exception as e:
-            print(f"Error in explain search: {e}")
-            state["context"] = "Error finding relevant information"
+            print(f"Explain grounded in {len(papers)} papers from graph")
+        else:
+            # Fallback: no relevant papers found
+            state["context"] = f"No papers found in your collection about '{search_query}'. Cannot provide explanation based on your graph content."
+            print("No relevant papers found for explanation")
         
         return state
     
@@ -443,6 +446,15 @@ Your synthesized explanation:"""
                         })
             
             if matching_papers:
+                # Check if user wants more than 5 results
+                question_lower = question.lower()
+                wants_all = any(phrase in question_lower for phrase in ['all', 'every', 'complete list', 'full list', 'everything'])
+                wants_specific_number = any(word.isdigit() and int(word) > 5 for word in question.split())
+                
+                # Limit to 5 unless specifically requested otherwise
+                if not wants_all and not wants_specific_number:
+                    matching_papers = matching_papers[:5]
+                
                 # Return structured data for UI blocks instead of LLM context
                 state["context"] = f"KEYWORD_RESULTS:{len(matching_papers)} papers found"
                 state["search_results"] = matching_papers
@@ -474,22 +486,89 @@ Your synthesized explanation:"""
             # Extract what property is being asked about
             question_lower = question.lower()
             
-            if "which topics" in question_lower or "what topics" in question_lower:
-                if "most" in question_lower or "read" in question_lower:
+            if ("which topics" in question_lower or "what topics" in question_lower or 
+                "read most" in question_lower or "reading" in question_lower or
+                "studied" in question_lower or "focus on" in question_lower):
+                
+                if ("most" in question_lower or "read" in question_lower or 
+                    "studied" in question_lower or "focus" in question_lower):
                     # Find topics with most papers (most read about)
                     topic_nodes = [n for n, attr in graph_obj.graph.nodes(data=True) if attr.get('type') == 'topic']
                     if topic_nodes:
                         # Sort topics by degree (number of connected papers)
                         sorted_topics = sorted(topic_nodes, key=lambda t: graph_obj.graph.degree(t), reverse=True)
-                        top_topics = sorted_topics[:5]  # Top 5
-                        topic_info = [f"{topic} ({graph_obj.graph.degree(topic)} papers)" for topic in top_topics]
-                        state["context"] = f"Topics you've read most about: {', '.join(topic_info)}"
+                        
+                        if len(sorted_topics) == 1:
+                            top_topic = sorted_topics[0]
+                            degree = graph_obj.graph.degree(top_topic)
+                            state["context"] = f"You've read most about '{top_topic}' with {degree} papers"
+                        else:
+                            top_topics = sorted_topics[:5]  # Top 5
+                            topic_info = [f"'{topic}' ({graph_obj.graph.degree(topic)} papers)" for topic in top_topics]
+                            state["context"] = f"Topics you've read most about: {', '.join(topic_info)}"
                     else:
                         state["context"] = "No topics found in graph"
                 else:
                     # General topic listing
                     topic_nodes = [n for n, attr in graph_obj.graph.nodes(data=True) if attr.get('type') == 'topic']
-                    state["context"] = f"All topics in graph: {', '.join(topic_nodes[:10])}"
+                    if len(topic_nodes) <= 10:
+                        state["context"] = f"All topics in your collection: {', '.join(topic_nodes)}"
+                    else:
+                        state["context"] = f"You have {len(topic_nodes)} topics. Top topics: {', '.join(topic_nodes[:10])}"
+            
+            elif ("gaps" in question_lower or "missing" in question_lower or 
+                  "weak spots" in question_lower or "what could i read" in question_lower or
+                  "what should i read" in question_lower or "recommendations" in question_lower or
+                  "suggest" in question_lower or "areas to explore" in question_lower or
+                  "underexplored" in question_lower):
+                
+                # Analyze graph structure to find weak spots
+                topic_nodes = [n for n, attr in graph_obj.graph.nodes(data=True) if attr.get('type') == 'topic']
+                paper_nodes = [n for n, attr in graph_obj.graph.nodes(data=True) if attr.get('type') == 'paper']
+                
+                if topic_nodes and paper_nodes:
+                    # Find topics with few connections (potential gaps)
+                    topic_connections = [(topic, graph_obj.graph.degree(topic)) for topic in topic_nodes]
+                    topic_connections.sort(key=lambda x: x[1])
+                    
+                    weak_topics = [topic for topic, degree in topic_connections if degree <= 2][:5]
+                    isolated_topics = [topic for topic, degree in topic_connections if degree == 1][:3]
+                    
+                    # Find topic pairs that aren't connected (potential research gaps)
+                    unconnected_pairs = []
+                    for i, topic1 in enumerate(topic_nodes[:10]):  # Limit to avoid too many combinations
+                        for topic2 in topic_nodes[i+1:10]:
+                            try:
+                                path = graph_obj.find_path(topic1, topic2)
+                                if not path or len(path) > 5:  # No connection or very distant
+                                    unconnected_pairs.append((topic1, topic2))
+                            except:
+                                unconnected_pairs.append((topic1, topic2))
+                    
+                    # Build recommendation response
+                    recommendations = []
+                    
+                    if weak_topics:
+                        recommendations.append(f"**Underexplored topics** (few papers): {', '.join(weak_topics)}")
+                    
+                    if isolated_topics:
+                        recommendations.append(f"**Isolated topics** (only 1 paper): {', '.join(isolated_topics)}")
+                    
+                    if unconnected_pairs[:3]:  # Show top 3 gaps
+                        gap_descriptions = [f"'{pair[0]}' ↔ '{pair[1]}'" for pair in unconnected_pairs[:3]]
+                        recommendations.append(f"**Research gaps** (unconnected areas): {', '.join(gap_descriptions)}")
+                    
+                    # Suggest interdisciplinary opportunities
+                    if len(topic_nodes) > 5:
+                        high_degree_topics = [topic for topic, degree in topic_connections[-3:]]  # Top 3 connected
+                        recommendations.append(f"**Consider connections between**: Your strong areas ({', '.join(high_degree_topics)}) and underexplored topics")
+                    
+                    if recommendations:
+                        state["context"] = "**Research Recommendations Based on Your Collection:**\n\n" + "\n\n".join(recommendations) + "\n\n*These suggestions are based on analyzing the structure and gaps in your current paper collection.*"
+                    else:
+                        state["context"] = "Your research collection appears well-balanced with good coverage across topics."
+                else:
+                    state["context"] = "Insufficient data to analyze research gaps"
             
             elif "min" in question_lower and ("topic" in question_lower or "connected" in question_lower):
                 min_topic = graph_obj.find_min_topic()
@@ -589,6 +668,40 @@ Your synthesized explanation:"""
     
     def get_mermaid_diagram(self) -> str:
         """Generate mermaid diagram dynamically from the actual graph structure"""
+        
+        # If we have path information from a bridge question, show the path
+        if hasattr(self, '_last_path') and self._last_path:
+            path_info = self._last_path
+            mermaid_lines = ["graph LR"]
+            
+            # Add nodes and connections for the path
+            for i, node in enumerate(path_info["nodes"]):
+                node_id = f"node{i}"
+                node_label = str(node)
+                
+                # Truncate long labels
+                if len(node_label) > 30:
+                    node_label = node_label[:27] + "..."
+                
+                # Style nodes differently based on type
+                if i == 0:  # Start node
+                    mermaid_lines.append(f'    {node_id}["{node_label}"]')
+                    mermaid_lines.append(f"    style {node_id} fill:#e1f5fe,stroke:#01579b")
+                elif i == len(path_info["nodes"]) - 1:  # End node
+                    mermaid_lines.append(f'    {node_id}["{node_label}"]')
+                    mermaid_lines.append(f"    style {node_id} fill:#c8e6c9,stroke:#2e7d32")
+                else:  # Intermediate nodes
+                    mermaid_lines.append(f'    {node_id}["{node_label}"]')
+                    mermaid_lines.append(f"    style {node_id} fill:#fff3e0,stroke:#ef6c00")
+                
+                # Add connection to next node
+                if i < len(path_info["nodes"]) - 1:
+                    next_node_id = f"node{i+1}"
+                    mermaid_lines.append(f"    {node_id} --> {next_node_id}")
+            
+            return "\n".join(mermaid_lines)
+        
+        # Default agent architecture diagram
         mermaid_lines = [
             "graph TD",
             "    START([User Question]) --> route_question",
@@ -631,4 +744,16 @@ Your synthesized explanation:"""
         
         result = self.graph.invoke(initial_state)
         self._last_state = result  # Store the last state
+        
+        # Store in conversation history for context
+        self.conversation_history.append({
+            "question": question,
+            "answer": result["answer"],
+            "type": getattr(self, '_last_question_type', 'unknown')
+        })
+        
+        # Keep only last 5 conversations for context
+        if len(self.conversation_history) > 5:
+            self.conversation_history = self.conversation_history[-5:]
+        
         return result["answer"]
