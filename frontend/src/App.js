@@ -19,7 +19,11 @@ function App() {
     const [followUpQuestion, setFollowUpQuestion] = useState("");
     const mermaidRef = useRef();
     const chatContentRef = useRef();
+    const [expandedResult, setExpandedResult] = useState(null);
     const chatInputRef = useRef();
+    const [chatHistoryIndex, setChatHistoryIndex] = useState(-1);
+    const [isFadingOut, setIsFadingOut] = useState(false);
+    const graphRef = useRef();
 
     useEffect(() => {
         mermaid.initialize({ startOnLoad: true });
@@ -99,13 +103,15 @@ function App() {
 
             const data = await response.json();
             console.log("Search response:", data);
+            console.log("Search results:", data.search_results);
 
             // Update the last entry with the answer
             setChatHistory((prev) => {
                 const updated = [...prev];
                 updated[updated.length - 1] = {
                     ...updated[updated.length - 1],
-                    answer: data.answer || data.error || "No response",
+                    answer: data.status === "search_results" ? "SEARCH_RESULTS" : (data.answer || data.error || "No response"),
+                    search_results: data.search_results || null,
                 };
                 return updated;
             });
@@ -197,6 +203,7 @@ function App() {
                     </div>
                 ) : graphData ? (
                     <GraphVisualization
+                        ref={graphRef}
                         data={graphData}
                         isDarkMode={isDarkMode}
                         onShowArchitecture={showAgentArchitecture}
@@ -234,7 +241,10 @@ function App() {
                         type="text"
                         placeholder="Ask a Question..."
                         value={searchTerm}
-                        onChange={(e) => setSearchTerm(e.target.value)}
+                        onChange={(e) => {
+                            setSearchTerm(e.target.value);
+                            setChatHistoryIndex(-1);
+                        }}
                         onKeyDown={(e) => {
                             if (e.key === "Enter") {
                                 handleSearch(searchTerm);
@@ -243,6 +253,12 @@ function App() {
                         }}
                         onFocus={() => setIsSearchExpanded(true)}
                         onBlur={() => setIsSearchExpanded(false)}
+                        onWheel={(e) => {
+                            if (e.deltaY > 0 && chatHistory.length > 0) { // Scrolling down
+                                e.preventDefault();
+                                setShowChatPanel(true);
+                            }
+                        }}
                         className={`search-bar unified-input ${
                             isSearchExpanded ? "expanded" : ""
                         }`}
@@ -252,7 +268,7 @@ function App() {
                     <div
                         className={`chat-panel-wrapper ${
                             isDarkMode ? "dark" : "light"
-                        }`}
+                        } ${isFadingOut ? "fading-out" : ""}`}
                     >
                         <div
                             className={`chat-panel ${
@@ -277,6 +293,17 @@ function App() {
                             <div
                                 className="chat-content"
                                 ref={chatContentRef}
+                                onWheel={(e) => {
+                                    if (e.deltaY < 0 && chatContentRef.current.scrollTop === 0) { // Scrolling up at top
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        setIsFadingOut(true);
+                                        setTimeout(() => {
+                                            setShowChatPanel(false);
+                                            setIsFadingOut(false);
+                                        }, 800);
+                                    }
+                                }}
                             >
                                 {chatHistory.map((entry, index) => (
                                     <div key={index} className="chat-entry">
@@ -293,6 +320,46 @@ function App() {
                                                     <span></span>
                                                     <span></span>
                                                     <span></span>
+                                                </div>
+                                            ) : (entry.answer === "SEARCH_RESULTS" && entry.search_results) ? (
+                                                <div className="search-results">
+                                                    {entry.search_results.map((result, idx) => (
+                                                        <div 
+                                                            key={idx} 
+                                                            className={`search-result-block ${expandedResult === idx ? 'expanded' : ''}`}
+                                                            onClick={() => setExpandedResult(expandedResult === idx ? null : idx)}
+                                                        >
+                                                            <h4>{result.title}</h4>
+                                                            <p className="author">{result.author}</p>
+                                                            <div className="topics">
+                                                                {result.topics.map((topic, topicIdx) => (
+                                                                    <span 
+                                                                        key={topicIdx} 
+                                                                        className="topic-tag"
+                                                                        onClick={(e) => {
+                                                                            e.stopPropagation();
+                                                                            setIsFadingOut(true);
+                                                                            setTimeout(() => {
+                                                                                setShowChatPanel(false);
+                                                                                setIsFadingOut(false);
+                                                                                // Focus on topic in graph
+                                                                                if (graphRef.current) {
+                                                                                    graphRef.current.focusOnTopic(topic);
+                                                                                }
+                                                                            }, 800);
+                                                                        }}
+                                                                    >
+                                                                        {topic}
+                                                                    </span>
+                                                                ))}
+                                                            </div>
+                                                            {expandedResult === idx && (
+                                                                <div className="summary">
+                                                                    <ReactMarkdown>{result.summary}</ReactMarkdown>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    ))}
                                                 </div>
                                             ) : (
                                                 <div className="markdown-content">

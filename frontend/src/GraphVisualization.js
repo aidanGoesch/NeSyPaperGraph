@@ -1,10 +1,11 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react';
 import * as d3 from 'd3';
 
-const GraphVisualization = ({ data, isDarkMode, onShowArchitecture }) => {
+const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, onTopicClick }, ref) => {
   const svgRef = useRef();
   const containerRef = useRef();
   const [selectedPaper, setSelectedPaper] = useState(null);
+  const [selectedTopic, setSelectedTopic] = useState(null);
   const [panelPosition, setPanelPosition] = useState({ x: 0, y: 0 });
   const [showSemanticEdges, setShowSemanticEdges] = useState(true);
   const [showMenu, setShowMenu] = useState(false);
@@ -12,6 +13,62 @@ const GraphVisualization = ({ data, isDarkMode, onShowArchitecture }) => {
   const selectedNodeRef = useRef(null);
   const simulationRef = useRef(null);
   const nodesRef = useRef([]);
+  const zoomRef = useRef(null);
+
+  useImperativeHandle(ref, () => ({
+    focusOnTopic: (topicName) => {
+      if (!nodesRef.current || !zoomRef.current) return;
+      
+      const topicNode = nodesRef.current.find(node => node.type === 'topic' && node.id === topicName);
+      if (!topicNode) return;
+      
+      selectedNodeRef.current = topicNode;
+      
+      // Navigate to topic location
+      const svg = d3.select(svgRef.current);
+      const container = containerRef.current;
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      const scale = 1.5;
+      const newX = -topicNode.x * scale + width / 2;
+      const newY = -topicNode.y * scale + height / 2;
+      
+      svg.transition()
+        .duration(750)
+        .call(zoomRef.current.transform, d3.zoomIdentity.translate(newX, newY).scale(scale));
+      
+      // Show topic panel
+      const transform = d3.zoomTransform(svg.node());
+      const [x, y] = transform.apply([topicNode.x, topicNode.y]);
+      const svgRect = svgRef.current.getBoundingClientRect();
+      
+      setPanelPosition({
+        x: svgRect.left + x + 20,
+        y: svgRect.top + y - 10,
+      });
+      
+      // Find connected papers
+      const links = data.edges || [];
+      if (links.length === 0) {
+        data.papers.forEach(paper => {
+          paper.topics.forEach(topic => {
+            links.push({ source: paper.title, target: topic });
+          });
+        });
+      }
+      
+      const connectedPapers = links
+        .filter(link => link.target.id === topicName || link.source.id === topicName)
+        .map(link => link.target.id === topicName ? link.source : link.target)
+        .filter(node => node.type === 'paper');
+      
+      setSelectedPaper(null);
+      setSelectedTopic({
+        name: topicName,
+        papers: connectedPapers
+      });
+    }
+  }));
 
   useEffect(() => {
     if (!data) return;
@@ -81,6 +138,8 @@ const GraphVisualization = ({ data, isDarkMode, onShowArchitecture }) => {
         return !(event.target && event.target.closest && event.target.closest('.info-panel'));
       });
 
+    zoomRef.current = zoom;
+
     svg.call(zoom);
 
     const link = g.append("g")
@@ -126,8 +185,7 @@ const GraphVisualization = ({ data, isDarkMode, onShowArchitecture }) => {
       })
       .on("click", function(event, d) {
         event.stopPropagation();
-        if (d.type !== 'paper') return;
-
+        
         selectedNodeRef.current = d; // keep live reference
 
         const transform = d3.zoomTransform(svg.node());
@@ -142,13 +200,29 @@ const GraphVisualization = ({ data, isDarkMode, onShowArchitecture }) => {
           y: svgRect.top + y + offsetY,
         });
 
-        setSelectedPaper({
-          title: d.title,
-          authors: d.authors || ['Dr. Jane Smith', 'Dr. John Doe', 'Dr. Alice Johnson'],
-          year: d.year || 2024,
-          citations: d.citations || Math.floor(Math.random() * 500),
-          abstract: d.abstract || 'This is a dummy abstract for the paper...'
-        });
+        if (d.type === 'paper') {
+          setSelectedTopic(null);
+          setSelectedPaper({
+            title: d.title,
+            authors: d.authors || ['Dr. Jane Smith', 'Dr. John Doe', 'Dr. Alice Johnson'],
+            year: d.year || 2024,
+            citations: d.citations || Math.floor(Math.random() * 500),
+            abstract: d.abstract || 'This is a dummy abstract for the paper...',
+            topics: d.topics || []
+          });
+        } else if (d.type === 'topic') {
+          setSelectedPaper(null);
+          // Find connected papers
+          const connectedPapers = links
+            .filter(link => link.target.id === d.id || link.source.id === d.id)
+            .map(link => link.target.id === d.id ? link.source : link.target)
+            .filter(node => node.type === 'paper');
+          
+          setSelectedTopic({
+            name: d.id,
+            papers: connectedPapers
+          });
+        }
 
         // zoom smoothly toward node
         const scale = 1.5;
@@ -434,6 +508,70 @@ const GraphVisualization = ({ data, isDarkMode, onShowArchitecture }) => {
             <strong>Citations:</strong> <span style={{ color: '#555' }}>{selectedPaper.citations}</span>
           </div>
           <div style={{ marginBottom: '12px' }}>
+            <strong>Topics:</strong>
+            <div style={{ marginTop: '4px', display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+              {selectedPaper.topics && selectedPaper.topics.map((topic, index) => (
+                <span
+                  key={index}
+                  style={{
+                    backgroundColor: '#FF6B6B',
+                    color: 'white',
+                    padding: '2px 8px',
+                    borderRadius: '12px',
+                    fontSize: '12px',
+                    cursor: 'pointer',
+                    transition: 'background-color 0.2s ease'
+                  }}
+                  onMouseEnter={(e) => e.target.style.backgroundColor = '#FF5252'}
+                  onMouseLeave={(e) => e.target.style.backgroundColor = '#FF6B6B'}
+                  onClick={() => {
+                    // Find the topic node and show its panel
+                    const topicNode = nodesRef.current.find(node => node.type === 'topic' && node.id === topic);
+                    if (topicNode && zoomRef.current) {
+                      selectedNodeRef.current = topicNode;
+                      
+                      // Navigate to topic location
+                      const svg = d3.select(svgRef.current);
+                      const container = containerRef.current;
+                      const width = container.clientWidth;
+                      const height = container.clientHeight;
+                      const scale = 1.5;
+                      const newX = -topicNode.x * scale + width / 2;
+                      const newY = -topicNode.y * scale + height / 2;
+                      
+                      svg.transition()
+                        .duration(750)
+                        .call(zoomRef.current.transform, d3.zoomIdentity.translate(newX, newY).scale(scale));
+                      
+                      // Find connected papers for topic panel
+                      const links = data.edges || [];
+                      if (links.length === 0) {
+                        data.papers.forEach(paper => {
+                          paper.topics.forEach(paperTopic => {
+                            links.push({ source: paper.title, target: paperTopic });
+                          });
+                        });
+                      }
+                      
+                      const connectedPapers = links
+                        .filter(link => link.target.id === topic || link.source.id === topic)
+                        .map(link => link.target.id === topic ? link.source : link.target)
+                        .filter(node => node.type === 'paper');
+                      
+                      setSelectedPaper(null);
+                      setSelectedTopic({
+                        name: topic,
+                        papers: connectedPapers
+                      });
+                    }
+                  }}
+                >
+                  {topic}
+                </span>
+              ))}
+            </div>
+          </div>
+          <div style={{ marginBottom: '12px' }}>
             <strong>Abstract:</strong>
             <p style={{ marginTop: '4px', color: '#555', lineHeight: '1.5' }}>
               {selectedPaper.abstract}
@@ -441,8 +579,103 @@ const GraphVisualization = ({ data, isDarkMode, onShowArchitecture }) => {
           </div>
         </div>
       )}
+      {selectedTopic && (
+        <div className="info-panel" style={{
+          position: 'absolute',
+          top: `${panelPosition.y}px`,
+          left: `${panelPosition.x}px`,
+          width: '350px',
+          maxHeight: '400px',
+          backgroundColor: 'white',
+          borderRadius: '8px',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+          padding: '20px',
+          overflowY: 'auto',
+          zIndex: 1000,
+          pointerEvents: 'auto'
+        }}>
+          <button 
+            onClick={() => {
+              setSelectedTopic(null);
+              setPanelPosition({ x: 0, y: 0 });
+            }}
+            style={{
+              position: 'absolute',
+              top: '10px',
+              right: '10px',
+              background: 'none',
+              border: 'none',
+              fontSize: '24px',
+              cursor: 'pointer',
+              color: '#666',
+              lineHeight: '1'
+            }}
+          >
+            ×
+          </button>
+          <h3 style={{ marginTop: 0, marginBottom: '15px', fontSize: '18px', color: '#333' }}>
+            Topic: {selectedTopic.name}
+          </h3>
+          <div style={{ marginBottom: '12px' }}>
+            <strong>Connected Papers ({selectedTopic.papers.length}):</strong>
+          </div>
+          <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
+            {selectedTopic.papers.map((paper, index) => (
+              <div key={index} style={{
+                padding: '10px',
+                marginBottom: '8px',
+                backgroundColor: '#f5f5f5',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                transition: 'background-color 0.2s ease'
+              }}
+              onMouseEnter={(e) => e.target.style.backgroundColor = '#e0e0e0'}
+              onMouseLeave={(e) => e.target.style.backgroundColor = '#f5f5f5'}
+              onClick={() => {
+                // Find the paper node in the graph
+                const paperNode = nodesRef.current.find(node => node.id === paper.title);
+                if (paperNode && zoomRef.current) {
+                  selectedNodeRef.current = paperNode;
+                  
+                  // Navigate to paper location
+                  const svg = d3.select(svgRef.current);
+                  const container = containerRef.current;
+                  const width = container.clientWidth;
+                  const height = container.clientHeight;
+                  const scale = 1.5;
+                  const newX = -paperNode.x * scale + width / 2;
+                  const newY = -paperNode.y * scale + height / 2;
+                  
+                  svg.transition()
+                    .duration(750)
+                    .call(zoomRef.current.transform, d3.zoomIdentity.translate(newX, newY).scale(scale));
+                }
+                
+                setSelectedTopic(null);
+                setSelectedPaper({
+                  title: paper.title,
+                  authors: paper.authors || ['Dr. Jane Smith', 'Dr. John Doe'],
+                  year: paper.year || 2024,
+                  citations: paper.citations || Math.floor(Math.random() * 500),
+                  abstract: paper.abstract || 'This is a dummy abstract for the paper...',
+                  topics: paper.topics || []
+                });
+              }}>
+                <div style={{ fontWeight: 'bold', fontSize: '14px', color: '#333', marginBottom: '4px' }}>
+                  {paper.title}
+                </div>
+                <div style={{ fontSize: '12px', color: '#666' }}>
+                  {paper.authors ? paper.authors.join(', ') : 'Authors not available'}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
-};
+});
+
+GraphVisualization.displayName = 'GraphVisualization';
 
 export default GraphVisualization;

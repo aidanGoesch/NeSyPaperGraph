@@ -11,6 +11,7 @@ class AgentState(TypedDict):
     question: str
     context: str
     answer: str
+    search_results: list
 
 class QuestionAgent:
     def __init__(self, graph_data=None, graph_obj=None):
@@ -432,20 +433,29 @@ Your synthesized explanation:"""
                                 break
                     
                     if title_match or topic_match:
-                        summary = getattr(paper, 'summary', None) or paper.text[:1000] + "..."
-                        matching_papers.append(f"Paper: {paper.title}\nSummary: {summary}")
+                        summary = getattr(paper, 'summary', None) or paper.text[:500] + "..."
+                        matching_papers.append({
+                            "title": paper.title,
+                            "author": getattr(paper, 'authors', None) or 'Unknown Author',
+                            "summary": summary,
+                            "topics": getattr(paper, 'topics', []),
+                            "node_id": node
+                        })
             
             if matching_papers:
-                # Return paper summaries for LLM grounding
-                state["context"] = f"Found {len(matching_papers)} matching papers for keywords: {', '.join(keywords)}\n\nPaper summaries for grounding:\n\n" + "\n\n---\n\n".join(matching_papers)
-                print(f"Keyword search found {len(matching_papers)} papers with summaries")
+                # Return structured data for UI blocks instead of LLM context
+                state["context"] = f"KEYWORD_RESULTS:{len(matching_papers)} papers found"
+                state["search_results"] = matching_papers
+                print(f"Keyword search found {len(matching_papers)} papers")
             else:
                 state["context"] = f"No papers found matching keywords: {', '.join(keywords)}"
+                state["search_results"] = []
                 print("No matching papers found for keywords")
                 
         except Exception as e:
             print(f"Error in keyword search: {e}")
             state["context"] = "Error searching for keywords"
+            state["search_results"] = []
         
         return state
     
@@ -544,6 +554,11 @@ Your synthesized explanation:"""
         question = state["question"]
         context = state.get("context", "")
         
+        # Handle keyword search results differently - don't send to LLM
+        if context.startswith("KEYWORD_RESULTS:"):
+            state["answer"] = "SEARCH_RESULTS"  # Special marker for frontend
+            return state
+        
         # Check if this is a chain reasoning result (already synthesized by LLM)
         if "CHAIN_REASONING_RESULT:" in context:
             # Extract the synthesized explanation
@@ -610,8 +625,10 @@ Your synthesized explanation:"""
         initial_state = {
             "question": question,
             "context": "",
-            "answer": ""
+            "answer": "",
+            "search_results": []
         }
         
         result = self.graph.invoke(initial_state)
+        self._last_state = result  # Store the last state
         return result["answer"]

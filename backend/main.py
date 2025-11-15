@@ -89,11 +89,20 @@ async def search(request: SearchRequest):
     
     try:
         answer = await agent.answer_question(request.query)
-        mermaid_diagram = agent.get_mermaid_diagram()
+        
+        # Check if this is a search results response
+        if answer == "SEARCH_RESULTS" and hasattr(agent, '_last_state') and agent._last_state.get('search_results'):
+            return {
+                "query": request.query,
+                "search_results": agent._last_state['search_results'],
+                "mermaid": agent.get_mermaid_diagram(),
+                "status": "search_results"
+            }
+        
         return {
             "query": request.query, 
             "answer": answer, 
-            "mermaid": mermaid_diagram,
+            "mermaid": agent.get_mermaid_diagram(),
             "status": "success"
         }
     except Exception as e:
