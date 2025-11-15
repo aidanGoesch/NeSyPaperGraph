@@ -189,16 +189,14 @@ class OpenAILLMClient:
             if len(text) > max_chars:
                 text = text[:max_chars] + "..."
             
-            prompt = f"""Please provide a comprehensive summary of this research paper. Include:
+            prompt = f"""Provide a comprehensive summary of this research paper. Do not include any headings or titles. Start directly with the content covering:
 1. Main research question/objective
-2. Key methodology or approach
+2. Key methodology or approach  
 3. Primary findings/results
 4. Conclusions and implications
 
 Paper text:
-{text}
-
-Summary:"""
+{text}"""
 
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -216,6 +214,80 @@ Summary:"""
 class TopicExtractor:
     def __init__(self, llm_client):
         self.llm_client = llm_client
+
+    def extract_paper_metadata(self, text, max_chars=4000):
+        """
+        Extract paper metadata (title, authors, publication date) from paper text.
+        
+        Args:
+            text: Paper text to analyze
+            max_chars: Maximum characters to send to LLM
+        
+        Returns:
+            Dict with title, authors, and publication_date
+        """
+        # Use beginning of paper where metadata is typically found
+        if len(text) > max_chars:
+            text = text[:max_chars]
+        
+        system_prompt = """You are an expert at extracting metadata from academic papers. Extract the title, authors, and publication date from the given paper text. Return the result in JSON format with the following structure:
+
+{
+    "title": "Paper Title",
+    "authors": ["Author 1", "Author 2", "Author 3"],
+    "publication_date": "YYYY" or "YYYY-MM" or "YYYY-MM-DD"
+}
+
+Guidelines:
+- Extract the exact title as it appears in the paper
+- List all authors in order as they appear
+- For publication date, extract year at minimum, include month/day if available
+- If any field cannot be determined, use null
+- Return only valid JSON"""
+
+        prompt = f"""Academic Paper Text (beginning):
+{text}
+
+Extract the title, authors, and publication date in JSON format."""
+
+        try:
+            response = self.llm_client.generate(prompt, system_prompt=system_prompt).strip()
+            
+            # Try to extract JSON from response
+            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                json_match = re.search(r'\{.*?\}', response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                else:
+                    json_str = response
+            
+            result = json.loads(json_str)
+            
+            # Validate and clean the result
+            metadata = {
+                'title': result.get('title'),
+                'authors': result.get('authors', []),
+                'publication_date': result.get('publication_date')
+            }
+            
+            # Ensure authors is a list
+            if isinstance(metadata['authors'], str):
+                metadata['authors'] = [metadata['authors']]
+            elif not isinstance(metadata['authors'], list):
+                metadata['authors'] = []
+            
+            return metadata
+            
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"Error extracting paper metadata: {e}")
+            return {
+                'title': None,
+                'authors': [],
+                'publication_date': None
+            }
 
     def extract_topics(self, text, current_topics=None, max_chars=8000):
         """

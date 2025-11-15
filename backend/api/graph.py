@@ -24,7 +24,11 @@ def graph_to_dict(graph):
             paper_data = data['data']
             papers.append({
                 "title": paper_data.title,
-                "topics": paper_data.topics
+                "topics": paper_data.topics,
+                "authors": paper_data.authors,
+                "publication_date": paper_data.publication_date,
+                "abstract": paper_data.summary,  # Use summary as abstract for frontend
+                "file_path": paper_data.file_path
             })
             topics.update(paper_data.topics)
         elif data.get('type') == 'topic':

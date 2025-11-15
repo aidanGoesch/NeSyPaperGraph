@@ -271,9 +271,25 @@ function App() {
                         } ${isFadingOut ? "fading-out" : ""}`}
                     >
                         <div
-                            className={`chat-panel ${
-                                isDarkMode ? "dark" : "light"
-                            }`}
+                            className={`chat-panel ${isDarkMode ? "dark" : "light"}`}
+                            onWheel={(e) => {
+                                const panel = e.currentTarget;
+                                const scrollTop = panel.scrollTop;
+                                const isScrollingUp = e.deltaY < 0;
+                                
+                                console.log('React onWheel - scrollTop:', scrollTop, 'isScrollingUp:', isScrollingUp);
+                                
+                                // Only close if we're at the very top AND scrolling up
+                                if (scrollTop === 0 && isScrollingUp) {
+                                    console.log('Closing chat panel from React handler');
+                                    e.preventDefault();
+                                    setIsFadingOut(true);
+                                    setTimeout(() => {
+                                        setShowChatPanel(false);
+                                        setIsFadingOut(false);
+                                    }, 800);
+                                }
+                            }}
                         >
                             {/* X CLOSE BUTTON — now in top right corner */}
                             <button
@@ -293,17 +309,6 @@ function App() {
                             <div
                                 className="chat-content"
                                 ref={chatContentRef}
-                                onWheel={(e) => {
-                                    if (e.deltaY < 0 && chatContentRef.current.scrollTop === 0) { // Scrolling up at top
-                                        e.preventDefault();
-                                        e.stopPropagation();
-                                        setIsFadingOut(true);
-                                        setTimeout(() => {
-                                            setShowChatPanel(false);
-                                            setIsFadingOut(false);
-                                        }, 800);
-                                    }
-                                }}
                             >
                                 {chatHistory.map((entry, index) => (
                                     <div key={index} className="chat-entry">

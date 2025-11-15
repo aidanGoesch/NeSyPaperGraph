@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react';
+import ReactMarkdown from 'react-markdown';
 import * as d3 from 'd3';
 
 const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, onTopicClick }, ref) => {
@@ -205,8 +206,8 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
           setSelectedPaper({
             title: d.title,
             authors: d.authors || ['Dr. Jane Smith', 'Dr. John Doe', 'Dr. Alice Johnson'],
-            year: d.year || 2024,
-            citations: d.citations || Math.floor(Math.random() * 500),
+            year: d.year,
+            publication_date: d.publication_date,
             abstract: d.abstract || 'This is a dummy abstract for the paper...',
             topics: d.topics || []
           });
@@ -502,10 +503,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
             </div>
           </div>
           <div style={{ marginBottom: '12px' }}>
-            <strong>Year:</strong> <span style={{ color: '#555' }}>{selectedPaper.year}</span>
-          </div>
-          <div style={{ marginBottom: '12px' }}>
-            <strong>Citations:</strong> <span style={{ color: '#555' }}>{selectedPaper.citations}</span>
+            <strong>Year:</strong> <span style={{ color: '#555' }}>{selectedPaper.year || selectedPaper.publication_date || 'Unknown'}</span>
           </div>
           <div style={{ marginBottom: '12px' }}>
             <strong>Topics:</strong>
@@ -572,10 +570,10 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
             </div>
           </div>
           <div style={{ marginBottom: '12px' }}>
-            <strong>Abstract:</strong>
-            <p style={{ marginTop: '4px', color: '#555', lineHeight: '1.5' }}>
-              {selectedPaper.abstract}
-            </p>
+            <strong>Summary:</strong>
+            <div style={{ marginTop: '4px', color: '#555', lineHeight: '1.5' }}>
+              <ReactMarkdown>{selectedPaper.abstract || 'No summary available.'}</ReactMarkdown>
+            </div>
           </div>
         </div>
       )}
@@ -655,8 +653,8 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
                 setSelectedPaper({
                   title: paper.title,
                   authors: paper.authors || ['Dr. Jane Smith', 'Dr. John Doe'],
-                  year: paper.year || 2024,
-                  citations: paper.citations || Math.floor(Math.random() * 500),
+                  year: paper.year,
+                  publication_date: paper.publication_date,
                   abstract: paper.abstract || 'This is a dummy abstract for the paper...',
                   topics: paper.topics || []
                 });

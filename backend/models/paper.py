@@ -9,7 +9,8 @@ class Paper(BaseModel):
     summary: Optional[str] = None
     topics: List[str] = []
     embedding: Optional[List[float]] = None  # Changed from np.array to List[float] for Pydantic compatibility
-    authors: Optional[str] = None
+    authors: Optional[List[str]] = None
+    publication_date: Optional[str] = None
     
     class Config:
         arbitrary_types_allowed = True
