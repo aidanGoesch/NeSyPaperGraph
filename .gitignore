@@ -42,3 +42,6 @@ Thumbs.db
 
 # Stored Graphs
 *.pkl
+
+# React build output
+frontend/build/

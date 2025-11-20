@@ -13,7 +13,6 @@ function App() {
     const [isUploading, setIsUploading] = useState(false);
     const [uploadError, setUploadError] = useState(null);
     const [showMermaid, setShowMermaid] = useState(false);
-    const [mermaidDiagram, setMermaidDiagram] = useState("");
     const [agentArchitectureDiagram, setAgentArchitectureDiagram] =
         useState("");
     const [showChatPanel, setShowChatPanel] = useState(false);
@@ -68,12 +67,10 @@ function App() {
 
         return htmlText;
     };
-    const mermaidRef = useRef();
     const agentArchitectureMermaidRef = useRef();
     const chatContentRef = useRef();
     const [expandedResult, setExpandedResult] = useState(null);
     const chatInputRef = useRef();
-    const [chatHistoryIndex, setChatHistoryIndex] = useState(-1);
     const [isFadingOut, setIsFadingOut] = useState(false);
     const graphRef = useRef();
     const searchInputRef = useRef();
@@ -437,7 +434,6 @@ function App() {
                         value={searchTerm}
                         onChange={(e) => {
                             setSearchTerm(e.target.value);
-                            setChatHistoryIndex(-1);
                         }}
                         onKeyDown={(e) => {
                             if (e.key === "Enter") {

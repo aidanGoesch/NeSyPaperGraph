@@ -1,10 +1,7 @@
 # File for various LLM related services
-import boto3
 import json
 import os
 import re
-import ast
-from botocore.config import Config
 
 system_prompt = """
 You are an expert academic paper analyzer specializing in topic extraction from research papers. Your task is to identify and extract the main topics, themes, and subject areas discussed in academic papers.
@@ -71,47 +68,6 @@ You MUST respond with ONLY a valid JSON object in the following format:
 - All topics must be strings in the array
 - Do not include any commentary or metadata outside the JSON structure
 """
-
-
-class LLMClient:
-    def __init__(self, model_id, region='us-east-1'):
-        self.model_id = model_id
-        config = Config(retries={'max_attempts': 3, 'mode': 'adaptive'})
-        
-        # Use API key if available
-        if os.getenv('AWS_BEARER_TOKEN_BEDROCK'):
-            self.bedrock = boto3.client(
-                'bedrock-runtime', 
-                region_name=region, 
-                config=config,
-                aws_access_key_id='',
-                aws_secret_access_key='',
-                aws_session_token=os.getenv('AWS_BEARER_TOKEN_BEDROCK')
-            )
-        else:
-            self.bedrock = boto3.client('bedrock-runtime', region_name=region, config=config)
-
-    def generate(self, prompt, system_prompt=None):
-        messages = [{"role": "user", "content": prompt}]
-        
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1000,
-            "messages": messages
-        }
-        
-        if system_prompt:
-            body["system"] = system_prompt
-        
-        response = self.bedrock.invoke_model(
-            body=json.dumps(body),
-            modelId=self.model_id,
-            accept='application/json',
-            contentType='application/json'
-        )
-        
-        response_body = json.loads(response.get('body').read())
-        return response_body['content'][0]['text']
 
 
 class OpenAILLMClient:
@@ -361,32 +317,3 @@ Extract EXACTLY 8 topics in JSON format."""
         except Exception as e:
             print(f"Error extracting topics: {e}")
             return []
-
-
-if __name__ == "__main__":
-    # Example usage with AWS Bedrock:
-    model_id = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
-    bedrock_client = LLMClient(model_id=model_id)
-    
-    # Use Bedrock client with TopicExtractor
-    topic_extractor = TopicExtractor(bedrock_client)
-
-    sample_text = """
-    This paper presents a novel approach to neural architecture search using 
-    reinforcement learning techniques. We develop a deep learning framework 
-    that automatically discovers optimal network architectures for computer 
-    vision tasks. Our method leverages transfer learning and attention mechanisms 
-    to improve model performance on image classification benchmarks. We evaluate 
-    our approach on CIFAR-10 and ImageNet datasets, demonstrating significant 
-    improvements over manually designed architectures.
-    """
-    
-    existing_topics = ["Machine Learning", "Computer Vision", "Deep Learning", "Reinforcement Learning"]
-    
-    extracted_topics = topic_extractor.extract_topics(
-        sample_text, 
-        current_topics=existing_topics
-    )
-    
-    print("Extracted Topics:", extracted_topics)
-    print(f"Number of topics: {len(extracted_topics)}")

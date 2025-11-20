@@ -1,6 +1,5 @@
 from models.graph import PaperGraph
 from models.paper import Paper
-from models.topic import Topic
 from services.llm_service import TopicExtractor, OpenAILLMClient
 from services.pdf_preprocessor import extract_text_from_pdf
 import os
@@ -53,10 +52,6 @@ class GraphBuilder:
             self.get_papers(file_path)
         else:
             raise ValueError("Either files_data or file_path must be provided")
-
-        # Initialize graph (already done above if existing_graph provided)
-        if not existing_graph:
-            graph = PaperGraph()
         
         # Get all topics seen across all previous uploads
         global _all_topics_seen

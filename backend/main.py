@@ -61,14 +61,6 @@ app.add_middleware(
 
 app.include_router(graph_router, prefix="/api")
 
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI"}
-
-@app.get("/api/data")
-def get_data():
-    return {"data": "Sample data from backend"}
-
 @app.get("/api/agent/architecture")
 def get_agent_architecture():
     # Always return the static agent architecture diagram - no need for agent instance

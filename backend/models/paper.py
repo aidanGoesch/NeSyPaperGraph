@@ -1,6 +1,5 @@
 from pydantic import BaseModel
 from typing import List, Optional
-import numpy as np
 
 class Paper(BaseModel):
     title: str
@@ -8,7 +7,7 @@ class Paper(BaseModel):
     text: str
     summary: Optional[str] = None
     topics: List[str] = []
-    embedding: Optional[List[float]] = None  # Changed from np.array to List[float] for Pydantic compatibility
+    embedding: Optional[List[float]] = None
     authors: Optional[List[str]] = None
     publication_date: Optional[str] = None
     

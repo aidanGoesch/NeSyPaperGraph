@@ -1,7 +1,6 @@
 import math
 import networkx as nx
 from .paper import Paper
-from .topic import Topic
 
 class PaperGraph:
     def __init__(self):
@@ -24,9 +23,6 @@ class PaperGraph:
                     similarity = cosine_similarity(paper1_data.embedding, paper2_data.embedding)
                     if similarity > 0.5:  # threshold for semantic similarity
                         self.graph.add_edge(paper1, paper2, weight=similarity, type='semantic')
-    
-    def add_topic(self, topic: Topic):
-        self.graph.add_node(topic.name, type='topic', data=topic)
     
     def find_path(self, source: str, target: str):
         try:
