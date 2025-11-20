@@ -134,13 +134,18 @@ class QuestionAgent:
         question = state["question"]
         print(f"Processing bridge question: {question}")
         
+        # Clear any previous path at the start of bridge question processing
+        # It will be set again if we successfully find a path
+        if hasattr(self, '_last_path'):
+            delattr(self, '_last_path')
+        
         start_node, end_node = self._extract_entities(question)
         
         if start_node and end_node:
             path_result = self._find_path_in_graph(start_node, end_node)
             state["context"] = path_result
             
-            # Store path information for mermaid diagram
+            # Store path information for mermaid diagram (only if path was found)
             if hasattr(self, '_last_path'):
                 state["path_info"] = self._last_path
             
@@ -148,6 +153,9 @@ class QuestionAgent:
         else:
             state["context"] = f"Could not identify two entities to connect in: {question}"
             print(f"Could not parse entities from bridge question: {question}")
+            # Ensure no path is set if we couldn't extract entities
+            if hasattr(self, '_last_path'):
+                delattr(self, '_last_path')
         
         return state
     
@@ -262,6 +270,9 @@ Your synthesized explanation:"""
                     end_node = node
             
             if not start_node or not end_node:
+                # Clear any previous path if we can't find nodes
+                if hasattr(self, '_last_path'):
+                    delattr(self, '_last_path')
                 return "Those are not related"
             
             # Use NetworkX to find shortest path
@@ -270,7 +281,7 @@ Your synthesized explanation:"""
                 path = nx.shortest_path(graph_obj.graph, start_node, end_node)
                 path_str = " → ".join([str(node) for node in path])
                 
-                # Store path for mermaid diagram
+                # Store path for mermaid diagram (only when path is successfully found)
                 self._last_path = {
                     "nodes": path,
                     "start_entity": start_entity,
@@ -345,12 +356,18 @@ Your synthesized explanation:"""
                     return f"Path found: {path_str}\n\nNo detailed paper content available for analysis."
                     
             except nx.NetworkXNoPath:
+                # Clear path if no path exists
+                if hasattr(self, '_last_path'):
+                    delattr(self, '_last_path')
                 return "Those are not related"
                 
         except Exception as e:
             print(f"Error in pathfinding: {e}")
             import traceback
             traceback.print_exc()
+            # Clear path on error
+            if hasattr(self, '_last_path'):
+                delattr(self, '_last_path')
             return "Those are not related"
     
     def _explain_question(self, state: AgentState) -> AgentState:
@@ -666,8 +683,42 @@ Your synthesized explanation:"""
         
         return state
     
+    @staticmethod
+    def get_agent_architecture_diagram() -> str:
+        """Get the static agent architecture diagram (always the same) - static method that doesn't depend on instance state"""
+        mermaid_lines = [
+            "graph TD",
+            "    START([User Question]) --> route_question",
+            "    route_question -->|Connection Query| bridge_question",
+            "    route_question -->|Explanation Query| explain_question",
+            "    route_question -->|Search Query| keyword_search",
+            "    route_question -->|Properties Query| graph_properties",
+            "    bridge_question --> generate_answer",
+            "    explain_question --> generate_answer", 
+            "    keyword_search --> generate_answer",
+            "    graph_properties --> generate_answer",
+            "    generate_answer --> END([Final Answer])",
+            "    generate_answer -.-> OpenAI[OpenAI GPT-3.5]",
+            "    OpenAI -.-> generate_answer",
+            "    bridge_question -.-> ChainReasoning[Chain of LLM Calls]",
+            "    ChainReasoning -.-> bridge_question",
+            "",
+            "    style START fill:#e1f5fe",
+            "    style END fill:#c8e6c9", 
+            "    style OpenAI fill:#fff3e0",
+            "    style ChainReasoning fill:#fff3e0",
+            "    style route_question fill:#ffecb3",
+            "    style bridge_question fill:#e8f5e8",
+            "    style explain_question fill:#f3e5f5",
+            "    style keyword_search fill:#fce4ec",
+            "    style graph_properties fill:#e3f2fd",
+            "    style generate_answer fill:#e1f5fe"
+        ]
+        
+        return "\n".join(mermaid_lines)
+    
     def get_mermaid_diagram(self) -> str:
-        """Generate mermaid diagram dynamically from the actual graph structure"""
+        """Generate mermaid diagram dynamically from the actual graph structure (for chat responses)"""
         
         # If we have path information from a bridge question, show the path
         if hasattr(self, '_last_path') and self._last_path:
@@ -701,40 +752,16 @@ Your synthesized explanation:"""
             
             return "\n".join(mermaid_lines)
         
-        # Default agent architecture diagram
-        mermaid_lines = [
-            "graph TD",
-            "    START([User Question]) --> route_question",
-            "    route_question -->|Connection Query| bridge_question",
-            "    route_question -->|Explanation Query| explain_question",
-            "    route_question -->|Search Query| keyword_search",
-            "    route_question -->|Properties Query| graph_properties",
-            "    bridge_question --> generate_answer",
-            "    explain_question --> generate_answer", 
-            "    keyword_search --> generate_answer",
-            "    graph_properties --> generate_answer",
-            "    generate_answer --> END([Final Answer])",
-            "    generate_answer -.-> OpenAI[OpenAI GPT-3.5]",
-            "    OpenAI -.-> generate_answer",
-            "    bridge_question -.-> ChainReasoning[Chain of LLM Calls]",
-            "    ChainReasoning -.-> bridge_question",
-            "",
-            "    style START fill:#e1f5fe",
-            "    style END fill:#c8e6c9", 
-            "    style OpenAI fill:#fff3e0",
-            "    style ChainReasoning fill:#fff3e0",
-            "    style route_question fill:#ffecb3",
-            "    style bridge_question fill:#e8f5e8",
-            "    style explain_question fill:#f3e5f5",
-            "    style keyword_search fill:#fce4ec",
-            "    style graph_properties fill:#e3f2fd",
-            "    style generate_answer fill:#e1f5fe"
-        ]
-        
-        return "\n".join(mermaid_lines)
+        # If no path, return None (no diagram for chat)
+        return None
     
     async def answer_question(self, question: str) -> str:
         """Main method to answer a question"""
+        # Clear previous path at the start of each new question
+        # This ensures mermaid/path are only returned if the current query uses them
+        if hasattr(self, '_last_path'):
+            delattr(self, '_last_path')
+        
         initial_state = {
             "question": question,
             "context": "",

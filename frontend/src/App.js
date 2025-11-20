@@ -14,12 +14,14 @@ function App() {
     const [uploadError, setUploadError] = useState(null);
     const [showMermaid, setShowMermaid] = useState(false);
     const [mermaidDiagram, setMermaidDiagram] = useState("");
+    const [agentArchitectureDiagram, setAgentArchitectureDiagram] =
+        useState("");
     const [showChatPanel, setShowChatPanel] = useState(false);
     const [chatHistory, setChatHistory] = useState([]);
     const [isSearching, setIsSearching] = useState(false);
     const [followUpQuestion, setFollowUpQuestion] = useState("");
     const [highlightPath, setHighlightPath] = useState(null);
-    
+
     // Function to handle paper citation clicks
     const handlePaperCitationClick = (paperTitle) => {
         // Hide chat panel
@@ -28,10 +30,10 @@ function App() {
             setShowChatPanel(false);
             setIsFadingOut(false);
         }, 800);
-        
+
         if (graphRef.current && graphData) {
             // Find the paper in the graph data
-            const paper = graphData.papers.find(p => p.title === paperTitle);
+            const paper = graphData.papers.find((p) => p.title === paperTitle);
             if (paper) {
                 // Use the graph's focusOnPaper method if it exists, or simulate paper click
                 if (graphRef.current.focusOnPaper) {
@@ -47,23 +49,27 @@ function App() {
     // Function to process citations and markdown
     const processTextWithCitations = (text) => {
         if (!text || !graphData) return text;
-        
+
         // First convert markdown to HTML
         let htmlText = marked(text);
-        
+
         // Then process citations in the HTML
-        const paperTitles = graphData.papers.map(p => p.title);
-        
-        paperTitles.forEach(title => {
-            const bracketPattern = new RegExp(`\\[${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]`, 'g');
+        const paperTitles = graphData.papers.map((p) => p.title);
+
+        paperTitles.forEach((title) => {
+            const bracketPattern = new RegExp(
+                `\\[${title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]`,
+                "g"
+            );
             htmlText = htmlText.replace(bracketPattern, (match) => {
                 return `<span class="paper-citation" data-paper-title="${title}" style="color: #4CAF50; cursor: pointer; text-decoration: underline;">${match}</span>`;
             });
         });
-        
+
         return htmlText;
     };
     const mermaidRef = useRef();
+    const agentArchitectureMermaidRef = useRef();
     const chatContentRef = useRef();
     const [expandedResult, setExpandedResult] = useState(null);
     const chatInputRef = useRef();
@@ -75,7 +81,7 @@ function App() {
     // Keyboard shortcut for Cmd+G to focus search
     useEffect(() => {
         const handleKeyDown = (e) => {
-            if ((e.metaKey || e.ctrlKey) && e.key === 'g') {
+            if ((e.metaKey || e.ctrlKey) && e.key === "g") {
                 e.preventDefault();
                 if (searchInputRef.current) {
                     searchInputRef.current.focus();
@@ -83,8 +89,8 @@ function App() {
             }
         };
 
-        document.addEventListener('keydown', handleKeyDown);
-        return () => document.removeEventListener('keydown', handleKeyDown);
+        document.addEventListener("keydown", handleKeyDown);
+        return () => document.removeEventListener("keydown", handleKeyDown);
     }, []);
 
     useEffect(() => {
@@ -92,18 +98,95 @@ function App() {
     }, []);
 
     useEffect(() => {
-        if (showMermaid && mermaidDiagram && mermaidRef.current) {
-            mermaidRef.current.innerHTML = mermaidDiagram;
-            mermaid.init(undefined, mermaidRef.current);
+        if (
+            showMermaid &&
+            agentArchitectureDiagram &&
+            agentArchitectureMermaidRef.current
+        ) {
+            agentArchitectureMermaidRef.current.innerHTML = "";
+            // Clean the mermaid code
+            const cleanMermaidCode = agentArchitectureDiagram
+                .replace(/<pre[^>]*>/gi, "")
+                .replace(/<\/pre>/gi, "")
+                .replace(/<[^>]+>/g, "")
+                .trim();
+
+            // Use mermaid.render() for dynamic content
+            mermaid
+                .render("mermaid-agent-architecture", cleanMermaidCode)
+                .then(({ svg }) => {
+                    if (agentArchitectureMermaidRef.current) {
+                        agentArchitectureMermaidRef.current.innerHTML = svg;
+                    }
+                })
+                .catch((err) => {
+                    console.error("Mermaid rendering error:", err);
+                    if (agentArchitectureMermaidRef.current) {
+                        agentArchitectureMermaidRef.current.innerHTML = `<p style="color: red; padding: 10px;">Error rendering diagram: ${err.message}</p>`;
+                    }
+                });
         }
-    }, [showMermaid, mermaidDiagram]);
+    }, [showMermaid, agentArchitectureDiagram]);
 
     useEffect(() => {
         // Auto-scroll to bottom when chat history updates
         if (chatContentRef.current) {
-            chatContentRef.current.scrollTop = chatContentRef.current.scrollHeight;
+            chatContentRef.current.scrollTop =
+                chatContentRef.current.scrollHeight;
         }
-    }, [chatHistory]);
+
+        // Render mermaid diagrams in chat entries
+        // Use a small delay to ensure DOM elements are ready when chat panel opens
+        const renderMermaidDiagrams = () => {
+            if (chatContentRef.current && showChatPanel) {
+                chatHistory.forEach((entry, index) => {
+                    if (entry.mermaid && entry.mermaid.trim()) {
+                        const mermaidContainer = document.getElementById(
+                            `chat-mermaid-${index}`
+                        );
+                        if (mermaidContainer) {
+                            // Check if already rendered by looking for SVG content
+                            const hasRenderedContent =
+                                mermaidContainer.querySelector("svg");
+                            if (!hasRenderedContent) {
+                                // Clear container
+                                mermaidContainer.innerHTML = "";
+                                // Clean the mermaid code (remove any HTML tags that might have been added)
+                                const cleanMermaidCode = entry.mermaid
+                                    .replace(/<pre[^>]*>/gi, "")
+                                    .replace(/<\/pre>/gi, "")
+                                    .replace(/<[^>]+>/g, "")
+                                    .trim();
+
+                                // Only render if we have valid mermaid code
+                                if (cleanMermaidCode) {
+                                    // Use mermaid.render() for dynamic content
+                                    const mermaidId = `mermaid-chat-${index}`;
+                                    mermaid
+                                        .render(mermaidId, cleanMermaidCode)
+                                        .then(({ svg }) => {
+                                            mermaidContainer.innerHTML = svg;
+                                        })
+                                        .catch((err) => {
+                                            console.error(
+                                                "Mermaid rendering error:",
+                                                err
+                                            );
+                                            mermaidContainer.innerHTML = `<p style="color: red; padding: 10px;">Error rendering diagram: ${err.message}</p>`;
+                                        });
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        };
+
+        // If chat panel is showing, render diagrams (with small delay to ensure DOM is ready)
+        if (showChatPanel) {
+            setTimeout(renderMermaidDiagrams, 100);
+        }
+    }, [chatHistory, showChatPanel]);
 
     // Load saved graph on startup, fallback to dummy if none exists
     useEffect(() => {
@@ -114,7 +197,9 @@ function App() {
                     return response.json();
                 } else {
                     // If no saved graph, try dummy
-                    return fetch("http://localhost:8000/api/graph/dummy").then(r => r.json());
+                    return fetch("http://localhost:8000/api/graph/dummy").then(
+                        (r) => r.json()
+                    );
                 }
             })
             .then((data) => setGraphData(data))
@@ -132,7 +217,7 @@ function App() {
             );
             const data = await response.json();
             if (data.mermaid) {
-                setMermaidDiagram(data.mermaid);
+                setAgentArchitectureDiagram(data.mermaid);
                 setShowMermaid(true);
             }
         } catch (error) {
@@ -142,6 +227,9 @@ function App() {
 
     const handleSearch = async (query) => {
         if (!query.trim()) return;
+
+        // Reset highlight path when asking a new question
+        setHighlightPath(null);
 
         setIsSearching(true);
         setShowChatPanel(true);
@@ -160,7 +248,10 @@ function App() {
                 console.log("Auto-scrolling to bottom");
                 const lastChild = chatContentRef.current.lastElementChild;
                 if (lastChild) {
-                    lastChild.scrollIntoView({ behavior: 'smooth', block: 'end' });
+                    lastChild.scrollIntoView({
+                        behavior: "smooth",
+                        block: "end",
+                    });
                 }
             } else {
                 console.log("chatContentRef.current is null");
@@ -180,8 +271,9 @@ function App() {
             console.log("Search response:", data);
             console.log("Search results:", data.search_results);
 
-            // Store path information for graph highlighting
-            if (data.path && data.path.nodes) {
+            // Only set highlight path if we have both path and mermaid diagram
+            // If there's no mermaid, don't highlight the old path
+            if (data.mermaid && data.path && data.path.nodes) {
                 setHighlightPath(data.path);
             } else {
                 setHighlightPath(null);
@@ -192,20 +284,28 @@ function App() {
                 const updated = [...prev];
                 updated[updated.length - 1] = {
                     ...updated[updated.length - 1],
-                    answer: data.status === "search_results" ? "SEARCH_RESULTS" : (data.answer || data.error || "No response"),
+                    answer:
+                        data.status === "search_results"
+                            ? "SEARCH_RESULTS"
+                            : data.answer || data.error || "No response",
                     search_results: data.search_results || null,
+                    mermaid: data.mermaid || null, // Store mermaid diagram from response (null if not present)
                 };
-                
+
                 // Auto-scroll after updating chat history
                 setTimeout(() => {
                     if (chatContentRef.current) {
-                        const lastChild = chatContentRef.current.lastElementChild;
+                        const lastChild =
+                            chatContentRef.current.lastElementChild;
                         if (lastChild) {
-                            lastChild.scrollIntoView({ behavior: 'smooth', block: 'end' });
+                            lastChild.scrollIntoView({
+                                behavior: "smooth",
+                                block: "end",
+                            });
                         }
                     }
                 }, 50);
-                
+
                 return updated;
             });
         } catch (error) {
@@ -348,7 +448,8 @@ function App() {
                         onFocus={() => setIsSearchExpanded(true)}
                         onBlur={() => setIsSearchExpanded(false)}
                         onWheel={(e) => {
-                            if (e.deltaY > 0 && chatHistory.length > 0) { // Scrolling down
+                            if (e.deltaY > 0 && chatHistory.length > 0) {
+                                // Scrolling down
                                 e.preventDefault();
                                 setShowChatPanel(true);
                             }
@@ -366,17 +467,26 @@ function App() {
                         } ${isFadingOut ? "fading-out" : ""}`}
                     >
                         <div
-                            className={`chat-panel ${isDarkMode ? "dark" : "light"}`}
+                            className={`chat-panel ${
+                                isDarkMode ? "dark" : "light"
+                            }`}
                             onWheel={(e) => {
                                 const panel = e.currentTarget;
                                 const scrollTop = panel.scrollTop;
                                 const isScrollingUp = e.deltaY < 0;
-                                
-                                console.log('React onWheel - scrollTop:', scrollTop, 'isScrollingUp:', isScrollingUp);
-                                
+
+                                console.log(
+                                    "React onWheel - scrollTop:",
+                                    scrollTop,
+                                    "isScrollingUp:",
+                                    isScrollingUp
+                                );
+
                                 // Only close if we're at the very top AND scrolling up
                                 if (scrollTop === 0 && isScrollingUp) {
-                                    console.log('Closing chat panel from React handler');
+                                    console.log(
+                                        "Closing chat panel from React handler"
+                                    );
                                     e.preventDefault();
                                     setIsFadingOut(true);
                                     setTimeout(() => {
@@ -401,10 +511,7 @@ function App() {
                             </button>
 
                             {/* Scrollable content */}
-                            <div
-                                className="chat-content"
-                                ref={chatContentRef}
-                            >
+                            <div className="chat-content" ref={chatContentRef}>
                                 {chatHistory.map((entry, index) => (
                                     <div key={index} className="chat-entry">
                                         <div className="question">
@@ -421,59 +528,167 @@ function App() {
                                                     <span></span>
                                                     <span></span>
                                                 </div>
-                                            ) : (entry.answer === "SEARCH_RESULTS" && entry.search_results) ? (
-                                                <div className="search-results">
-                                                    {entry.search_results.map((result, idx) => (
-                                                        <div 
-                                                            key={idx} 
-                                                            className={`search-result-block ${expandedResult === idx ? 'expanded' : ''}`}
-                                                            onClick={() => setExpandedResult(expandedResult === idx ? null : idx)}
-                                                        >
-                                                            <h4>{result.title}</h4>
-                                                            <p className="author">{result.author}</p>
-                                                            <div className="topics">
-                                                                {result.topics.map((topic, topicIdx) => (
-                                                                    <span 
-                                                                        key={topicIdx} 
-                                                                        className="topic-tag"
-                                                                        onClick={(e) => {
-                                                                            e.stopPropagation();
-                                                                            setIsFadingOut(true);
-                                                                            setTimeout(() => {
-                                                                                setShowChatPanel(false);
-                                                                                setIsFadingOut(false);
-                                                                                // Focus on topic in graph
-                                                                                if (graphRef.current) {
-                                                                                    graphRef.current.focusOnTopic(topic);
+                                            ) : entry.answer ===
+                                                  "SEARCH_RESULTS" &&
+                                              entry.search_results ? (
+                                                <>
+                                                    <div className="search-results">
+                                                        {entry.search_results.map(
+                                                            (result, idx) => (
+                                                                <div
+                                                                    key={idx}
+                                                                    className={`search-result-block ${
+                                                                        expandedResult ===
+                                                                        idx
+                                                                            ? "expanded"
+                                                                            : ""
+                                                                    }`}
+                                                                    onClick={() =>
+                                                                        setExpandedResult(
+                                                                            expandedResult ===
+                                                                                idx
+                                                                                ? null
+                                                                                : idx
+                                                                        )
+                                                                    }
+                                                                >
+                                                                    <h4>
+                                                                        {
+                                                                            result.title
+                                                                        }
+                                                                    </h4>
+                                                                    <p className="author">
+                                                                        {
+                                                                            result.author
+                                                                        }
+                                                                    </p>
+                                                                    <div className="topics">
+                                                                        {result.topics.map(
+                                                                            (
+                                                                                topic,
+                                                                                topicIdx
+                                                                            ) => (
+                                                                                <span
+                                                                                    key={
+                                                                                        topicIdx
+                                                                                    }
+                                                                                    className="topic-tag"
+                                                                                    onClick={(
+                                                                                        e
+                                                                                    ) => {
+                                                                                        e.stopPropagation();
+                                                                                        setIsFadingOut(
+                                                                                            true
+                                                                                        );
+                                                                                        setTimeout(
+                                                                                            () => {
+                                                                                                setShowChatPanel(
+                                                                                                    false
+                                                                                                );
+                                                                                                setIsFadingOut(
+                                                                                                    false
+                                                                                                );
+                                                                                                // Focus on topic in graph
+                                                                                                if (
+                                                                                                    graphRef.current
+                                                                                                ) {
+                                                                                                    graphRef.current.focusOnTopic(
+                                                                                                        topic
+                                                                                                    );
+                                                                                                }
+                                                                                            },
+                                                                                            800
+                                                                                        );
+                                                                                    }}
+                                                                                >
+                                                                                    {
+                                                                                        topic
+                                                                                    }
+                                                                                </span>
+                                                                            )
+                                                                        )}
+                                                                    </div>
+                                                                    {expandedResult ===
+                                                                        idx && (
+                                                                        <div className="summary">
+                                                                            <ReactMarkdown>
+                                                                                {
+                                                                                    result.summary
                                                                                 }
-                                                                            }, 800);
-                                                                        }}
-                                                                    >
-                                                                        {topic}
-                                                                    </span>
-                                                                ))}
-                                                            </div>
-                                                            {expandedResult === idx && (
-                                                                <div className="summary">
-                                                                    <ReactMarkdown>{result.summary}</ReactMarkdown>
+                                                                            </ReactMarkdown>
+                                                                        </div>
+                                                                    )}
                                                                 </div>
-                                                            )}
-                                                        </div>
-                                                    ))}
-                                                </div>
+                                                            )
+                                                        )}
+                                                    </div>
+                                                    {entry.mermaid && (
+                                                        <div
+                                                            id={`chat-mermaid-${index}`}
+                                                            className="chat-mermaid-diagram"
+                                                            style={{
+                                                                width: "100%",
+                                                                marginTop:
+                                                                    "15px",
+                                                                padding: "15px",
+                                                                backgroundColor:
+                                                                    isDarkMode
+                                                                        ? "#2d2d2d"
+                                                                        : "#f5f5f5",
+                                                                borderRadius:
+                                                                    "8px",
+                                                                overflow:
+                                                                    "auto",
+                                                            }}
+                                                        />
+                                                    )}
+                                                </>
                                             ) : (
-                                                <div 
-                                                    className="markdown-content"
-                                                    onClick={(e) => {
-                                                        if (e.target.classList.contains('paper-citation')) {
-                                                            const paperTitle = e.target.getAttribute('data-paper-title');
-                                                            handlePaperCitationClick(paperTitle);
-                                                        }
-                                                    }}
-                                                    dangerouslySetInnerHTML={{
-                                                        __html: processTextWithCitations(entry.answer)
-                                                    }}
-                                                />
+                                                <>
+                                                    <div
+                                                        className="markdown-content"
+                                                        onClick={(e) => {
+                                                            if (
+                                                                e.target.classList.contains(
+                                                                    "paper-citation"
+                                                                )
+                                                            ) {
+                                                                const paperTitle =
+                                                                    e.target.getAttribute(
+                                                                        "data-paper-title"
+                                                                    );
+                                                                handlePaperCitationClick(
+                                                                    paperTitle
+                                                                );
+                                                            }
+                                                        }}
+                                                        dangerouslySetInnerHTML={{
+                                                            __html: processTextWithCitations(
+                                                                entry.answer
+                                                            ),
+                                                        }}
+                                                    />
+                                                    {entry.mermaid && (
+                                                        <div
+                                                            id={`chat-mermaid-${index}`}
+                                                            className="chat-mermaid-diagram"
+                                                            style={{
+                                                                width: "100%",
+                                                                marginTop:
+                                                                    "15px",
+                                                                padding: "15px",
+                                                                backgroundColor:
+                                                                    isDarkMode
+                                                                        ? "#2d2d2d"
+                                                                        : "#f5f5f5",
+                                                                borderRadius:
+                                                                    "8px",
+                                                                overflow:
+                                                                    "auto",
+                                                            }}
+                                                        />
+                                                    )}
+                                                </>
                                             )}
                                         </div>
                                     </div>
@@ -496,7 +711,10 @@ function App() {
                                         followUpQuestion.trim()
                                     ) {
                                         e.preventDefault();
-                                        console.log("Follow-up question:", followUpQuestion);
+                                        console.log(
+                                            "Follow-up question:",
+                                            followUpQuestion
+                                        );
                                         handleSearch(followUpQuestion);
                                         setFollowUpQuestion("");
                                         // Focus back to this input, not chatInputRef
@@ -543,7 +761,7 @@ function App() {
                             ×
                         </button>
                         <h3>Agent Architecture</h3>
-                        <div ref={mermaidRef}></div>
+                        <div ref={agentArchitectureMermaidRef}></div>
                     </div>
                 )}
             </main>

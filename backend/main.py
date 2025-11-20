@@ -71,11 +71,8 @@ def get_data():
 
 @app.get("/api/agent/architecture")
 def get_agent_architecture():
-    global agent
-    if not agent:
-        current_graph_data, current_graph_obj = get_current_graph_data()
-        agent = QuestionAgent(current_graph_data, current_graph_obj)
-    mermaid_diagram = agent.get_mermaid_diagram()
+    # Always return the static agent architecture diagram - no need for agent instance
+    mermaid_diagram = QuestionAgent.get_agent_architecture_diagram()
     return {"mermaid": mermaid_diagram, "status": "success"}
 
 @app.post("/api/search")
@@ -90,19 +87,23 @@ async def search(request: SearchRequest):
     try:
         answer = await agent.answer_question(request.query)
         
+        # Get mermaid diagram for chat (may be None if no path)
+        chat_mermaid = agent.get_mermaid_diagram()
+        
         # Check if this is a search results response
         if answer == "SEARCH_RESULTS" and hasattr(agent, '_last_state') and agent._last_state.get('search_results'):
             return {
                 "query": request.query,
                 "search_results": agent._last_state['search_results'],
-                "mermaid": agent.get_mermaid_diagram(),
+                "mermaid": chat_mermaid,  # May be None
+                "path": getattr(agent, '_last_path', None),
                 "status": "search_results"
             }
         
         return {
             "query": request.query, 
             "answer": answer, 
-            "mermaid": agent.get_mermaid_diagram(),
+            "mermaid": chat_mermaid,  # May be None
             "path": getattr(agent, '_last_path', None),
             "status": "success"
         }
