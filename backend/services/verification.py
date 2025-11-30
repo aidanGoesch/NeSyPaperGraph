@@ -148,16 +148,6 @@ def find_optimal_topic_merge(topics: list, topic_synonyms: dict) -> dict:
     
     # Convert to indexed format
     return {i: topic_list for i, topic_list in enumerate(groups.values())}
-from models.graph import PaperGraph
-from models.paper import Paper
-from models.topic import Topic
-
-from z3 import *
-
-from typing import List, Dict, Tuple, Set
-
-def get_transitive_synonym_groups(topics: List[str], topic_synonyms: Dict[str, List[str]]) -> List[Set[str]]:
-    """Groups topics that must merge due to direct or indirect synonym relationships."""
     parent = {topic: topic for topic in topics}
     
     def find(i):
