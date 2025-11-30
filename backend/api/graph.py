@@ -1,6 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from services.graph_builder import create_dummy_graph, GraphBuilder, get_all_topics_seen
+from services.verification import verify_bipartite
 import traceback
 import logging
 import pickle
@@ -31,10 +32,9 @@ def graph_to_dict(graph):
                 "file_path": paper_data.file_path
             })
             topics.update(paper_data.topics)
-        elif data.get('type') == 'topic':
-            topics.add(node)
     
-    # Extract all edges
+    # Extract all edges and collect connected topics
+    connected_topics = set()
     for source, target, edge_data in graph.graph.edges(data=True):
         edges.append({
             "source": source,
@@ -42,10 +42,15 @@ def graph_to_dict(graph):
             "type": edge_data.get('type', 'topic'),
             "weight": edge_data.get('weight', 1.0)
         })
+        # Track which topics are actually connected
+        if graph.graph.nodes[source].get('type') == 'topic':
+            connected_topics.add(source)
+        if graph.graph.nodes[target].get('type') == 'topic':
+            connected_topics.add(target)
     
     return {
         "papers": papers,
-        "topics": list(topics),
+        "topics": list(connected_topics),  # Only include topics with edges
         "edges": edges
     }
 
@@ -111,9 +116,16 @@ async def upload_papers(files: List[UploadFile] = File(...)):
         if graph:
             # Update existing graph with new papers
             updated_graph = builder.build_graph(files_data=files_data, existing_graph=graph)
+            # Incremental verification - only check new nodes/edges
+            logger.info(f"Verifying {len(updated_graph.new_nodes)} new nodes and {len(updated_graph.new_edges)} new edges...")
+            verify_bipartite(updated_graph, updated_graph.new_nodes, updated_graph.new_edges)
+            updated_graph.clear_incremental_tracking()
         else:
             # Create new graph
             updated_graph = builder.build_graph(files_data=files_data)
+            # Full verification for new graph
+            logger.info("Verifying entire graph...")
+            verify_bipartite(updated_graph)
         
         graph = updated_graph
         
@@ -157,10 +169,67 @@ def load_saved_graph():
         raise HTTPException(status_code=404, detail="No saved graph found")
     
     try:
+        logger.info("Loading graph from pickle file...")
         with open(save_path, 'rb') as f:
             graph = pickle.load(f)
+        logger.info("Graph loaded successfully")
+        
+        logger.info("Verifying bipartiteness...")
+        verify_bipartite(graph)
+        logger.info("Bipartite verification complete")
+        
+        # Load synonyms into cache if they exist
+        from services.graph_builder import _topic_synonyms_cache
+        has_synonyms = hasattr(graph, 'topic_synonyms') and graph.topic_synonyms and len(graph.topic_synonyms) > 0
+        
+        if has_synonyms:
+            _topic_synonyms_cache.update(graph.topic_synonyms)
+            logger.info(f"Loaded {len(graph.topic_synonyms)} cached synonyms from graph")
+        
+        # If no synonyms exist, compute them
+        if not has_synonyms:
+            from services.llm_service import OpenAILLMClient
+            from services.verification import find_optimal_topic_merge
+            
+            all_topics = [node for node, data in graph.graph.nodes(data=True) if data.get('type') == 'topic']
+            logger.info(f"Found {len(all_topics)} topics without synonyms")
+            
+            if all_topics:
+                logger.info(f"Computing synonyms for {len(all_topics)} topics in batches...")
+                client = OpenAILLMClient()
+                
+                # Process in batches of 50 topics at a time
+                batch_size = 50
+                topic_synonyms = {}
+                for i in range(0, len(all_topics), batch_size):
+                    batch = all_topics[i:i+batch_size]
+                    logger.info(f"Processing batch {i//batch_size + 1}/{(len(all_topics)-1)//batch_size + 1} ({len(batch)} topics)")
+                    batch_synonyms = client.generate_topic_synonyms(batch)
+                    topic_synonyms.update(batch_synonyms)
+                
+                graph.topic_synonyms = topic_synonyms
+                _topic_synonyms_cache.update(topic_synonyms)
+                logger.info(f"Computed synonyms for {len(topic_synonyms)} topics")
+                
+                # Find optimal topic merges
+                logger.info("Finding optimal topic merges...")
+                from services.verification import find_optimal_topic_merge
+                merge_groups = find_optimal_topic_merge(all_topics, topic_synonyms)
+                graph.topic_merge_groups = merge_groups
+                logger.info(f"Found {len(merge_groups)} merge groups")
+                
+                # Apply the merges to the graph
+                logger.info("Applying topic merges to graph...")
+                graph.merge_topics(merge_groups)
+                logger.info("Topic merges applied")
+                
+                # Save updated graph with synonyms and merged topics
+                with open(save_path, 'wb') as f:
+                    pickle.dump(graph, f)
+                logger.info("Saved graph with computed synonyms and merged topics")
         
         # Convert to frontend format
+        logger.info("Converting graph to frontend format...")
         graph_data = graph_to_dict(graph)
         
         # Add all topics seen

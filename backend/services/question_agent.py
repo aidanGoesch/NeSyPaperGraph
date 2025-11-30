@@ -161,17 +161,33 @@ class QuestionAgent:
     
     def _extract_entities(self, question):
         """Extract start and end entities from bridge questions using LLM"""
+        
+        # Get available topics from graph for context
+        graph_obj = self._get_graph_object()
+        topics_context = ""
+        if graph_obj:
+            topics = [str(node) for node, data in graph_obj.graph.nodes(data=True) if data.get('type') == 'topic']
+            if topics:
+                topics_context = f"\n\nAvailable topics in the research graph:\n{', '.join(topics[:50])}"  # Limit to 50 topics
+        
         extraction_prompt = f"""
-Extract the two main concepts/entities that need to be connected from this question.
-Return ONLY the two entities separated by a pipe (|), nothing else.
+You are extracting entities from a question about a research paper knowledge graph.
+
+CRITICAL RULES:
+1. Extract EXACTLY what the user wrote, do NOT expand abbreviations
+2. If user says "LLMs", extract "LLMs" (not "Large Language Models")
+3. If user says "RL", extract "RL" (not "Reinforcement Learning")
+4. Return ONLY the two entities separated by a pipe (|)
+{topics_context}
 
 Examples:
 "How are generative models and transfer learning related?" -> generative models|transfer learning
-"What's the connection between DNA and RNA?" -> DNA|RNA
+"How are LLMs and RL related?" -> LLMs|RL
 "Compare neural networks and decision trees" -> neural networks|decision trees
 
 Question: {question}
-"""
+
+Entities (exactly as written in question):"""
         
         try:
             response = self.llm.invoke([HumanMessage(content=extraction_prompt)])
@@ -250,6 +266,59 @@ Your synthesized explanation:"""
             fallback += f"\n**Connection Path:**\n{path_str}"
             return fallback
     
+    def _resolve_synonym(self, entity, graph_obj):
+        """Resolve entity to actual graph node, checking synonyms"""
+        entity_lower = entity.lower().strip()
+        
+        # Common abbreviation mappings - map to key terms that MUST appear
+        abbrev_map = {
+            'llms': 'language model',
+            'llm': 'language model',
+            'rl': 'reinforcement',
+            'nlp': 'natural language processing',
+            'cv': 'computer vision',
+            'ml': 'machine learning',
+            'dl': 'deep learning',
+            'nn': 'neural network',
+            'cnn': 'convolutional',
+            'rnn': 'recurrent'
+        }
+        
+        # If it's an abbreviation, use the expanded form
+        if entity_lower in abbrev_map:
+            search_term = abbrev_map[entity_lower]
+            print(f"Expanding abbreviation '{entity}' -> '{search_term}'")
+        else:
+            search_term = entity_lower
+        
+        # Direct match in node names
+        for node, data in graph_obj.graph.nodes(data=True):
+            node_lower = str(node).lower()
+            if search_term in node_lower:
+                print(f"Resolved '{entity}' -> '{node}' (direct match)")
+                return node
+        
+        # Check merged topics
+        for node, data in graph_obj.graph.nodes(data=True):
+            if data.get('type') == 'topic' and 'merged_topics' in data:
+                for merged in data['merged_topics']:
+                    if search_term in merged.lower():
+                        print(f"Resolved '{entity}' -> '{node}' (merged topic)")
+                        return node
+        
+        # Check topic_synonyms
+        if hasattr(graph_obj, 'topic_synonyms'):
+            for topic, synonyms in graph_obj.topic_synonyms.items():
+                for syn in synonyms:
+                    if search_term in syn.lower():
+                        for node in graph_obj.graph.nodes():
+                            if topic.lower() in str(node).lower():
+                                print(f"Resolved '{entity}' -> '{node}' (synonym)")
+                                return node
+        
+        print(f"Could not resolve '{entity}' to any graph node")
+        return None
+    
     def _find_path_in_graph(self, start_entity, end_entity):
         """Find path between two entities and use chain reasoning to explain the connection"""
         try:
@@ -258,22 +327,31 @@ Your synthesized explanation:"""
             if not graph_obj:
                 return "Graph not available"
             
-            # Find nodes that match the entities
-            start_node = None
-            end_node = None
+            print(f"Attempting to resolve: '{start_entity}' and '{end_entity}'")
             
-            for node, data in graph_obj.graph.nodes(data=True):
-                node_str = str(node).lower()
-                if start_entity.lower() in node_str:
-                    start_node = node
-                if end_entity.lower() in node_str:
-                    end_node = node
+            # Resolve entities to actual nodes (handles synonyms)
+            start_node = self._resolve_synonym(start_entity, graph_obj)
+            end_node = self._resolve_synonym(end_entity, graph_obj)
             
-            if not start_node or not end_node:
-                # Clear any previous path if we can't find nodes
-                if hasattr(self, '_last_path'):
-                    delattr(self, '_last_path')
-                return "Those are not related"
+            print(f"Resolved to: start_node='{start_node}', end_node='{end_node}'")
+            
+            if not start_node:
+                # List similar topics to help user
+                topics = [str(n) for n, d in graph_obj.graph.nodes(data=True) if d.get('type') == 'topic']
+                similar = [t for t in topics if any(word in t.lower() for word in start_entity.lower().split())]
+                msg = f"Could not find '{start_entity}' in the graph."
+                if similar:
+                    msg += f" Did you mean: {', '.join(similar[:5])}?"
+                return msg
+            
+            if not end_node:
+                # List similar topics to help user
+                topics = [str(n) for n, d in graph_obj.graph.nodes(data=True) if d.get('type') == 'topic']
+                similar = [t for t in topics if any(word in t.lower() for word in end_entity.lower().split())]
+                msg = f"Could not find '{end_entity}' in the graph."
+                if similar:
+                    msg += f" Did you mean: {', '.join(similar[:5])}?"
+                return msg
             
             # Use NetworkX to find shortest path
             import networkx as nx

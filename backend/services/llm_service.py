@@ -2,6 +2,11 @@
 import json
 import os
 import re
+import ast
+import logging
+from botocore.config import Config
+
+logger = logging.getLogger(__name__)
 
 system_prompt = """
 You are an expert academic paper analyzer specializing in topic extraction from research papers. Your task is to identify and extract the main topics, themes, and subject areas discussed in academic papers.
@@ -165,6 +170,51 @@ Paper text:
             
         except Exception as e:
             return f"Summary generation failed: {str(e)}"
+    
+    def generate_topic_synonyms(self, topics: list[str]) -> dict[str, list[str]]:
+        """Generate synonyms for each topic to help identify duplicates"""
+        try:
+            prompt = f"""For each topic below, identify which OTHER topics in the list are synonyms or very similar meanings.
+Return ONLY a JSON object where keys are topics and values are arrays of OTHER topics from the list that mean the same thing.
+
+IMPORTANT: Only use topics that appear in the provided list. Do not invent new topic names.
+
+Topics: {', '.join(topics)}
+
+Example format (using only topics from the list):
+{{"Large Language Models": ["LLMs", "Language Models"], "Neural Networks": ["Deep Networks", "ANNs"]}}
+
+If a topic has no synonyms in the list, use an empty array: {{"Unique Topic": []}}
+
+JSON:"""
+            
+            logger.info(f"Requesting synonyms for {len(topics)} topics from OpenAI...")
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2000,
+                temperature=0.3
+            )
+            
+            # Parse JSON response
+            import json
+            content = response.choices[0].message.content.strip()
+            logger.info(f"Received response, length: {len(content)}")
+            
+            # Extract JSON from response (in case there's extra text)
+            start = content.find('{')
+            end = content.rfind('}') + 1
+            if start != -1 and end > start:
+                json_str = content[start:end]
+                result = json.loads(json_str)
+                logger.info(f"Successfully parsed {len(result)} topic synonyms")
+                return result
+            else:
+                logger.error(f"No JSON found in response: {content[:200]}")
+                return {}
+        except Exception as e:
+            logger.error(f"Error generating topic synonyms: {str(e)}", exc_info=True)
+            return {}
 
 
 class TopicExtractor:

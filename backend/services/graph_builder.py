@@ -2,6 +2,7 @@ from models.graph import PaperGraph
 from models.paper import Paper
 from services.llm_service import TopicExtractor, OpenAILLMClient
 from services.pdf_preprocessor import extract_text_from_pdf
+from services.verification import verify_bipartite, find_optimal_topic_merge
 import os
 import logging
 from pathlib import Path
@@ -10,6 +11,9 @@ logger = logging.getLogger(__name__)
 
 # Global set to store all topics seen across all uploads (in-memory, not persistent)
 _all_topics_seen = set()
+
+# Global dict to store topic synonyms (persistent across uploads)
+_topic_synonyms_cache = {}
 
 
 class GraphBuilder:
@@ -29,6 +33,8 @@ class GraphBuilder:
             file_path: Directory path to scan for PDFs (legacy support), or None
             existing_graph: Existing PaperGraph to update, or None to create new
         """
+        global _topic_synonyms_cache
+        
         # Use existing graph or create new one
         if existing_graph:
             graph = existing_graph
@@ -40,6 +46,10 @@ class GraphBuilder:
                     self.papers.append(data['data'])
                 elif data.get('type') == 'topic':
                     self.topics.add(node)
+            
+            # Load existing synonyms into cache
+            if hasattr(graph, 'topic_synonyms') and graph.topic_synonyms:
+                _topic_synonyms_cache.update(graph.topic_synonyms)
         else:
             # Reset state for new build
             self.papers = []
@@ -88,8 +98,59 @@ class GraphBuilder:
             
             # Add paper to graph immediately after processing
             graph.add_paper(paper)
+            
+            # Verify bipartiteness incrementally after adding paper
+            if not verify_bipartite(graph, graph.new_nodes, graph.new_edges):
+                logger.error(f"Bipartite verification failed after adding paper: {paper.title}. Rolling back.")
+                
+                # Remove the paper node
+                if paper.title in graph.graph:
+                    # Get topics connected to this paper before removing
+                    paper_topics = list(graph.graph.neighbors(paper.title))
+                    graph.graph.remove_node(paper.title)
+                    
+                    # Remove orphaned topics (topics with no remaining connections)
+                    for topic in paper_topics:
+                        if topic in graph.graph and graph.graph.degree(topic) == 0:
+                            graph.graph.remove_node(topic)
+                            logger.info(f"Removed orphaned topic: {topic}")
+                
+                # Clear the incremental tracking for this failed addition
+                graph.clear_incremental_tracking()
+                continue
+            
+            # Clear tracking after successful verification
+            graph.clear_incremental_tracking()
         
         logger.info(f"Processed {len(self.papers)} papers, {len(self.topics)} unique topics in this batch")
+        
+        # Generate synonyms for all topics in the graph
+        all_topics = [node for node, data in graph.graph.nodes(data=True) if data.get('type') == 'topic']
+        if all_topics:
+            # Find topics that don't have synonyms yet
+            new_topics = [t for t in all_topics if t not in _topic_synonyms_cache]
+            
+            if new_topics:
+                logger.info(f"Generating synonyms for {len(new_topics)} new topics...")
+                new_synonyms = client.generate_topic_synonyms(new_topics)
+                _topic_synonyms_cache.update(new_synonyms)
+                logger.info(f"Generated synonyms for {len(new_synonyms)} topics")
+            else:
+                logger.info("All topics already have cached synonyms")
+            
+            # Use all cached synonyms for this graph
+            graph.topic_synonyms = {t: _topic_synonyms_cache[t] for t in all_topics if t in _topic_synonyms_cache}
+            
+            # Find optimal topic merges
+            logger.info("Finding optimal topic merges...")
+            merge_groups = find_optimal_topic_merge(all_topics, graph.topic_synonyms)
+            graph.topic_merge_groups = merge_groups
+            logger.info(f"Found {len(merge_groups)} topic groups for merging")
+            
+            # Apply the merges to the graph
+            logger.info("Applying topic merges to graph...")
+            graph.merge_topics(merge_groups)
+            logger.info("Topic merges applied")
         
         return graph
 
@@ -170,6 +231,17 @@ def clear_all_topics_seen():
     """Clear the set of all topics seen (useful for testing or reset)"""
     global _all_topics_seen
     _all_topics_seen.clear()
+
+
+def get_topic_synonyms_cache():
+    """Get the cached topic synonyms"""
+    return _topic_synonyms_cache.copy()
+
+
+def clear_topic_synonyms_cache():
+    """Clear the cached topic synonyms"""
+    global _topic_synonyms_cache
+    _topic_synonyms_cache.clear()
 
 
 def create_dummy_graph() -> PaperGraph:
