@@ -110,6 +110,9 @@ class QuestionAgent:
             "recommendations", "suggest", "areas to explore", "underexplored"
         ]
         
+        # Semantic edge patterns (check before bridge patterns)
+        semantic_patterns = ["semantic", "strongest", "similar papers", "similarity", "most similar"]
+        
         # Bridge questions - looking for relationships/connections
         bridge_patterns = [
             "connect", "relationship", "between", "how are", 
@@ -117,7 +120,10 @@ class QuestionAgent:
             "vs", "difference between", "how is", "relate"
         ]
         
-        if any(pattern in question for pattern in property_patterns):
+        # Check semantic patterns first (more specific)
+        if any(pattern in question for pattern in semantic_patterns):
+            question_type = "properties"
+        elif any(pattern in question for pattern in property_patterns):
             question_type = "properties"
         elif any(pattern in question for pattern in bridge_patterns):
             question_type = "bridge"
@@ -265,6 +271,38 @@ Your synthesized explanation:"""
                 fallback += f"{i}. {explanation}\n\n"
             fallback += f"\n**Connection Path:**\n{path_str}"
             return fallback
+    
+    def _extract_topics_from_question(self, question, graph_obj):
+        """Extract topic names from a question using LLM"""
+        topics_in_graph = [str(node) for node, data in graph_obj.graph.nodes(data=True) if data.get('type') == 'topic']
+        
+        extraction_prompt = f"""Extract the topic names from this question. Return ONLY the topic names, one per line.
+
+Available topics in the graph:
+{', '.join(topics_in_graph[:100])}
+
+Question: {question}
+
+Topics (one per line):"""
+        
+        try:
+            response = self.llm.invoke([HumanMessage(content=extraction_prompt)])
+            topics_text = response.content.strip()
+            
+            # Parse topics from response
+            extracted = [line.strip() for line in topics_text.split('\n') if line.strip()]
+            
+            # Resolve each extracted topic to actual graph nodes
+            resolved_topics = []
+            for topic in extracted:
+                resolved = self._resolve_synonym(topic, graph_obj)
+                if resolved:
+                    resolved_topics.append(resolved)
+            
+            return resolved_topics
+        except Exception as e:
+            print(f"Topic extraction failed: {e}")
+            return []
     
     def _resolve_synonym(self, entity, graph_obj):
         """Resolve entity to actual graph node, checking synonyms"""
@@ -581,6 +619,124 @@ Your synthesized explanation:"""
             # Extract what property is being asked about
             question_lower = question.lower()
             
+            # Check for set cover queries
+            if ("fewest" in question_lower or "minimum" in question_lower or "minimal" in question_lower) and \
+               ("papers" in question_lower or "read" in question_lower) and \
+               ("learn" in question_lower or "cover" in question_lower or "understand" in question_lower):
+                
+                print(f"Detected set cover query: {question}")
+                
+                # Extract topics from the question
+                topics = self._extract_topics_from_question(question, graph_obj)
+                
+                if not topics:
+                    state["context"] = "Could not identify topics from your question."
+                    return state
+                
+                print(f"Extracted topics: {topics}")
+                
+                # Create subgraph with these topics and their neighbors
+                import networkx as nx
+                subgraph_nodes = set(topics)
+                for topic in topics:
+                    if topic in graph_obj.graph:
+                        subgraph_nodes.update(graph_obj.graph.neighbors(topic))
+                
+                subgraph = graph_obj.graph.subgraph(subgraph_nodes).copy()
+                
+                # Create temporary PaperGraph object for set_cover
+                from models.graph import PaperGraph
+                temp_graph = PaperGraph()
+                temp_graph.graph = subgraph
+                
+                # Call set_cover
+                from services.verification import set_cover
+                chosen_papers = set_cover(temp_graph)
+                
+                if chosen_papers:
+                    # Format as search results
+                    search_results = []
+                    for paper_title in chosen_papers:
+                        paper_data = graph_obj.graph.nodes[paper_title].get('data')
+                        if paper_data:
+                            search_results.append({
+                                "title": paper_title,
+                                "author": getattr(paper_data, 'authors', None) or 'Unknown',
+                                "summary": getattr(paper_data, 'summary', None) or paper_data.text[:500] + "...",
+                                "topics": getattr(paper_data, 'topics', []),
+                                "node_id": paper_title
+                            })
+                    
+                    state["context"] = f"SET_COVER_RESULTS:{len(chosen_papers)} papers needed to cover {len(topics)} topics"
+                    state["search_results"] = search_results
+                    print(f"Set cover found {len(chosen_papers)} papers for {len(topics)} topics")
+                else:
+                    state["context"] = "Could not find a minimal set of papers to cover those topics."
+                    state["search_results"] = []
+                
+                return state
+            
+            # Check for semantic edge queries
+            if ("semantic" in question_lower) or \
+               ("most similar" in question_lower) or \
+               ("strongest" in question_lower and "similar" in question_lower) or \
+               ("most related" in question_lower and "paper" in question_lower):
+                
+                print(f"Detected semantic edge query: {question}")
+                
+                # Get all semantic edges (edges between papers)
+                semantic_edges = []
+                for n1, n2, data in graph_obj.graph.edges(data=True):
+                    if data.get('type') == 'semantic':
+                        semantic_edges.append((n1, n2, data.get('weight', 0)))
+                
+                print(f"Found {len(semantic_edges)} semantic edges")
+                
+                if semantic_edges:
+                    # Sort by weight (similarity)
+                    semantic_edges.sort(key=lambda x: x[2], reverse=True)
+                    
+                    # Get top 10 strongest connections
+                    top_edges = semantic_edges[:10]
+                    
+                    # Format as search results (pairs with nested papers)
+                    search_results = []
+                    for paper1, paper2, weight in top_edges:
+                        # Get paper data for both papers
+                        paper1_data = graph_obj.graph.nodes[paper1].get('data')
+                        paper2_data = graph_obj.graph.nodes[paper2].get('data')
+                        
+                        search_results.append({
+                            "type": "semantic_pair",
+                            "similarity": weight,
+                            "papers": [
+                                {
+                                    "title": paper1,
+                                    "authors": paper1_data.authors if paper1_data and paper1_data.authors else [],
+                                    "publication_date": paper1_data.publication_date if paper1_data else None,
+                                    "topics": paper1_data.topics if paper1_data else [],
+                                    "node_id": paper1
+                                },
+                                {
+                                    "title": paper2,
+                                    "authors": paper2_data.authors if paper2_data and paper2_data.authors else [],
+                                    "publication_date": paper2_data.publication_date if paper2_data else None,
+                                    "topics": paper2_data.topics if paper2_data else [],
+                                    "node_id": paper2
+                                }
+                            ]
+                        })
+                    
+                    state["context"] = f"SEMANTIC_RESULTS:{len(semantic_edges)} semantic connections found"
+                    state["search_results"] = search_results
+                    print(f"Returning {len(search_results)} semantic pair results")
+                else:
+                    state["context"] = "No semantic edges found in the graph. Papers may not have embeddings yet."
+                    state["search_results"] = []
+                    print("No semantic edges found")
+                
+                return state
+            
             if ("which topics" in question_lower or "what topics" in question_lower or 
                 "read most" in question_lower or "reading" in question_lower or
                 "studied" in question_lower or "focus on" in question_lower):
@@ -729,7 +885,7 @@ Your synthesized explanation:"""
         context = state.get("context", "")
         
         # Handle keyword search results differently - don't send to LLM
-        if context.startswith("KEYWORD_RESULTS:"):
+        if context.startswith("KEYWORD_RESULTS:") or context.startswith("SEMANTIC_RESULTS:") or context.startswith("SET_COVER_RESULTS:"):
             state["answer"] = "SEARCH_RESULTS"  # Special marker for frontend
             return state
         

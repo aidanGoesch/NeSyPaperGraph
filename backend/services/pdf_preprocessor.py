@@ -2,10 +2,16 @@ from pypdf import PdfReader
 import re
 from keybert import KeyBERT
 from rapidfuzz import fuzz
+from io import BytesIO
 
-def extract_text_from_pdf(pdf_path):
-    """Extract all text from a PDF file."""
-    reader = PdfReader(pdf_path)
+def extract_text_from_pdf(pdf_input):
+    """Extract all text from a PDF file or bytes."""
+    # Handle both file paths and bytes
+    if isinstance(pdf_input, bytes):
+        reader = PdfReader(BytesIO(pdf_input))
+    else:
+        reader = PdfReader(pdf_input)
+    
     extracted_text = ""
     for page in reader.pages:
         extracted_text += page.extract_text() + "\n"

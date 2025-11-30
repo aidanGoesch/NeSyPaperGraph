@@ -148,3 +148,36 @@ def get_transitive_synonym_groups(topics: List[str], topic_synonyms: Dict[str, L
         groups.setdefault(root, set()).add(topic)
 
     return list(groups.values())
+
+
+def set_cover(pg : PaperGraph):
+    """Takes a subgraph and returns the set of papers that you would need to read to cover all topics"""
+    # Collect all the topics 
+    topics = {n for n, attr in pg.graph.nodes(data=True) if attr['type'] == 'topic'}
+    papers = {n for n, attr in pg.graph.nodes(data=True) if attr['type'] == 'paper'}
+
+    print(topics)
+    print(papers)
+
+    topic_to_papers = {topic: set(pg.graph.neighbors(topic)) for topic in topics}
+
+    opt = Optimize()
+
+    # Step 1: Create Boolean variables
+    is_chosen = {paper: Bool(f"chosen_{paper}") for paper in papers}
+
+    # Step 2: Add constraints
+    for topic, papers_covering_it in topic_to_papers.items():
+        opt.add(Or([is_chosen[paper] for paper in papers_covering_it]))
+
+    opt.minimize(Sum(list(is_chosen.values())))
+
+    if opt.check() == sat:
+        print('sat')
+        model = opt.model()
+        chosen_papers = [paper for paper in papers if model.evaluate(is_chosen[paper])]
+        print(chosen_papers)
+        return chosen_papers
+    else:
+        print('other')
+        return []
