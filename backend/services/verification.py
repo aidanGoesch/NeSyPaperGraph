@@ -1,5 +1,7 @@
 from models.graph import PaperGraph
 from models.paper import Paper
+import time
+from ortools.sat.python import cp_model
 from z3 import *
 from typing import List, Dict, Tuple, Set
 
@@ -181,3 +183,128 @@ def set_cover(pg : PaperGraph):
     else:
         print('other')
         return []
+
+def solve_gaps_with_cpsat(gap_data, k):
+    model = cp_model.CpModel()
+
+    # Create integer data structures
+    select = {}
+    scores = {}
+    topics = set()
+
+    for (a, b, interesting, cost) in gap_data:
+        topics.add(a)
+        topics.add(b)
+
+        var = model.NewBoolVar(f"{a}_{b}")
+        select[(a,b)] = var
+
+        # integer score to avoid floats in solver
+        scores[(a,b)] = int(interesting * 1000) - cost
+
+    # Each topic appears at most once
+    # Build adjacency lists of which gap vars use each topic
+    topic_to_vars = {t: [] for t in topics}
+
+    for (a, b) in select:
+        topic_to_vars[a].append(select[(a,b)])
+        topic_to_vars[b].append(select[(a,b)])
+
+    for t in topics:
+        if topic_to_vars[t]:
+            model.Add(sum(topic_to_vars[t]) <= 1)
+
+    # Choose exactly k gaps
+    model.Add(sum(select.values()) == k)
+
+    # Objective: maximize score
+    model.Maximize(sum(select[(a,b)] * scores[(a,b)]
+                       for (a,b,_,_) in gap_data))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 3.0  # optional timeout
+
+    status = solver.Solve(model)
+
+    if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        print("No feasible solution")
+        return []
+
+    selected = [(a,b) for (a,b) in select if solver.Value(select[(a,b)]) == 1]
+    return selected
+
+    
+
+def identify_research_gap(pg: PaperGraph, k=5, weight=1, top_n=5000):
+    """
+    Optimized gap identification:
+      1. Computes interestingness for *all* topic pairs
+      2. Keeps only the top-N pairs (default: 5000)
+      3. Halves the space by removing (b,a) duplicates
+      4. Uses Z3 with Integer 0/1 selection variables
+      5. Enforces exactly k selections
+      6. Maximizes score = weight * interestingness - cost
+    """
+
+    start_time = time.time()
+
+    # -------------------------
+    # Step 1: topic similarity
+    # -------------------------
+    def topic_similarity(topic_a, topic_b):
+        papers_a = list(pg.graph.neighbors(topic_a))
+        papers_b = list(pg.graph.neighbors(topic_b))
+
+        total_similarity = 0
+        count = 0
+        for pa in papers_a:
+            for pb in papers_b:
+                if pg.graph.has_edge(pa, pb):
+                    total_similarity += pg.graph[pa][pb].get('weight', 0)
+                    count += 1
+        
+        return total_similarity / count if count > 0 else 0
+
+    topics = [n for n, attr in pg.graph.nodes(data=True) if attr['type'] == 'topic']
+    num_topics = len(topics)
+    print(f"[Gap Analysis] Found {num_topics} topics")
+
+    # -------------------------
+    # Step 2: Compute raw gaps
+    # -------------------------
+    print("[Gap Analysis] Enumerating and scoring gaps...")
+    gap_data = []  # (topic_a, topic_b, interestingness, cost)
+
+    for i in range(num_topics):
+        for j in range(i + 1, num_topics):  # remove symmetric duplicates
+            a = topics[i]
+            b = topics[j]
+
+            path_length = len(pg.find_path(a, b))
+
+            # Only consider "gaps" where the connection is long or nonexistent
+            if path_length > 4 or path_length == 0:
+                sim = topic_similarity(a, b)
+                interesting = path_length * sim
+
+                papers_a = len(list(pg.graph.neighbors(a)))
+                papers_b = len(list(pg.graph.neighbors(b)))
+                cost = papers_a + papers_b
+
+                gap_data.append((a, b, interesting, cost))
+
+    print(f"[Gap Analysis] Total raw gaps: {len(gap_data)}")
+
+    # -------------------------
+    # Step 3: keep only top-N interesting
+    # -------------------------
+    print(f"[Gap Analysis] Selecting top {top_n} most interesting gaps...")
+    gap_data.sort(key=lambda x: x[2], reverse=True)
+    gap_data = gap_data[:top_n]
+    print(f"[Gap Analysis] Reduced to {len(gap_data)} gaps sent to Z3")
+
+    selected = solve_gaps_with_cpsat(gap_data, k)
+
+    print(f"[Gap Analysis] Selected {len(selected)} gaps.")
+    return selected
+

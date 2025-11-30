@@ -123,11 +123,17 @@ class QuestionAgent:
         # Check semantic patterns first (more specific)
         if any(pattern in question for pattern in semantic_patterns):
             question_type = "properties"
+        # Check for gap/recommendation queries (very specific)
+        elif any(word in question for word in ["gaps", "missing", "weak spots", "recommendations", "suggest", "underexplored", "what could i read", "what should i read"]):
+            question_type = "properties"
+        # Check explain patterns before other properties (more specific)
+        elif any(phrase in question for phrase in ["what is", "what are", "explain", "define", "describe", "what about", "tell me about"]):
+            question_type = "explain"
         elif any(pattern in question for pattern in property_patterns):
             question_type = "properties"
         elif any(pattern in question for pattern in bridge_patterns):
             question_type = "bridge"
-        elif any(word in question for word in ["explain", "what is", "define", "describe", "what about", "tell me about", "about"]):
+        elif "about" in question:
             question_type = "explain"
         else:
             question_type = "search"
@@ -494,11 +500,16 @@ Topics (one per line):"""
         # Extract what needs to be explained
         explain_terms = []
         words = question.lower().split()
+        skip_words = {"explain", "what", "is", "are", "define", "describe", "the", "a", "an"}
+        
+        # Skip initial question words and articles
+        start_idx = 0
         for i, word in enumerate(words):
-            if word in ["explain", "what", "is", "define", "describe"]:
-                # Get remaining words as the thing to explain
-                explain_terms.extend(words[i+1:])
+            if word not in skip_words:
+                start_idx = i
                 break
+        
+        explain_terms = words[start_idx:]
         
         if not explain_terms:
             explain_terms = words  # fallback to all words
@@ -773,53 +784,44 @@ Topics (one per line):"""
                   "suggest" in question_lower or "areas to explore" in question_lower or
                   "underexplored" in question_lower):
                 
-                # Analyze graph structure to find weak spots
-                topic_nodes = [n for n, attr in graph_obj.graph.nodes(data=True) if attr.get('type') == 'topic']
-                paper_nodes = [n for n, attr in graph_obj.graph.nodes(data=True) if attr.get('type') == 'paper']
+                # Use Z3-based research gap identification
+                from services.verification import identify_research_gap
                 
-                if topic_nodes and paper_nodes:
-                    # Find topics with few connections (potential gaps)
-                    topic_connections = [(topic, graph_obj.graph.degree(topic)) for topic in topic_nodes]
-                    topic_connections.sort(key=lambda x: x[1])
+                try:
+                    gaps = identify_research_gap(graph_obj, k=5, weight=1)
                     
-                    weak_topics = [topic for topic, degree in topic_connections if degree <= 2][:5]
-                    isolated_topics = [topic for topic, degree in topic_connections if degree == 1][:3]
-                    
-                    # Find topic pairs that aren't connected (potential research gaps)
-                    unconnected_pairs = []
-                    for i, topic1 in enumerate(topic_nodes[:10]):  # Limit to avoid too many combinations
-                        for topic2 in topic_nodes[i+1:10]:
-                            try:
-                                path = graph_obj.find_path(topic1, topic2)
-                                if not path or len(path) > 5:  # No connection or very distant
-                                    unconnected_pairs.append((topic1, topic2))
-                            except:
-                                unconnected_pairs.append((topic1, topic2))
-                    
-                    # Build recommendation response
-                    recommendations = []
-                    
-                    if weak_topics:
-                        recommendations.append(f"**Underexplored topics** (few papers): {', '.join(weak_topics)}")
-                    
-                    if isolated_topics:
-                        recommendations.append(f"**Isolated topics** (only 1 paper): {', '.join(isolated_topics)}")
-                    
-                    if unconnected_pairs[:3]:  # Show top 3 gaps
-                        gap_descriptions = [f"'{pair[0]}' ↔ '{pair[1]}'" for pair in unconnected_pairs[:3]]
-                        recommendations.append(f"**Research gaps** (unconnected areas): {', '.join(gap_descriptions)}")
-                    
-                    # Suggest interdisciplinary opportunities
-                    if len(topic_nodes) > 5:
-                        high_degree_topics = [topic for topic, degree in topic_connections[-3:]]  # Top 3 connected
-                        recommendations.append(f"**Consider connections between**: Your strong areas ({', '.join(high_degree_topics)}) and underexplored topics")
-                    
-                    if recommendations:
-                        state["context"] = "**Research Recommendations Based on Your Collection:**\n\n" + "\n\n".join(recommendations) + "\n\n*These suggestions are based on analyzing the structure and gaps in your current paper collection.*"
+                    if gaps:
+                        # Build context for LLM to explain gaps
+                        gap_descriptions = []
+                        for topic_a, topic_b in gaps:
+                            # Get paper counts for each topic
+                            papers_a = len(list(graph_obj.graph.neighbors(topic_a)))
+                            papers_b = len(list(graph_obj.graph.neighbors(topic_b)))
+                            
+                            # Get path length
+                            path = graph_obj.find_path(topic_a, topic_b)
+                            path_length = len(path) if path else 0
+                            
+                            gap_descriptions.append(
+                                f"- **{topic_a}** ({papers_a} papers) ↔ **{topic_b}** ({papers_b} papers): "
+                                f"{'No direct connection' if path_length == 0 else f'Distant connection ({path_length} hops)'}"
+                            )
+                        
+                        state["context"] = (
+                            "**Research Gaps Identified (using Z3 optimization):**\n\n"
+                            "These topic pairs are semantically related but poorly connected in your collection, "
+                            "representing potential novel research directions:\n\n" +
+                            "\n".join(gap_descriptions) +
+                            "\n\n*Gaps are ranked by interestingness: path length × semantic similarity between topics.*"
+                        )
                     else:
-                        state["context"] = "Your research collection appears well-balanced with good coverage across topics."
-                else:
-                    state["context"] = "Insufficient data to analyze research gaps"
+                        state["context"] = "No significant research gaps found. Your collection has good coverage across related topics."
+                    
+                except Exception as e:
+                    print(f"Error in gap identification: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    state["context"] = "Error analyzing research gaps. Make sure papers have embeddings for semantic analysis."
             
             elif "min" in question_lower and ("topic" in question_lower or "connected" in question_lower):
                 min_topic = graph_obj.find_min_topic()
