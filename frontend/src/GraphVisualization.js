@@ -514,6 +514,11 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
             padding: '10px',
             minWidth: '200px'
           }}>
+            <div style={{ marginBottom: '15px', padding: '8px', backgroundColor: '#f5f5f5', borderRadius: '4px' }}>
+              <div style={{ fontSize: '14px', fontWeight: 'bold', marginBottom: '5px' }}>Graph Stats</div>
+              <div style={{ fontSize: '13px' }}>📄 Papers: {data.papers?.length || 0}</div>
+              <div style={{ fontSize: '13px' }}>🏷️ Topics: {data.topics?.length || 0}</div>
+            </div>
             <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', marginBottom: '15px' }}>
               <input
                 type="checkbox"

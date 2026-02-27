@@ -530,29 +530,57 @@ function App() {
                                                 <>
                                                     <div className="search-results">
                                                         {entry.search_results.map(
-                                                            (result, idx) => (
-                                                                <div
-                                                                    key={idx}
-                                                                    className={`search-result-block ${
-                                                                        expandedResult ===
-                                                                        idx
-                                                                            ? "expanded"
-                                                                            : ""
-                                                                    }`}
-                                                                    onClick={() =>
-                                                                        setExpandedResult(
+                                                            (result, idx) => 
+                                                                result.type === "semantic_pair" ? (
+                                                                    // Semantic pair container
+                                                                    <div key={idx} className="semantic-pair-container">
+                                                                        <div className="similarity-header">
+                                                                            Similarity: {(result.similarity * 100).toFixed(0)}%
+                                                                        </div>
+                                                                        <div className="paper-pair">
+                                                                            {result.papers.map((paper, pIdx) => (
+                                                                                <div
+                                                                                    key={pIdx}
+                                                                                    className="search-result-block"
+                                                                                    onClick={() => handlePaperCitationClick(paper.title)}
+                                                                                >
+                                                                                    <h4>{paper.title}</h4>
+                                                                                    {paper.abstract && (
+                                                                                        <p className="abstract-preview">
+                                                                                            {paper.abstract.substring(0, 150)}...
+                                                                                        </p>
+                                                                                    )}
+                                                                                </div>
+                                                                            ))}
+                                                                        </div>
+                                                                    </div>
+                                                                ) : (
+                                                                    // Regular keyword search result
+                                                                    <div
+                                                                        key={idx}
+                                                                        className={`search-result-block ${
                                                                             expandedResult ===
-                                                                                idx
-                                                                                ? null
-                                                                                : idx
-                                                                        )
-                                                                    }
-                                                                >
-                                                                    <h4>
-                                                                        {
-                                                                            result.title
+                                                                            idx
+                                                                                ? "expanded"
+                                                                                : ""
+                                                                        }`}
+                                                                        onClick={() =>
+                                                                            setExpandedResult(
+                                                                                expandedResult ===
+                                                                                    idx
+                                                                                    ? null
+                                                                                    : idx
+                                                                            )
                                                                         }
-                                                                    </h4>
+                                                                    >
+                                                                        <h4>
+                                                                            {result.title}
+                                                                            {result.similarity && (
+                                                                                <span className="similarity-badge">
+                                                                                    {(result.similarity * 100).toFixed(0)}%
+                                                                                </span>
+                                                                            )}
+                                                                        </h4>
                                                                     <p className="author">
                                                                         {
                                                                             result.author

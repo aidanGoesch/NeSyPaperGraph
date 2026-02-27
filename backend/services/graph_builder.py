@@ -34,6 +34,25 @@ class GraphBuilder:
         self.papers = []
         self.topics = set()
 
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        """Normalize title for duplicate detection: lowercase, remove punctuation and extra whitespace"""
+        import re
+        normalized = title.lower()
+        normalized = re.sub(r'[^\w\s]', '', normalized)  # Remove punctuation
+        normalized = re.sub(r'\s+', ' ', normalized).strip()  # Normalize whitespace
+        return normalized
+    
+    def _is_duplicate_paper(self, paper: Paper, graph: PaperGraph) -> bool:
+        """Check if paper already exists in graph by normalized title"""
+        normalized_new = self._normalize_title(paper.title)
+        for node, data in graph.graph.nodes(data=True):
+            if data.get('type') == 'paper':
+                existing_title = data['data'].title
+                if self._normalize_title(existing_title) == normalized_new:
+                    return True
+        return False
+
 
     def build_graph(self, files_data=None, file_path: str = None, existing_graph=None) -> PaperGraph:
         """
@@ -89,6 +108,10 @@ class GraphBuilder:
         
         # Process papers one at a time, adding each to graph immediately
         for paper in self.papers:
+            # Check for duplicate papers by normalized title
+            if self._is_duplicate_paper(paper, graph):
+                logger.info(f"Skipping duplicate paper: {paper.title}")
+                continue
             # Truncate very long texts to avoid excessive processing time
             # Keep first 50000 characters (enough for topic extraction)
             text_for_extraction = paper.text[:50000] if len(paper.text) > 50000 else paper.text
