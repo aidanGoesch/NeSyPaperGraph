@@ -60,11 +60,6 @@ async def lifespan(app: FastAPI):
     app.state.agent = None
     app.state.agent_graph_identity = None
 
-    try:
-        app.state.graph = load_graph()
-    except Exception as exc:
-        print(f"Could not load graph from S3 on startup: {exc}")
-
     yield
 
 
