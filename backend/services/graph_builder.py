@@ -6,7 +6,6 @@ from services.verification import verify_bipartite, find_optimal_topic_merge
 import os
 import logging
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -15,19 +14,6 @@ _all_topics_seen = set()
 
 # Global dict to store topic synonyms (persistent across uploads)
 _topic_synonyms_cache = {}
-
-# Global embedding model (load once, reuse)
-_embedding_model = None
-
-def get_embedding_model():
-    """Get or initialize the embedding model"""
-    global _embedding_model
-    if _embedding_model is None:
-        logger.info("Loading sentence-transformers model...")
-        _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        logger.info("Embedding model loaded")
-    return _embedding_model
-
 
 class GraphBuilder:
     def __init__(self):
@@ -103,9 +89,6 @@ class GraphBuilder:
         client = OpenAILLMClient()
         extractor = TopicExtractor(client)
         
-        # Get embedding model
-        embedding_model = get_embedding_model()
-        
         # Process papers one at a time, adding each to graph immediately
         for paper in self.papers:
             # Check for duplicate papers by normalized title
@@ -141,7 +124,15 @@ class GraphBuilder:
             
             # Generate embedding from summary (more concise than full text)
             embedding_text = paper.summary if paper.summary else text_for_extraction[:1000]
-            paper.embedding = embedding_model.encode(embedding_text).tolist()
+            try:
+                paper.embedding = client.generate_embedding(embedding_text)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to generate OpenAI embedding for '%s': %s",
+                    paper.title,
+                    exc,
+                )
+                paper.embedding = []
             
             # Update accumulated topics with new topics from this paper
             new_topics = set(topics) - accumulated_topics

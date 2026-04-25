@@ -104,12 +104,28 @@ class OpenAILLMClient:
         self.assistant_id = assistant_id or os.getenv('OPENAI_ASSISTANT_ID')
         # Allow overriding the chat model via environment variable
         self.model_name = os.getenv("OPENAI_CHAT_MODEL", "gpt-5-mini-2025-08-07")
+        self.embedding_model_name = os.getenv(
+            "OPENAI_EMBEDDING_MODEL",
+            "text-embedding-3-small",
+        )
         
         # Initialize OpenAI client
         self.client = openai.OpenAI(
             api_key=self.api_key,
             default_headers={"OpenAI-Beta": "assistants=v2"}
         )
+
+    def generate_embedding(self, text: str) -> list[float]:
+        """Generate embedding vector for text using OpenAI embeddings API."""
+        embedding_input = (text or "").strip()
+        if not embedding_input:
+            return []
+
+        response = self.client.embeddings.create(
+            model=self.embedding_model_name,
+            input=embedding_input,
+        )
+        return response.data[0].embedding
 
     def generate(self, prompt, system_prompt=None, context: str | None = None):
         """
