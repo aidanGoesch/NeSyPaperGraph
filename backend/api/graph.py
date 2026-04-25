@@ -1,10 +1,12 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from uuid import uuid4
+
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from services.graph_builder import create_dummy_graph, GraphBuilder, get_all_topics_seen
 from services.verification import verify_bipartite
+from services.storage_service import load_graph, save_graph
 import traceback
 import logging
-import pickle
 import os
 from typing import List
 
@@ -60,9 +62,56 @@ def get_dummy_graph():
     graph = create_dummy_graph()
     return graph_to_dict(graph)
 
+async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes]]):
+    """Run PDF processing pipeline in background and persist updated graph to S3."""
+    jobs = app.state.jobs
+    jobs[job_id]["status"] = "processing"
+    jobs[job_id]["error"] = None
+    try:
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("OPENAI_API_KEY environment variable not set")
+
+        async with app.state.graph_lock:
+            existing_graph = app.state.graph
+            if existing_graph is None:
+                existing_graph = load_graph()
+
+            builder = GraphBuilder()
+            if existing_graph:
+                updated_graph = builder.build_graph(
+                    files_data=files_data,
+                    existing_graph=existing_graph,
+                )
+                logger.info(
+                    "Verifying %s new nodes and %s new edges...",
+                    len(updated_graph.new_nodes),
+                    len(updated_graph.new_edges),
+                )
+                verify_bipartite(updated_graph, updated_graph.new_nodes, updated_graph.new_edges)
+                updated_graph.clear_incremental_tracking()
+            else:
+                updated_graph = builder.build_graph(files_data=files_data)
+                logger.info("Verifying entire graph...")
+                verify_bipartite(updated_graph)
+
+            save_graph(updated_graph)
+            app.state.graph = updated_graph
+            app.state.agent = None
+            app.state.agent_graph_identity = None
+
+        jobs[job_id]["status"] = "done"
+    except Exception as exc:
+        logger.error("Error in background PDF job %s: %s\n%s", job_id, str(exc), traceback.format_exc())
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(exc)
+
 
 @router.post("/graph/upload")
-async def upload_papers(files: List[UploadFile] = File(...)):
+async def upload_papers(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+):
     """
     Upload PDF files, process them with OpenAI, and return graph data.
     Files are processed in memory and not stored on disk.
@@ -76,102 +125,45 @@ async def upload_papers(files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
     
-    try:
-        # Read all files into memory (don't save to disk)
-        files_data = []
-        for file in files:
-            # Skip hidden files and non-PDF files
-            if not file.filename or file.filename.startswith('.') or not file.filename.endswith('.pdf'):
-                continue
-            
-            # Read file content asynchronously into memory
-            contents = await file.read()
-            files_data.append((file.filename, contents))
-        
-        if not files_data:
-            raise HTTPException(status_code=400, detail="No valid PDF files found")
-        
-        logger.info(f"Processing {len(files_data)} PDF files")
-        
-        # Check if OpenAI API key is set
-        if not os.getenv('OPENAI_API_KEY'):
-            raise HTTPException(status_code=400, detail="OPENAI_API_KEY environment variable not set")
-        
-        # Try to load existing graph, or create new one
-        save_path = "storage/saved_graph.pkl"
-        try:
-            if os.path.exists(save_path):
-                with open(save_path, 'rb') as f:
-                    graph = pickle.load(f)
-                logger.info("Loaded existing graph to update")
-            else:
-                graph = None
-                logger.info("No existing graph found, creating new one")
-        except Exception as e:
-            logger.warning(f"Could not load existing graph: {e}, creating new one")
-            graph = None
-        
-        # Process the PDFs using GraphBuilder
-        builder = GraphBuilder()
-        if graph:
-            # Update existing graph with new papers
-            updated_graph = builder.build_graph(files_data=files_data, existing_graph=graph)
-            # Incremental verification - only check new nodes/edges
-            logger.info(f"Verifying {len(updated_graph.new_nodes)} new nodes and {len(updated_graph.new_edges)} new edges...")
-            verify_bipartite(updated_graph, updated_graph.new_nodes, updated_graph.new_edges)
-            updated_graph.clear_incremental_tracking()
-        else:
-            # Create new graph
-            updated_graph = builder.build_graph(files_data=files_data)
-            # Full verification for new graph
-            logger.info("Verifying entire graph...")
-            verify_bipartite(updated_graph)
-        
-        graph = updated_graph
-        
-        # Convert graph to frontend format
-        graph_data = graph_to_dict(graph)
-        
-        # Save the graph for future loading
-        save_path = "storage/saved_graph.pkl"
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, 'wb') as f:
-            pickle.dump(graph, f)
-        logger.info(f"Graph saved to {save_path}")
-        
-        # Add all topics seen across all uploads to the response
-        all_topics = get_all_topics_seen()
-        graph_data["all_topics_seen"] = list(all_topics)
-        
-        return JSONResponse(content=graph_data)
-        
-    except HTTPException:
-        # Re-raise HTTP exceptions as-is
-        raise
-    except Exception as e:
-        # Log the full error for debugging
-        error_trace = traceback.format_exc()
-        logger.error(f"Error processing files: {str(e)}\n{error_trace}")
-        
-        # Return detailed error message
-        error_msg = f"Error processing files: {str(e)}"
-        if "OPENAI" in str(e).upper() or "assistant" in str(e).lower():
-            error_msg += " (Check your OPENAI_API_KEY and OPENAI_ASSISTANT_ID environment variables)"
-        raise HTTPException(status_code=500, detail=error_msg)
+    # Read all files into memory (don't save to disk)
+    files_data = []
+    filenames = []
+    for file in files:
+        # Skip hidden files and non-PDF files
+        if not file.filename or file.filename.startswith(".") or not file.filename.endswith(".pdf"):
+            continue
+        contents = await file.read()
+        files_data.append((file.filename, contents))
+        filenames.append(file.filename)
+
+    if not files_data:
+        raise HTTPException(status_code=400, detail="No valid PDF files found")
+
+    jobs = request.app.state.jobs
+    job_id = str(uuid4())
+    jobs[job_id] = {
+        "status": "pending",
+        "filename": ", ".join(filenames),
+        "error": None,
+    }
+
+    background_tasks.add_task(process_pdf_job, request.app, job_id, files_data)
+    return {"job_id": job_id, "status": "pending"}
 
 
 @router.get("/graph/load")
-def load_saved_graph():
+def load_saved_graph(request: Request):
     """Load previously saved graph data"""
-    save_path = "storage/saved_graph.pkl"
-    
-    if not os.path.exists(save_path):
-        raise HTTPException(status_code=404, detail="No saved graph found")
-    
     try:
-        logger.info("Loading graph from pickle file...")
-        with open(save_path, 'rb') as f:
-            graph = pickle.load(f)
+        graph = request.app.state.graph
+        if graph is None:
+            logger.info("Loading graph from S3...")
+            graph = load_graph()
+            request.app.state.graph = graph
+
+        if graph is None:
+            raise HTTPException(status_code=404, detail="No saved graph found")
+
         logger.info("Graph loaded successfully")
         
         logger.info("Verifying bipartiteness...")
@@ -224,8 +216,7 @@ def load_saved_graph():
                 logger.info("Topic merges applied")
                 
                 # Save updated graph with synonyms and merged topics
-                with open(save_path, 'wb') as f:
-                    pickle.dump(graph, f)
+                save_graph(graph)
                 logger.info("Saved graph with computed synonyms and merged topics")
         
         # Convert to frontend format
@@ -239,6 +230,8 @@ def load_saved_graph():
         logger.info("Loaded saved graph successfully")
         return JSONResponse(content=graph_data)
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error loading saved graph: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error loading graph: {str(e)}")

@@ -118,10 +118,26 @@ class GraphBuilder:
             
             # Extract topics, passing in all accumulated topics (global + from previous papers in this batch)
             topics = extractor.extract_topics(text_for_extraction, current_topics=accumulated_topics)
+            
+            # Skip paper if topic extraction failed
+            if not topics:
+                logger.warning(f"Skipping paper due to failed topic extraction: {paper.title}")
+                continue
+            
             paper.topics = topics
             
-            # Generate summary
-            paper.summary = client.generate_summary(text_for_extraction)
+            # Generate summary (with internal fallbacks)
+            summary = client.generate_summary(text_for_extraction)
+
+            if not summary and text_for_extraction:
+                logger.warning(
+                    f"[Summary] Empty summary returned for paper '{paper.title}'. "
+                    f"Using heuristic summary based on source text."
+                )
+                # As a last resort, use the start of the text as a pseudo-summary
+                summary = text_for_extraction[:1000]
+
+            paper.summary = summary
             
             # Generate embedding from summary (more concise than full text)
             embedding_text = paper.summary if paper.summary else text_for_extraction[:1000]
@@ -219,11 +235,15 @@ class GraphBuilder:
             # Extract text from PDF
             text = extract_text_from_pdf(file_content)
             
-            # Extract metadata using LLM
+            # Extract metadata using LLM (with internal heuristic fallback)
             metadata = extractor.extract_paper_metadata(text)
             
             # Use extracted title if available, otherwise use filename
             title = metadata.get('title') or Path(filename).stem
+            if not metadata.get('title'):
+                logger.warning(
+                    f"[Metadata] No title returned from extractor; using filename as title for {filename}"
+                )
             
             paper = Paper(
                 title=title,
@@ -252,11 +272,15 @@ class GraphBuilder:
             # Extract text from PDF
             text = extract_text_from_pdf(str(pdf_file))
             
-            # Extract metadata using LLM
+            # Extract metadata using LLM (with internal heuristic fallback)
             metadata = extractor.extract_paper_metadata(text)
             
             # Use extracted title if available, otherwise use filename
             title = metadata.get('title') or pdf_file.stem
+            if not metadata.get('title'):
+                logger.warning(
+                    f"[Metadata] No title returned from extractor; using filename as title for {pdf_file}"
+                )
             
             paper = Paper(
                 title=title,

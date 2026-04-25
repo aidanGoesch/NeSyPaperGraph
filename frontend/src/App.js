@@ -6,6 +6,7 @@ import mermaid from "mermaid";
 import "./App.css";
 
 function App() {
+    const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000";
     const [graphData, setGraphData] = useState(null);
     const [isDarkMode, setIsDarkMode] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
@@ -20,6 +21,7 @@ function App() {
     const [isSearching, setIsSearching] = useState(false);
     const [followUpQuestion, setFollowUpQuestion] = useState("");
     const [highlightPath, setHighlightPath] = useState(null);
+    const [uploadStatus, setUploadStatus] = useState(null);
 
     // Function to handle paper citation clicks
     const handlePaperCitationClick = (paperTitle) => {
@@ -74,6 +76,24 @@ function App() {
     const [isFadingOut, setIsFadingOut] = useState(false);
     const graphRef = useRef();
     const searchInputRef = useRef();
+    const uploadPollingRef = useRef(null);
+
+    const fetchGraph = async () => {
+        try {
+            const response = await fetch(`${API_BASE}/api/graph/load`);
+            if (response.ok) {
+                const data = await response.json();
+                setGraphData(data);
+                return;
+            }
+            const fallbackResponse = await fetch(`${API_BASE}/api/graph/dummy`);
+            const fallbackData = await fallbackResponse.json();
+            setGraphData(fallbackData);
+        } catch (error) {
+            console.error("Error loading graph:", error);
+            setGraphData(null);
+        }
+    };
 
     // Keyboard shortcut for Cmd+G to focus search
     useEffect(() => {
@@ -187,30 +207,56 @@ function App() {
 
     // Load saved graph on startup, fallback to dummy if none exists
     useEffect(() => {
-        // Try to load saved graph first
-        fetch("http://localhost:8000/api/graph/load")
-            .then((response) => {
-                if (response.ok) {
-                    return response.json();
-                } else {
-                    // If no saved graph, try dummy
-                    return fetch("http://localhost:8000/api/graph/dummy").then(
-                        (r) => r.json()
-                    );
-                }
-            })
-            .then((data) => setGraphData(data))
-            .catch((error) => {
-                console.error("Error loading graph:", error);
-                // Fallback to empty state
-                setGraphData(null);
-            });
+        fetchGraph();
     }, []);
+
+    useEffect(() => {
+        return () => {
+            if (uploadPollingRef.current) {
+                clearInterval(uploadPollingRef.current);
+            }
+        };
+    }, []);
+
+    const pollJobStatus = (jobId) =>
+        new Promise((resolve, reject) => {
+            uploadPollingRef.current = setInterval(async () => {
+                try {
+                    const response = await fetch(`${API_BASE}/api/jobs/${jobId}`);
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(
+                            errorData.detail || "Failed to fetch job status"
+                        );
+                    }
+                    const data = await response.json();
+                    setUploadStatus(data.status);
+                    if (data.status === "done" || data.status === "error") {
+                        clearInterval(uploadPollingRef.current);
+                        uploadPollingRef.current = null;
+                        if (data.status === "done") {
+                            resolve(data);
+                            return;
+                        }
+                        reject(
+                            new Error(
+                                data.error ||
+                                    "Upload processing failed in background job"
+                            )
+                        );
+                    }
+                } catch (error) {
+                    clearInterval(uploadPollingRef.current);
+                    uploadPollingRef.current = null;
+                    reject(error);
+                }
+            }, 2000);
+        });
 
     const showAgentArchitecture = async () => {
         try {
             const response = await fetch(
-                "http://localhost:8000/api/agent/architecture"
+                `${API_BASE}/api/agent/architecture`
             );
             const data = await response.json();
             if (data.mermaid) {
@@ -225,8 +271,48 @@ function App() {
     const handleSearch = async (query) => {
         if (!query.trim()) return;
 
+        // Check for special search syntax
+        if (query.startsWith(':topic=')) {
+            const topicName = query.slice(7).trim();
+            if (graphRef.current && graphData) {
+                // Find matching topic
+                const matchingTopic = graphData.topics?.find(t => 
+                    t.toLowerCase().includes(topicName.toLowerCase())
+                );
+                if (matchingTopic) {
+                    graphRef.current.focusOnTopic(matchingTopic);
+                    setSearchTerm('');
+                    return;
+                } else {
+                    alert(`Topic not found: ${topicName}`);
+                    return;
+                }
+            }
+            return;
+        }
+
+        if (query.startsWith(':paper=') || query.startsWith(':title=')) {
+            const paperTitle = query.slice(query.indexOf('=') + 1).trim();
+            if (graphRef.current && graphData) {
+                // Find matching paper
+                const matchingPaper = graphData.papers?.find(p => 
+                    p.title.toLowerCase().includes(paperTitle.toLowerCase())
+                );
+                if (matchingPaper) {
+                    handlePaperCitationClick(matchingPaper.title);
+                    setSearchTerm('');
+                    return;
+                } else {
+                    alert(`Paper not found: ${paperTitle}`);
+                    return;
+                }
+            }
+            return;
+        }
+
+        // Regular LLM search
         // Reset highlight path when asking a new question
-        setHighlightPath(null);
+        // setHighlightPath(null);
 
         setIsSearching(true);
         setShowChatPanel(true);
@@ -256,7 +342,7 @@ function App() {
         }, 200);
 
         try {
-            const response = await fetch("http://localhost:8000/api/search", {
+            const response = await fetch(`${API_BASE}/api/search`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -270,11 +356,11 @@ function App() {
 
             // Only set highlight path if we have both path and mermaid diagram
             // If there's no mermaid, don't highlight the old path
-            if (data.mermaid && data.path && data.path.nodes) {
-                setHighlightPath(data.path);
-            } else {
-                setHighlightPath(null);
-            }
+            // if (data.mermaid && data.path && data.path.nodes) {
+            //     setHighlightPath(data.path);
+            // } else {
+            //     setHighlightPath(null);
+            // }
 
             // Update the last entry with the answer
             setChatHistory((prev) => {
@@ -286,7 +372,8 @@ function App() {
                             ? "SEARCH_RESULTS"
                             : data.answer || data.error || "No response",
                     search_results: data.search_results || null,
-                    mermaid: data.mermaid || null, // Store mermaid diagram from response (null if not present)
+                    mermaid: data.mermaid || null,
+                    sources_used: data.sources_used || null,
                 };
 
                 // Auto-scroll after updating chat history
@@ -326,6 +413,7 @@ function App() {
         if (files.length > 0) {
             setIsUploading(true);
             setUploadError(null);
+            setUploadStatus("pending");
 
             try {
                 // Clear existing graph data first
@@ -339,7 +427,7 @@ function App() {
 
                 // Upload files to backend
                 const response = await fetch(
-                    "http://localhost:8000/api/graph/upload",
+                    `${API_BASE}/api/graph/upload`,
                     {
                         method: "POST",
                         body: formData,
@@ -354,19 +442,20 @@ function App() {
                 }
 
                 const data = await response.json();
-                // Replace the graph with new data
-                setGraphData(data);
-                setUploadError(null); // Clear any previous errors
-                console.log(
-                    "Graph replaced with",
-                    data.papers.length,
-                    "papers"
-                );
+                if (!data.job_id) {
+                    throw new Error("Upload did not return a job_id");
+                }
+
+                await pollJobStatus(data.job_id);
+                await fetchGraph();
+                setUploadStatus("done");
+                setUploadError(null);
             } catch (error) {
                 console.error("Upload error:", error);
                 setUploadError(
                     error.message || "Failed to upload and process files"
                 );
+                setUploadStatus("error");
                 // Keep graph data as null on error
             } finally {
                 setIsUploading(false);
@@ -390,9 +479,11 @@ function App() {
                 {isUploading ? (
                     <div className="loading">
                         Processing papers and extracting topics...
+                        {uploadStatus ? ` (${uploadStatus})` : ""}
                     </div>
                 ) : graphData ? (
                     <GraphVisualization
+                        key={graphData.papers?.length || 0}
                         ref={graphRef}
                         data={graphData}
                         isDarkMode={isDarkMode}
@@ -430,7 +521,7 @@ function App() {
                 {!showChatPanel && (
                     <input
                         type="text"
-                        placeholder="Ask a Question..."
+                        placeholder="Ask a Question... (or :topic=name, :paper=title)"
                         value={searchTerm}
                         onChange={(e) => {
                             setSearchTerm(e.target.value);
@@ -646,26 +737,38 @@ function App() {
                                                             )
                                                         )}
                                                     </div>
-                                                    {entry.mermaid && (
+                                                    {/* {entry.mermaid && (
                                                         <div
-                                                            id={`chat-mermaid-${index}`}
-                                                            className="chat-mermaid-diagram"
                                                             style={{
-                                                                width: "100%",
-                                                                marginTop:
-                                                                    "15px",
-                                                                padding: "15px",
-                                                                backgroundColor:
-                                                                    isDarkMode
-                                                                        ? "#2d2d2d"
-                                                                        : "#f5f5f5",
-                                                                borderRadius:
-                                                                    "8px",
-                                                                overflow:
-                                                                    "auto",
+                                                                width: "90%",
+                                                                marginTop: "15px",
+                                                                marginLeft: "auto",
+                                                                marginRight: "auto",
+                                                                display: "flex",
+                                                                justifyContent: "center"
                                                             }}
-                                                        />
-                                                    )}
+                                                        >
+                                                            <div
+                                                                style={{
+                                                                    padding: "15px",
+                                                                    backgroundColor:
+                                                                        isDarkMode
+                                                                            ? "#2d2d2d"
+                                                                            : "#f5f5f5",
+                                                                    borderRadius: "8px",
+                                                                    display: "inline-block"
+                                                                }}
+                                                            >
+                                                                <div 
+                                                                    id={`chat-mermaid-${index}`}
+                                                                    className="chat-mermaid-diagram"
+                                                                    style={{
+                                                                        transform: "scale(0.5)"
+                                                                    }}
+                                                                ></div>
+                                                            </div>
+                                                        </div>
+                                                    )} */}
                                                 </>
                                             ) : (
                                                 <>
@@ -692,25 +795,63 @@ function App() {
                                                             ),
                                                         }}
                                                     />
-                                                    {entry.mermaid && (
+                                                    {/* {entry.mermaid && (
                                                         <div
-                                                            id={`chat-mermaid-${index}`}
-                                                            className="chat-mermaid-diagram"
                                                             style={{
-                                                                width: "100%",
-                                                                marginTop:
-                                                                    "15px",
-                                                                padding: "15px",
-                                                                backgroundColor:
-                                                                    isDarkMode
-                                                                        ? "#2d2d2d"
-                                                                        : "#f5f5f5",
-                                                                borderRadius:
-                                                                    "8px",
-                                                                overflow:
-                                                                    "auto",
+                                                                width: "90%",
+                                                                marginTop: "15px",
+                                                                marginLeft: "auto",
+                                                                marginRight: "auto",
+                                                                display: "flex",
+                                                                justifyContent: "center"
                                                             }}
-                                                        />
+                                                        >
+                                                            <div
+                                                                style={{
+                                                                    padding: "15px",
+                                                                    backgroundColor:
+                                                                        isDarkMode
+                                                                            ? "#2d2d2d"
+                                                                            : "#f5f5f5",
+                                                                    borderRadius: "8px",
+                                                                    display: "inline-block"
+                                                                }}
+                                                            >
+                                                                <div 
+                                                                    id={`chat-mermaid-${index}`}
+                                                                    className="chat-mermaid-diagram"
+                                                                    style={{
+                                                                        transform: "scale(0.5)"
+                                                                    }}
+                                                                ></div>
+                                                            </div>
+                                                        </div>
+                                                    )} */}
+                                                    {entry.sources_used && entry.sources_used.length > 0 && (
+                                                        <div className="sources-section" style={{
+                                                            marginTop: "15px",
+                                                            paddingTop: "15px",
+                                                            borderTop: isDarkMode ? "1px solid #444" : "1px solid #ddd"
+                                                        }}>
+                                                            <strong>Sources:</strong>
+                                                            <div style={{ marginTop: "8px" }}>
+                                                                {entry.sources_used.map((source, sIdx) => (
+                                                                    <div
+                                                                        key={sIdx}
+                                                                        className="source-item"
+                                                                        onClick={() => handlePaperCitationClick(source)}
+                                                                        style={{
+                                                                            color: "#4CAF50",
+                                                                            cursor: "pointer",
+                                                                            textDecoration: "underline",
+                                                                            marginBottom: "4px"
+                                                                        }}
+                                                                    >
+                                                                        {source}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
                                                     )}
                                                 </>
                                             )}

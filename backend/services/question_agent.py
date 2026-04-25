@@ -12,12 +12,13 @@ class AgentState(TypedDict):
     context: str
     answer: str
     search_results: list
+    sources_used: list
 
 class QuestionAgent:
     def __init__(self, graph_data=None, graph_obj=None):
         self.llm = ChatOpenAI(
-            model="gpt-3.5-turbo",
-            temperature=0.7,
+            model=os.getenv("OPENAI_CHAT_MODEL", "gpt-5-mini-2025-08-07"),
+            temperature=1,
             api_key=os.getenv("OPENAI_API_KEY")
         )
         self.graph_data = graph_data
@@ -26,17 +27,17 @@ class QuestionAgent:
         self.graph = self._build_graph()
     
     def _get_graph_object(self):
-        """Get the actual graph object, either from stored object or by loading from file"""
+        """Get the actual graph object, either from memory or by loading from S3."""
         if self.graph_obj:
             return self.graph_obj
         
         # Try to load the saved graph
         try:
-            import pickle
-            save_path = "storage/saved_graph.pkl"
-            if os.path.exists(save_path):
-                with open(save_path, 'rb') as f:
-                    return pickle.load(f)
+            from services.storage_service import load_graph
+            graph = load_graph()
+            if graph:
+                self.graph_obj = graph
+                return graph
         except Exception as e:
             print(f"Could not load saved graph: {e}")
         
@@ -160,6 +161,14 @@ class QuestionAgent:
             # Store path information for mermaid diagram (only if path was found)
             if hasattr(self, '_last_path'):
                 state["path_info"] = self._last_path
+                # Track papers in path as sources
+                path = self._last_path.get("nodes", [])
+                graph_obj = self._get_graph_object()
+                if graph_obj:
+                    for node in path:
+                        node_data = graph_obj.graph.nodes.get(node, {})
+                        if node_data.get('type') == 'paper':
+                            state["sources_used"].append(str(node))
             
             print(f"Bridge analysis: {start_node} -> {end_node}")
         else:
@@ -311,7 +320,7 @@ Topics (one per line):"""
             return []
     
     def _resolve_synonym(self, entity, graph_obj):
-        """Resolve entity to actual graph node, checking synonyms"""
+        """Resolve entity to actual graph node, checking synonyms. Prioritize topics over papers."""
         entity_lower = entity.lower().strip()
         
         # Common abbreviation mappings - map to key terms that MUST appear
@@ -335,14 +344,15 @@ Topics (one per line):"""
         else:
             search_term = entity_lower
         
-        # Direct match in node names
+        # PRIORITY 1: Direct match in TOPIC nodes only
         for node, data in graph_obj.graph.nodes(data=True):
-            node_lower = str(node).lower()
-            if search_term in node_lower:
-                print(f"Resolved '{entity}' -> '{node}' (direct match)")
-                return node
+            if data.get('type') == 'topic':
+                node_lower = str(node).lower()
+                if search_term in node_lower:
+                    print(f"Resolved '{entity}' -> '{node}' (topic direct match)")
+                    return node
         
-        # Check merged topics
+        # PRIORITY 2: Check merged topics
         for node, data in graph_obj.graph.nodes(data=True):
             if data.get('type') == 'topic' and 'merged_topics' in data:
                 for merged in data['merged_topics']:
@@ -350,7 +360,7 @@ Topics (one per line):"""
                         print(f"Resolved '{entity}' -> '{node}' (merged topic)")
                         return node
         
-        # Check topic_synonyms
+        # PRIORITY 3: Check topic_synonyms
         if hasattr(graph_obj, 'topic_synonyms'):
             for topic, synonyms in graph_obj.topic_synonyms.items():
                 for syn in synonyms:
@@ -359,6 +369,14 @@ Topics (one per line):"""
                             if topic.lower() in str(node).lower():
                                 print(f"Resolved '{entity}' -> '{node}' (synonym)")
                                 return node
+        
+        # PRIORITY 4: Fallback to paper nodes (only if no topic match)
+        for node, data in graph_obj.graph.nodes(data=True):
+            if data.get('type') == 'paper':
+                node_lower = str(node).lower()
+                if search_term in node_lower:
+                    print(f"Resolved '{entity}' -> '{node}' (paper fallback match)")
+                    return node
         
         print(f"Could not resolve '{entity}' to any graph node")
         return None
@@ -397,10 +415,28 @@ Topics (one per line):"""
                     msg += f" Did you mean: {', '.join(similar[:5])}?"
                 return msg
             
-            # Use NetworkX to find shortest path
+            # Use NetworkX to find shortest path (excluding semantic edges)
             import networkx as nx
             try:
-                path = nx.shortest_path(graph_obj.graph, start_node, end_node)
+                # Create a view of the graph without semantic edges
+                def edge_filter(n1, n2):
+                    edge_data = graph_obj.graph.get_edge_data(n1, n2)
+                    return edge_data.get('type') != 'semantic'
+                
+                filtered_graph = nx.subgraph_view(graph_obj.graph, filter_edge=edge_filter)
+                
+                path = nx.shortest_path(filtered_graph, start_node, end_node)
+                
+                # Debug: print node types and edges in path
+                print(f"Path nodes with types and connections:")
+                for i, node in enumerate(path):
+                    node_type = graph_obj.graph.nodes[node].get('type', 'unknown')
+                    print(f"  [{i}] {node} ({node_type})")
+                    if i < len(path) - 1:
+                        next_node = path[i + 1]
+                        has_edge = graph_obj.graph.has_edge(node, next_node)
+                        print(f"      -> edge to next: {has_edge}")
+                
                 path_str = " → ".join([str(node) for node in path])
                 
                 # Store path for mermaid diagram (only when path is successfully found)
@@ -516,11 +552,15 @@ Topics (one per line):"""
         
         # Use keyword search to find relevant papers
         search_query = " ".join(explain_terms)
-        search_state = {"question": search_query, "context": "", "search_results": []}
+        search_state = {"question": search_query, "context": "", "search_results": [], "sources_used": []}
         search_result = self._keyword_search(search_state)
         
         if search_result.get("search_results"):
             papers = search_result["search_results"][:3]  # Use top 3 papers for explanation
+            
+            # Track papers as sources
+            for paper in papers:
+                state["sources_used"].append(paper['title'])
             
             # Collect paper content for grounding
             paper_content = []
@@ -901,13 +941,15 @@ Topics (one per line):"""
         if "Paper summaries for grounding:" in context:
             system_message = """You are a helpful assistant that answers questions about research papers and academic topics. 
             
-            IMPORTANT: You must base your response ONLY on the paper summaries provided in the context. Do not use any external knowledge or make assumptions beyond what is explicitly stated in the provided summaries. If the provided summaries don't contain enough information to answer the question, say so clearly."""
+            IMPORTANT: You must base your response ONLY on the paper summaries provided in the context. Do not use any external knowledge or make assumptions beyond what is explicitly stated in the provided summaries. If the provided summaries don't contain enough information to answer the question, say so clearly.
+            
+            Write your response in flowing paragraphs, not bullet points."""
         elif "Path found:" in context:
             system_message = """You are a helpful assistant that answers questions about research papers and academic topics.
 
-            IMPORTANT: You must base your response ONLY on the information provided in the context. Explain the connection concisely."""
+            IMPORTANT: You must base your response ONLY on the information provided in the context. Explain the connection concisely in flowing paragraphs, not bullet points."""
         else:
-            system_message = "You are a helpful assistant that answers questions about research papers and academic topics."
+            system_message = "You are a helpful assistant that answers questions about research papers and academic topics. Write your response in flowing paragraphs, not bullet points."
         
         messages = [
             SystemMessage(content=system_message),
@@ -934,7 +976,7 @@ Topics (one per line):"""
             "    keyword_search --> generate_answer",
             "    graph_properties --> generate_answer",
             "    generate_answer --> END([Final Answer])",
-            "    generate_answer -.-> OpenAI[OpenAI GPT-3.5]",
+            "    generate_answer -.-> OpenAI[OpenAI GPT-5-nano]",
             "    OpenAI -.-> generate_answer",
             "    bridge_question -.-> ChainReasoning[Chain of LLM Calls]",
             "    ChainReasoning -.-> bridge_question",
@@ -959,10 +1001,15 @@ Topics (one per line):"""
         # If we have path information from a bridge question, show the path
         if hasattr(self, '_last_path') and self._last_path:
             path_info = self._last_path
-            mermaid_lines = ["graph LR"]
+            nodes = path_info["nodes"]
             
-            # Add nodes and connections for the path
-            for i, node in enumerate(path_info["nodes"]):
+            # Get graph object to check node types
+            graph_obj = self._get_graph_object()
+            
+            mermaid_lines = ["graph TD"]
+            
+            # Add nodes and connections
+            for i, node in enumerate(nodes):
                 node_id = f"node{i}"
                 node_label = str(node)
                 
@@ -970,19 +1017,23 @@ Topics (one per line):"""
                 if len(node_label) > 30:
                     node_label = node_label[:27] + "..."
                 
-                # Style nodes differently based on type
-                if i == 0:  # Start node
-                    mermaid_lines.append(f'    {node_id}["{node_label}"]')
-                    mermaid_lines.append(f"    style {node_id} fill:#e1f5fe,stroke:#01579b")
-                elif i == len(path_info["nodes"]) - 1:  # End node
-                    mermaid_lines.append(f'    {node_id}["{node_label}"]')
-                    mermaid_lines.append(f"    style {node_id} fill:#c8e6c9,stroke:#2e7d32")
-                else:  # Intermediate nodes
-                    mermaid_lines.append(f'    {node_id}["{node_label}"]')
+                # Get node type for styling
+                node_type = 'unknown'
+                if graph_obj:
+                    node_data = graph_obj.graph.nodes.get(node, {})
+                    node_type = node_data.get('type', 'unknown')
+                
+                # All nodes are rectangles
+                mermaid_lines.append(f'    {node_id}["{node_label}"]')
+                
+                # Color based on type
+                if node_type == 'paper':
                     mermaid_lines.append(f"    style {node_id} fill:#fff3e0,stroke:#ef6c00")
+                else:  # topic
+                    mermaid_lines.append(f"    style {node_id} fill:#f3e5f5,stroke:#7b1fa2")
                 
                 # Add connection to next node
-                if i < len(path_info["nodes"]) - 1:
+                if i < len(nodes) - 1:
                     next_node_id = f"node{i+1}"
                     mermaid_lines.append(f"    {node_id} --> {next_node_id}")
             
@@ -1002,7 +1053,8 @@ Topics (one per line):"""
             "question": question,
             "context": "",
             "answer": "",
-            "search_results": []
+            "search_results": [],
+            "sources_used": []
         }
         
         result = self.graph.invoke(initial_state)

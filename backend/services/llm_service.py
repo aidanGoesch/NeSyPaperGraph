@@ -4,9 +4,20 @@ import os
 import re
 import ast
 import logging
+import time
+import threading
 from botocore.config import Config
 
 logger = logging.getLogger(__name__)
+
+# Global configuration for LLM behaviour
+DEBUG_LLM = os.getenv("DEBUG_LLM", "0").lower() in {"1", "true", "yes", "y"}
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3") or "3")
+LLM_BACKOFF_BASE_SECONDS = float(os.getenv("LLM_BACKOFF_BASE_SECONDS", "1.0") or "1.0")
+LLM_SLEEP_BETWEEN_CALLS_MS = int(os.getenv("LLM_SLEEP_BETWEEN_CALLS_MS", "0") or "0")
+
+_LLM_MAX_CONCURRENT = int(os.getenv("LLM_MAX_CONCURRENT", "0") or "0")
+_llm_semaphore = threading.Semaphore(_LLM_MAX_CONCURRENT) if _LLM_MAX_CONCURRENT > 0 else None
 
 system_prompt = """
 You are an expert academic paper analyzer specializing in topic extraction from research papers. Your task is to identify and extract the main topics, themes, and subject areas discussed in academic papers.
@@ -85,12 +96,14 @@ class OpenAILLMClient:
             assistant_id: OpenAI Assistant ID (if None, will use OPENAI_ASSISTANT_ID env var)
         """
         import openai
-        
+
         self.api_key = api_key or os.getenv('OPENAI_API_KEY')
         if not self.api_key:
             raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
         
         self.assistant_id = assistant_id or os.getenv('OPENAI_ASSISTANT_ID')
+        # Allow overriding the chat model via environment variable
+        self.model_name = os.getenv("OPENAI_CHAT_MODEL", "gpt-5-mini-2025-08-07")
         
         # Initialize OpenAI client
         self.client = openai.OpenAI(
@@ -98,7 +111,7 @@ class OpenAILLMClient:
             default_headers={"OpenAI-Beta": "assistants=v2"}
         )
 
-    def generate(self, prompt, system_prompt=None):
+    def generate(self, prompt, system_prompt=None, context: str | None = None):
         """
         Generate text using OpenAI.
         
@@ -109,15 +122,17 @@ class OpenAILLMClient:
         Returns:
             str: The generated text response
         """
-        return self._generate_with_api(prompt, system_prompt)
+        return self._generate_with_api(prompt, system_prompt, context=context)
     
-    def _generate_with_api(self, prompt, system_prompt=None):
+    def _generate_with_api(self, prompt, system_prompt=None, context: str | None = None, max_tokens: int = 2000):
         """
         Generate text using OpenAI Chat Completions API.
         
         Args:
             prompt: The prompt text
             system_prompt: System instructions (optional)
+            context: Context label for logging (optional)
+            max_tokens: Maximum completion tokens (default 2000, increased from 1000)
             
         Returns:
             str: The generated text response
@@ -128,29 +143,109 @@ class OpenAILLMClient:
             messages.append({"role": "system", "content": system_prompt})
         
         messages.append({"role": "user", "content": prompt})
-        
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o-mini",  # Faster and cheaper than gpt-3.5-turbo
-                messages=messages,
-                temperature=0.2,
-                max_tokens=1000
-            )
-            
-            return response.choices[0].message.content
-            
-        except Exception as e:
-            raise RuntimeError(f"OpenAI API error: {str(e)}")
+
+        prompt_len = len(prompt) if isinstance(prompt, str) else 0
+        context_label = context or "generic"
+
+        for attempt in range(LLM_MAX_RETRIES):
+            try:
+                # Increase max_tokens on retry if we hit length limit
+                current_max_tokens = max_tokens
+                if attempt > 0:
+                    # Increase by 50% on each retry if previous attempt hit length limit
+                    current_max_tokens = int(max_tokens * (1.5 ** attempt))
+                    # Cap at 4000 tokens
+                    current_max_tokens = min(current_max_tokens, 4000)
+
+                if DEBUG_LLM:
+                    logger.info(
+                        f"[LLM] Request start | context={context_label} | "
+                        f"model={self.model_name} | prompt_chars={prompt_len} | "
+                        f"has_system={bool(system_prompt)} | max_tokens={current_max_tokens} | "
+                        f"attempt={attempt + 1}/{LLM_MAX_RETRIES}"
+                    )
+
+                def _do_request():
+                    return self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=messages,
+                        max_completion_tokens=current_max_tokens
+                    )
+
+                if _llm_semaphore:
+                    with _llm_semaphore:
+                        response = _do_request()
+                else:
+                    response = _do_request()
+
+                content = response.choices[0].message.content
+                finish_reason = getattr(response.choices[0], "finish_reason", None)
+                model_used = getattr(response, "model", self.model_name)
+
+                if DEBUG_LLM:
+                    logger.info(
+                        f"[LLM] Response received | context={context_label} | "
+                        f"model={model_used} | finish_reason={finish_reason} | "
+                        f"content_len={len(content) if content else 0}"
+                    )
+
+                if not content:
+                    logger.warning(
+                        f"[LLM] Empty content from OpenAI | context={context_label} | "
+                        f"model={model_used} | finish_reason={finish_reason} | "
+                        f"attempt={attempt + 1}/{LLM_MAX_RETRIES} | max_tokens_used={current_max_tokens}"
+                    )
+                    # If finish_reason is 'length', the model hit the token limit - increase on retry
+                    if finish_reason == "length" and attempt < LLM_MAX_RETRIES - 1:
+                        logger.info(
+                            f"[LLM] Hit token limit (finish_reason=length), will increase max_tokens on next attempt"
+                        )
+                    # Treat empty content as transient and retry if attempts remain
+                    if attempt < LLM_MAX_RETRIES - 1:
+                        backoff = LLM_BACKOFF_BASE_SECONDS * (2 ** attempt)
+                        logger.info(f"[LLM] Retrying after empty content in {backoff:.2f}s")
+                        time.sleep(backoff)
+                        continue
+
+                if LLM_SLEEP_BETWEEN_CALLS_MS > 0:
+                    time.sleep(LLM_SLEEP_BETWEEN_CALLS_MS / 1000.0)
+
+                return content or ""
+
+            except Exception as e:
+                message = str(e)
+                lower_msg = message.lower()
+                is_transient = any(
+                    kw in lower_msg
+                    for kw in ["rate limit", "429", "timeout", "timed out", "server error", "503"]
+                )
+
+                if is_transient and attempt < LLM_MAX_RETRIES - 1:
+                    backoff = LLM_BACKOFF_BASE_SECONDS * (2 ** attempt)
+                    logger.warning(
+                        f"[LLM] Transient OpenAI error (will retry) | context={context_label} | "
+                        f"attempt={attempt + 1}/{LLM_MAX_RETRIES} | backoff={backoff:.2f}s | error={message}"
+                    )
+                    time.sleep(backoff)
+                    continue
+
+                logger.error(
+                    f"[LLM] OpenAI API error (giving up) | context={context_label} | "
+                    f"attempt={attempt + 1}/{LLM_MAX_RETRIES} | error={message}"
+                )
+                raise RuntimeError(f"OpenAI API error: {message}")
 
     def generate_summary(self, text: str) -> str:
         """Generate a summary of the paper text"""
-        try:
-            # Truncate text if too long
-            max_chars = 30000
-            if len(text) > max_chars:
-                text = text[:max_chars] + "..."
-            
-            prompt = f"""Provide a comprehensive summary of this research paper. Do not include any headings or titles. Start directly with the content covering:
+        # Truncate text if too long
+        max_chars = 30000
+        original_len = len(text)
+        truncated = False
+        if original_len > max_chars:
+            text = text[:max_chars] + "..."
+            truncated = True
+        
+        prompt = f"""Provide a comprehensive summary of this research paper. Do not include any headings or titles. Start directly with the content covering:
 1. Main research question/objective
 2. Key methodology or approach  
 3. Primary findings/results
@@ -159,17 +254,99 @@ class OpenAILLMClient:
 Paper text:
 {text}"""
 
+        # Retry up to 3 times on failure
+        for attempt in range(LLM_MAX_RETRIES):
+            try:
+                if DEBUG_LLM:
+                    logger.info(
+                        f"[LLM] Summary request start | model={self.model_name} | "
+                        f"prompt_chars={len(prompt)} | text_truncated={truncated} | "
+                        f"attempt={attempt + 1}/{LLM_MAX_RETRIES}"
+                    )
+
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_completion_tokens=500
+                )
+                
+                summary = response.choices[0].message.content
+                if summary:
+                    if DEBUG_LLM:
+                        finish_reason = getattr(response.choices[0], "finish_reason", None)
+                        logger.info(
+                            f"[LLM] Summary response received | model={getattr(response, 'model', self.model_name)} | "
+                            f"finish_reason={finish_reason} | summary_len={len(summary)}"
+                        )
+                    return summary.strip()
+                
+                finish_reason = getattr(response.choices[0], "finish_reason", None)
+                logger.warning(
+                    f"Empty summary response (attempt {attempt + 1}/{LLM_MAX_RETRIES}) | "
+                    f"model={getattr(response, 'model', self.model_name)} | finish_reason={finish_reason}"
+                )
+                if attempt < LLM_MAX_RETRIES - 1:
+                    backoff = LLM_BACKOFF_BASE_SECONDS * (2 ** attempt)
+                    time.sleep(backoff)  # Wait before retry
+                    
+            except Exception as e:
+                message = str(e)
+                lower_msg = message.lower()
+                is_transient = any(
+                    kw in lower_msg
+                    for kw in ["rate limit", "429", "timeout", "timed out", "server error", "503"]
+                )
+                logger.warning(
+                    f"Summary generation error (attempt {attempt + 1}/{LLM_MAX_RETRIES}): {message} | "
+                    f"transient={is_transient}"
+                )
+                if is_transient and attempt < LLM_MAX_RETRIES - 1:
+                    backoff = LLM_BACKOFF_BASE_SECONDS * (2 ** attempt)
+                    time.sleep(backoff)
+                else:
+                    # For non-transient errors, break early
+                    break
+
+        # All retries failed - attempt alternate simple prompt
+        logger.error("Failed to generate summary after primary attempts, trying alternate prompt")
+        alt_prompt = f"""Summarize this research paper in 3-5 sentences as an abstract suitable for a reader familiar with the field.
+
+Paper text:
+{text}"""
+        try:
             response = self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-                temperature=0.3
+                model=self.model_name,
+                messages=[{"role": "user", "content": alt_prompt}],
+                max_completion_tokens=300
             )
-            
-            return response.choices[0].message.content.strip()
-            
+            summary = response.choices[0].message.content or ""
+            if summary:
+                logger.warning(
+                    "Using summary generated from alternate prompt after failures with primary prompt"
+                )
+                return summary.strip()
         except Exception as e:
-            return f"Summary generation failed: {str(e)}"
+            logger.warning(f"Alternate summary prompt also failed: {e}")
+
+        # Final local heuristic fallback: use first few sentences of the text
+        logger.error("Falling back to heuristic summary based on source text")
+        return self._heuristic_summary(text)
+
+    def _heuristic_summary(self, text: str, max_chars: int = 2000, max_sentences: int = 5) -> str:
+        """
+        Create a simple extractive summary from the start of the text.
+        This is a last-resort fallback when LLM-based summaries fail.
+        """
+        if not text:
+            return ""
+
+        snippet = text[:max_chars]
+        # Naive sentence splitting
+        sentences = re.split(r'(?<=[.!?])\s+', snippet)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        if not sentences:
+            return snippet.strip()
+        return " ".join(sentences[:max_sentences])
     
     def generate_topic_synonyms(self, topics: list[str]) -> dict[str, list[str]]:
         """Generate synonyms for each topic to help identify duplicates"""
@@ -190,10 +367,9 @@ JSON:"""
             
             logger.info(f"Requesting synonyms for {len(topics)} topics from OpenAI...")
             response = self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self.model_name,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
-                temperature=0.3
+                max_completion_tokens=2000
             )
             
             # Parse JSON response
@@ -233,7 +409,8 @@ class TopicExtractor:
             Dict with title, authors, and publication_date
         """
         # Use beginning of paper where metadata is typically found
-        if len(text) > max_chars:
+        original_len = len(text)
+        if original_len > max_chars:
             text = text[:max_chars]
         
         system_prompt = """You are an expert at extracting metadata from academic papers. Extract the title, authors, and publication date from the given paper text. Return the result in JSON format with the following structure:
@@ -256,44 +433,92 @@ Guidelines:
 
 Extract the title, authors, and publication date in JSON format."""
 
-        try:
-            response = self.llm_client.generate(prompt, system_prompt=system_prompt).strip()
-            
-            # Try to extract JSON from response
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1)
-            else:
-                json_match = re.search(r'\{.*?\}', response, re.DOTALL)
+        # Retry up to 3 times
+        for attempt in range(LLM_MAX_RETRIES):
+            try:
+                if DEBUG_LLM:
+                    logger.info(
+                        f"[Metadata] LLM metadata extraction attempt {attempt + 1}/{LLM_MAX_RETRIES} | "
+                        f"text_chars={len(text)} | original_chars={original_len} | "
+                        f"text_truncated={original_len > max_chars}"
+                    )
+
+                response = self.llm_client.generate(
+                    prompt, system_prompt=system_prompt, context="metadata"
+                ).strip()
+                
+                # Check for empty response
+                if not response:
+                    logger.warning(f"Empty metadata response (attempt {attempt + 1}/{LLM_MAX_RETRIES})")
+                    if attempt < LLM_MAX_RETRIES - 1:
+                        time.sleep(LLM_BACKOFF_BASE_SECONDS * (2 ** attempt))  # Wait before retry
+                    continue
+                
+                # Try to extract JSON from response
+                json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL)
+                json_path = None
                 if json_match:
-                    json_str = json_match.group(0)
+                    json_str = json_match.group(1)
+                    json_path = "markdown_block"
                 else:
-                    json_str = response
-            
-            result = json.loads(json_str)
-            
-            # Validate and clean the result
-            metadata = {
-                'title': result.get('title'),
-                'authors': result.get('authors', []),
-                'publication_date': result.get('publication_date')
-            }
-            
-            # Ensure authors is a list
-            if isinstance(metadata['authors'], str):
-                metadata['authors'] = [metadata['authors']]
-            elif not isinstance(metadata['authors'], list):
-                metadata['authors'] = []
-            
-            return metadata
-            
-        except (json.JSONDecodeError, Exception) as e:
-            print(f"Error extracting paper metadata: {e}")
-            return {
-                'title': None,
-                'authors': [],
-                'publication_date': None
-            }
+                    json_match = re.search(r'\{.*?\}', response, re.DOTALL)
+                    if json_match:
+                        json_str = json_match.group(0)
+                        json_path = "bare_object"
+                    else:
+                        json_str = response
+                        json_path = "raw_response"
+                
+                result = json.loads(json_str)
+                
+                # Validate and clean the result
+                metadata = {
+                    'title': result.get('title'),
+                    'authors': result.get('authors', []),
+                    'publication_date': result.get('publication_date')
+                }
+                
+                # Ensure authors is a list
+                if isinstance(metadata['authors'], str):
+                    metadata['authors'] = [metadata['authors']]
+                elif not isinstance(metadata['authors'], list):
+                    metadata['authors'] = []
+
+                # Basic validation: require non-empty title and authors list
+                title_ok = isinstance(metadata['title'], str) and metadata['title'].strip() != ""
+                authors_ok = isinstance(metadata['authors'], list) and len(metadata['authors']) > 0
+
+                if not title_ok or not authors_ok:
+                    logger.warning(
+                        f"[Metadata] Incomplete or invalid metadata from LLM "
+                        f"(attempt {attempt + 1}/{LLM_MAX_RETRIES}) | "
+                        f"title_ok={title_ok} | authors_ok={authors_ok}"
+                    )
+                    if attempt < LLM_MAX_RETRIES - 1:
+                        continue
+                    # Fall through to heuristic fallback after loop
+                else:
+                    if DEBUG_LLM:
+                        logger.info(
+                            f"[Metadata] Successfully extracted metadata via LLM | "
+                            f"title={metadata['title']!r} | authors_count={len(metadata['authors'])}"
+                        )
+                    return metadata
+
+            except json.JSONDecodeError as e:
+                snippet = response[:500] if isinstance(response, str) else ""
+                logger.warning(
+                    f"Metadata JSON parsing error (attempt {attempt + 1}/{LLM_MAX_RETRIES}) via {json_path}: {e}. "
+                    f"Response snippet: {snippet!r}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Error extracting paper metadata (attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
+                )
+        
+        # All retries failed or produced invalid metadata - use heuristic fallback
+        logger.error("Failed to extract valid metadata via LLM after all attempts; using heuristic parser")
+        return self._heuristic_metadata(text)
 
     def extract_topics(self, text, current_topics=None, max_chars=8000):
         """
@@ -313,8 +538,48 @@ Extract the title, authors, and publication date in JSON format."""
             # Take beginning and end of paper for better context
             chunk_size = max_chars // 2
             text = text[:chunk_size] + "\n...\n" + text[-chunk_size:]
-        
-        return self._extract_from_text(text, current_topics)
+
+        if DEBUG_LLM:
+            logger.info(
+                f"[Topics] Starting topic extraction | text_chars={len(text)} | "
+                f"max_chars={max_chars} | has_current_topics={bool(current_topics)} | "
+                f"current_topics_count={len(current_topics) if current_topics else 0}"
+            )
+
+        topics = self._extract_from_text(text, current_topics)
+        if topics:
+            return topics
+
+        # Fallback: use KeyBERT-based topic extraction if LLM could not provide topics
+        logger.warning("[Topics] LLM topic extraction failed; falling back to KeyBERT-based topics")
+        try:
+            from .pdf_preprocessor import extract_topics as keybert_extract_topics
+
+            kb_topics = keybert_extract_topics(text, current_topics=current_topics)
+            if not kb_topics:
+                logger.error("[Topics] KeyBERT fallback also returned no topics")
+                return []
+
+            # Normalize and limit to 8 topics
+            cleaned = []
+            for t in kb_topics:
+                if not t:
+                    continue
+                # Title-case while preserving common acronyms reasonably well
+                normalized = str(t).strip()
+                if not normalized:
+                    continue
+                cleaned.append(normalized.title())
+                if len(cleaned) >= 8:
+                    break
+
+            logger.warning(
+                f"[Topics] Using {len(cleaned)} fallback topics from KeyBERT after LLM failure"
+            )
+            return cleaned
+        except Exception as e:
+            logger.error(f"[Topics] Error during KeyBERT fallback topic extraction: {e}", exc_info=True)
+            return []
     
     def _extract_from_text(self, text, current_topics):
         """
@@ -334,36 +599,152 @@ Academic Paper Text:
 
 Extract EXACTLY 8 topics in JSON format."""
 
-        try:
-            response = self.llm_client.generate(prompt, system_prompt=system_prompt).strip()
-            
-            # Try to extract JSON from response
-            # Handle cases where LLM wraps JSON in markdown code blocks
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1)
-            else:
-                # Try to find JSON object directly
-                json_match = re.search(r'\{.*?\}', response, re.DOTALL)
+        # Retry up to 3 times on failure
+        for attempt in range(LLM_MAX_RETRIES):
+            try:
+                if DEBUG_LLM:
+                    logger.info(
+                        f"[Topics] LLM topic extraction attempt {attempt + 1}/{LLM_MAX_RETRIES} | "
+                        f"prompt_chars={len(prompt)} | has_existing_topics={bool(existing_topics_str)}"
+                    )
+
+                response = self.llm_client.generate(
+                    prompt, system_prompt=system_prompt, context="topics"
+                ).strip()
+                
+                # Check for empty response
+                if not response:
+                    logger.warning(
+                        f"Empty response from LLM for topics (attempt {attempt + 1}/{LLM_MAX_RETRIES})"
+                    )
+                    if attempt < LLM_MAX_RETRIES - 1:
+                        time.sleep(LLM_BACKOFF_BASE_SECONDS * (2 ** attempt))  # Wait before retry
+                    continue
+                
+                # Try to extract JSON from response
+                # Handle cases where LLM wraps JSON in markdown code blocks
+                json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL)
+                json_path = None
                 if json_match:
-                    json_str = json_match.group(0)
+                    json_str = json_match.group(1)
+                    json_path = "markdown_block"
                 else:
-                    json_str = response
-            
-            # Parse JSON
-            result = json.loads(json_str)
-            topics = result.get('topics', [])
-            
-            # Ensure we return at most 8 topics
-            if isinstance(topics, list):
-                return [str(t).strip() for t in topics[:8] if t]
-            
-            return []
-            
-        except json.JSONDecodeError as e:
-            print(f"JSON parsing error: {e}")
-            print(f"Response was: {response}")
-            return []
-        except Exception as e:
-            print(f"Error extracting topics: {e}")
-            return []
+                    # Try to find JSON object directly
+                    json_match = re.search(r'\{.*?\}', response, re.DOTALL)
+                    if json_match:
+                        json_str = json_match.group(0)
+                        json_path = "bare_object"
+                    else:
+                        json_str = response
+                        json_path = "raw_response"
+                
+                # Parse JSON
+                result = json.loads(json_str)
+                topics = result.get('topics', [])
+                
+                # Ensure we return at most 8 topics
+                if isinstance(topics, list) and topics:
+                    cleaned = [str(t).strip() for t in topics[:8] if t]
+                    if DEBUG_LLM:
+                        logger.info(
+                            f"[Topics] Extracted {len(cleaned)} topics via LLM on attempt "
+                            f"{attempt + 1}/{LLM_MAX_RETRIES}"
+                        )
+                    return cleaned
+                
+                logger.warning(
+                    f"No topics extracted from LLM response (attempt {attempt + 1}/{LLM_MAX_RETRIES})"
+                )
+                
+            except json.JSONDecodeError as e:
+                snippet = response[:500] if isinstance(response, str) else ""
+                logger.warning(
+                    f"JSON parsing error while extracting topics (attempt {attempt + 1}/{LLM_MAX_RETRIES}) "
+                    f"via {json_path}: {e}. Response snippet: {snippet!r}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Error extracting topics (attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
+                )
+        
+        # All retries failed
+        logger.error("Failed to extract topics via LLM after all attempts")
+        return []
+
+    def _heuristic_metadata(self, text: str, max_lines: int = 40) -> dict:
+        """
+        Heuristic/local metadata extraction when LLM-based extraction fails.
+        Attempts to infer title, authors, and publication date from the early
+        part of the paper text.
+        """
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        lines = lines[:max_lines]
+
+        title = None
+        authors: list[str] = []
+        pub_date = None
+
+        # Heuristic title: first non-obviously-non-title line
+        title_exclude_patterns = [
+            r"arxiv",
+            r"preprint",
+            r"doi",
+            r"copyright",
+            r"all rights reserved",
+        ]
+
+        def looks_like_title(line: str) -> bool:
+            if len(line) < 5 or len(line) > 300:
+                return False
+            lower = line.lower()
+            if any(re.search(pat, lower) for pat in title_exclude_patterns):
+                return False
+            # Avoid pure page numbers
+            if re.fullmatch(r"\d+(\s+of\s+\d+)?", line):
+                return False
+            return True
+
+        for ln in lines:
+            if looks_like_title(ln):
+                title = ln.strip()
+                break
+
+        # Heuristic authors: look at lines after title
+        start_idx = 0
+        if title and title in lines:
+            start_idx = lines.index(title) + 1
+
+        author_candidates = lines[start_idx:start_idx + 5]
+        for ln in author_candidates:
+            # Look for commas and 'and' as separators, with multiple capitalized words
+            if "," in ln or " and " in ln:
+                parts = re.split(r",| and ", ln)
+                candidate_authors = []
+                for p in parts:
+                    p = p.strip()
+                    if not p:
+                        continue
+                    # Require at least one space and some alphabetic characters
+                    if " " in p and re.search(r"[A-Za-z]", p):
+                        candidate_authors.append(p)
+                if len(candidate_authors) >= 1:
+                    authors = candidate_authors
+                    break
+
+        # Heuristic publication date: look for YYYY or YYYY-MM(-DD)
+        date_pattern = re.compile(r"(19|20)\d{2}(?:-\d{2}){0,2}")
+        for ln in lines:
+            m = date_pattern.search(ln)
+            if m:
+                pub_date = m.group(0)
+                break
+
+        logger.warning(
+            f"[Metadata] Using heuristic metadata | "
+            f"title={title!r} | authors_count={len(authors)} | publication_date={pub_date!r}"
+        )
+        return {
+            "title": title,
+            "authors": authors,
+            "publication_date": pub_date,
+        }

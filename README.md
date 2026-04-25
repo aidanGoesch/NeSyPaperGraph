@@ -64,7 +64,13 @@ pip install -r requirements.txt
 
 # Configure environment
 cp .env.example .env
-# Add your OPENAI_API_KEY to .env
+# Add required variables to .env:
+# OPENAI_API_KEY
+# AWS_ACCESS_KEY_ID
+# AWS_SECRET_ACCESS_KEY
+# AWS_REGION
+# S3_BUCKET_NAME
+# FRONTEND_URL
 
 # Start server
 uvicorn main:app --reload
@@ -81,12 +87,21 @@ npm start
 
 Frontend runs on `http://localhost:3000`
 
+### Docker Compose (Local Cloud-Parity)
+```bash
+docker compose up --build
+```
+
+Backend runs on `http://localhost:8000`, frontend on `http://localhost:3000`.
+
 ## Usage
 
-1. **Upload Papers**: Drag and drop PDF research papers into the interface
+1. **Upload Papers**: Upload PDF research papers into the interface
 2. **Explore Graph**: Interact with the bipartite graph to see paper-topic relationships
 3. **Ask Questions**: Use natural language to query the research corpus
 4. **Follow Citations**: Click paper references in answers to navigate to source papers
+
+Uploads are now asynchronous. The frontend submits files, receives a `job_id`, and polls `/api/jobs/{job_id}` until processing completes.
 
 ## Key Features
 
@@ -107,6 +122,57 @@ The LangGraph agent implements a multi-step reasoning process:
 - Graph traversal and information retrieval
 - Context synthesis and answer generation
 - Citation extraction and path visualization
+
+## Cloud Deployment
+
+### Required Environment Variables
+Define these in Railway (backend) and Vercel (frontend):
+
+```bash
+# Backend
+OPENAI_API_KEY=
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_REGION=us-east-1
+S3_BUCKET_NAME=
+FRONTEND_URL=https://your-vercel-app.vercel.app
+
+# Frontend (Vercel)
+REACT_APP_API_URL=https://your-railway-service.railway.app
+```
+
+### Deploy Backend to Railway
+1. Push repository to GitHub.
+2. Create Railway project from GitHub repo.
+3. Set Railway root directory to `backend/`.
+4. Railway auto-detects `backend/Dockerfile`.
+5. Add backend environment variables listed above.
+6. Deploy and note Railway URL.
+
+### Deploy Frontend to Vercel
+1. Create Vercel project from GitHub repo.
+2. Set Vercel root directory to `frontend/`.
+3. Set `REACT_APP_API_URL` to Railway backend URL.
+4. Deploy.
+
+### S3 Bucket Seeding
+1. Create private S3 bucket (for example `nesy-paper-graph`).
+2. Create IAM credentials with bucket access.
+3. Upload initial graph object:
+
+```bash
+aws s3 cp backend/storage/saved_graph.pkl s3://nesy-paper-graph/saved_graph.pkl
+```
+
+## Verification Checklist
+
+- [ ] `GET /health` on Railway returns 200.
+- [ ] CORS allows requests from Vercel frontend domain.
+- [ ] PDF upload returns `job_id` immediately.
+- [ ] Job status transitions `pending -> processing -> done` through `/api/jobs/{job_id}`.
+- [ ] Frontend refreshes graph after job completes.
+- [ ] Graph persists across backend restart/redeploy (loaded from S3).
+- [ ] Sentence-transformer model loads on cold start without runtime download errors.
 
 ## Future Enhancements
 

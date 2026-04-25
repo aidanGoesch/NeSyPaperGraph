@@ -10,6 +10,9 @@ class Paper(BaseModel):
     embedding: Optional[List[float]] = None
     authors: Optional[List[str]] = None
     publication_date: Optional[str] = None
+    methods: List[str] = []
+    problems: List[str] = []
+    domain: str = "unknown"
     
     class Config:
         arbitrary_types_allowed = True
