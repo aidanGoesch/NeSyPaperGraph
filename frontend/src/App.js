@@ -655,7 +655,6 @@ function App() {
             setIsUploading(true);
             setUploadError(null);
             setUploadStatus("queued");
-            setRecentlyCompletedPapers([]);
 
             try {
                 // Create FormData to send files
@@ -772,16 +771,16 @@ function App() {
                         document.getElementById("file-upload").click()
                     }
                     className="upload-button"
-                    disabled={isUploading || !accessKey}
+                    disabled={!accessKey}
                 >
-                    {isUploading ? "⏳ Processing..." : "📁 Upload Papers"}
+                    {isUploading ? "📁 Upload More Papers" : "📁 Upload Papers"}
                 </button>
                 {isUploading && (
                     <div
                         style={{
                             position: "fixed",
                             top: "72px",
-                            right: "20px",
+                            left: "20px",
                             zIndex: 1500,
                             background: isDarkMode ? "#2b2b2b" : "white",
                             color: isDarkMode ? "#f5f5f5" : "#222",
