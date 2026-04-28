@@ -338,7 +338,11 @@ async def upload_papers(
     filenames = []
     for file in files:
         # Skip hidden files and non-PDF files
-        if not file.filename or file.filename.startswith(".") or not file.filename.endswith(".pdf"):
+        if (
+            not file.filename
+            or file.filename.startswith(".")
+            or not file.filename.lower().endswith(".pdf")
+        ):
             continue
         contents = await file.read()
         file_hash = hashlib.sha256(contents).hexdigest()

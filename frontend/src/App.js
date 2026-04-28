@@ -16,6 +16,7 @@ function App() {
     const [isBootingBackend, setIsBootingBackend] = useState(false);
     const [backendBootMessage, setBackendBootMessage] = useState("");
     const [graphData, setGraphData] = useState(null);
+    const [lastGraphData, setLastGraphData] = useState(null);
     const [isDarkMode, setIsDarkMode] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
     const [isSearchExpanded, setIsSearchExpanded] = useState(false);
@@ -148,6 +149,7 @@ function App() {
                 if (response.ok) {
                     const data = await response.json();
                     setGraphData(data);
+                    setLastGraphData(data);
                     setIsBootingBackend(false);
                     return;
                 }
@@ -160,6 +162,7 @@ function App() {
                     if (fallbackResponse.ok) {
                         const fallbackData = await fallbackResponse.json();
                         setGraphData(fallbackData);
+                        setLastGraphData(fallbackData);
                         setIsBootingBackend(false);
                         return;
                     }
@@ -180,7 +183,7 @@ function App() {
         }
 
         setUploadError("Backend is still waking up. Please refresh in a moment.");
-        setGraphData(null);
+        // Preserve any existing graph snapshot instead of blanking the UI.
         setIsBootingBackend(false);
         })();
 
@@ -333,6 +336,7 @@ function App() {
             const payload = parsePayload(event);
             if (payload?.graph) {
                 setGraphData(payload.graph);
+                setLastGraphData(payload.graph);
             }
         });
 
@@ -359,6 +363,7 @@ function App() {
             if (!payload) return;
             if (payload.graph) {
                 setGraphData(payload.graph);
+                setLastGraphData(payload.graph);
             }
             if (activeUploadJobsRef.current.has(payload.job_id)) {
                 const statusLabel =
@@ -383,6 +388,7 @@ function App() {
             if (!payload) return;
             if (payload.graph) {
                 setGraphData(payload.graph);
+                setLastGraphData(payload.graph);
             }
             if (activeUploadJobsRef.current.has(payload.job_id)) {
                 activeUploadJobsRef.current.delete(payload.job_id);
@@ -650,6 +656,8 @@ function App() {
         }
     };
 
+    const visibleGraphData = graphData || lastGraphData;
+
     return (
         <div className={`app ${isDarkMode ? "dark" : "light"}`}>
             {!accessKey && (
@@ -689,11 +697,11 @@ function App() {
                         </div>
                         <div className="skeleton-status">{backendBootMessage}</div>
                     </div>
-                ) : graphData ? (
+                ) : visibleGraphData ? (
                     <GraphVisualization
-                        key={graphData.papers?.length || 0}
+                        key={visibleGraphData.papers?.length || 0}
                         ref={graphRef}
-                        data={graphData}
+                        data={visibleGraphData}
                         isDarkMode={isDarkMode}
                         onShowArchitecture={showAgentArchitecture}
                         highlightPath={highlightPath}
