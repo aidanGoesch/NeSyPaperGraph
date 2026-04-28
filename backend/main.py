@@ -3,6 +3,7 @@ import sys
 from contextlib import asynccontextmanager
 import asyncio
 import secrets
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -98,14 +99,29 @@ async def enforce_access_key(request: Request, call_next):
     return await call_next(request)
 
 configured_origins = [
-    origin.strip().rstrip("/")
+    origin.strip()
     for origin in os.environ.get("FRONTEND_URL", "http://localhost:3000").split(",")
     if origin.strip()
 ]
 
+
+def normalize_origin(origin: str) -> str:
+    cleaned = origin.strip().strip('"').strip("'").rstrip("/")
+    parts = urlsplit(cleaned)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return cleaned
+
+
+configured_origins = [normalize_origin(origin) for origin in configured_origins]
+configured_origins = [origin for origin in configured_origins if origin]
+configured_origins = list(dict.fromkeys(configured_origins))
+configured_origin_regex = os.environ.get("FRONTEND_URL_REGEX", "").strip() or None
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=configured_origins,
+    allow_origin_regex=configured_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
