@@ -4,16 +4,16 @@ from contextlib import asynccontextmanager
 import asyncio
 import secrets
 from urllib.parse import urlsplit
+import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from api.graph import router as graph_router
-from services.question_agent import QuestionAgent
 from services.storage_service import load_graph
+from services.observability import log_memory, timed_block
 from dotenv import load_dotenv
-import os
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,32 +27,54 @@ signal.signal(signal.SIGINT, signal_handler)
 class SearchRequest(BaseModel):
     query: str
 
-def get_current_graph_data(app: FastAPI):
-    """Get the most recent graph data"""
+
+def prune_jobs(jobs: dict) -> None:
+    max_jobs = int(os.getenv("MAX_JOB_HISTORY", "200") or "200")
+    ttl_seconds = int(os.getenv("JOB_TTL_SECONDS", "3600") or "3600")
+    if not jobs:
+        return
+
+    import time
+
+    now = time.time()
+
+    expired = []
+    for job_id, job in jobs.items():
+        finished_at = job.get("finished_at")
+        if finished_at and now - finished_at > ttl_seconds:
+            expired.append(job_id)
+    for job_id in expired:
+        jobs.pop(job_id, None)
+
+    if max_jobs > 0 and len(jobs) > max_jobs:
+        sorted_jobs = sorted(
+            jobs.items(),
+            key=lambda item: item[1].get("started_at", 0),
+        )
+        for job_id, _ in sorted_jobs[: len(jobs) - max_jobs]:
+            jobs.pop(job_id, None)
+
+def get_current_graph(app: FastAPI):
+    """Get the most recent graph object."""
     graph_obj = getattr(app.state, "graph", None)
     try:
         if graph_obj is None:
-            graph_obj = load_graph()
+            with timed_block("load_graph_for_search"):
+                graph_obj = load_graph()
             app.state.graph = graph_obj
         if graph_obj is not None:
-            from api.graph import graph_to_dict
-            return graph_to_dict(graph_obj), graph_obj
+            return graph_obj
     except Exception as e:
         print(f"Could not load saved graph: {e}")
     
     try:
         # Fallback to dummy graph
-        from api.graph import get_dummy_graph
-        return get_dummy_graph(), None
+        from services.graph_builder import create_dummy_graph
+
+        return create_dummy_graph()
     except Exception as e:
         print(f"Could not load dummy graph: {e}")
-        return {
-            "papers": [
-                {"title": "Paper A", "topics": ["Topic 1", "Topic 2", "Topic 3"]},
-                {"title": "Paper B", "topics": ["Topic 1", "Topic 2", "Topic 3"]}
-            ],
-            "topics": ["Topic 1", "Topic 2", "Topic 3"]
-        }, None
+        return None
 
 
 @asynccontextmanager
@@ -62,6 +84,7 @@ async def lifespan(app: FastAPI):
     app.state.graph_lock = asyncio.Lock()
     app.state.agent = None
     app.state.agent_graph_identity = None
+    log_memory("startup_initialized_state")
 
     yield
 
@@ -131,12 +154,15 @@ app.include_router(graph_router, prefix="/api")
 
 @app.get("/api/agent/architecture")
 def get_agent_architecture():
-    # Always return the static agent architecture diagram - no need for agent instance
+    # Import lazily to avoid loading LangGraph stack at startup.
+    from services.question_agent import QuestionAgent
+
     mermaid_diagram = QuestionAgent.get_agent_architecture_diagram()
     return {"mermaid": mermaid_diagram, "status": "success"}
 
 @app.get("/api/jobs/{job_id}")
 def get_job_status(job_id: str):
+    prune_jobs(app.state.jobs)
     job = app.state.jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -148,11 +174,16 @@ def health():
 
 @app.post("/api/search")
 async def search(request: SearchRequest):
-    current_graph_data, current_graph_obj = get_current_graph_data(app)
+    # Import lazily to avoid loading LangGraph stack at startup.
+    from services.question_agent import QuestionAgent
+
+    with timed_block("search_graph_fetch"):
+        current_graph_obj = get_current_graph(app)
     current_graph_identity = id(current_graph_obj) if current_graph_obj is not None else None
     if app.state.agent is None or app.state.agent_graph_identity != current_graph_identity:
-        app.state.agent = QuestionAgent(current_graph_data, current_graph_obj)
+        app.state.agent = QuestionAgent(None, current_graph_obj)
         app.state.agent_graph_identity = current_graph_identity
+        log_memory("search_agent_rebuilt")
     
     print(f"Received search query: {request.query}")
     

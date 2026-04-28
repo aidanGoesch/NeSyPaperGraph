@@ -1,4 +1,5 @@
 import math
+import os
 import networkx as nx
 from .paper import Paper
 
@@ -28,15 +29,25 @@ class PaperGraph:
     
     def add_semantic_edges(self):
         """Add edges between semantically similar papers"""
+        threshold = float(os.getenv("SEMANTIC_SIMILARITY_THRESHOLD", "0.5") or "0.5")
+        max_neighbors = int(os.getenv("SEMANTIC_MAX_NEIGHBORS_PER_PAPER", "20") or "20")
         paper_nodes = [n for n, attr in self.graph.nodes(data=True) if attr['type'] == 'paper']
         for i, paper1 in enumerate(paper_nodes):
+            top_candidates = []
             for paper2 in paper_nodes[i+1:]:
                 paper1_data = self.graph.nodes[paper1]['data']
                 paper2_data = self.graph.nodes[paper2]['data']
                 if paper1_data.embedding and paper2_data.embedding:
                     similarity = cosine_similarity(paper1_data.embedding, paper2_data.embedding)
-                    if similarity > 0.5:  # threshold for semantic similarity
-                        self.graph.add_edge(paper1, paper2, weight=similarity, type='semantic')
+                    if similarity > threshold:
+                        top_candidates.append((similarity, paper2))
+
+            if max_neighbors > 0:
+                top_candidates.sort(key=lambda item: item[0], reverse=True)
+                top_candidates = top_candidates[:max_neighbors]
+
+            for similarity, paper2 in top_candidates:
+                self.graph.add_edge(paper1, paper2, weight=similarity, type='semantic')
     
     def merge_topics(self, merge_groups: dict):
         """Merge topics based on merge groups. Each group is merged into a single representative topic."""

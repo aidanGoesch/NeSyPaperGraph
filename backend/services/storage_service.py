@@ -4,6 +4,7 @@ import pickle
 
 import boto3
 from botocore.exceptions import ClientError
+from services.observability import timed_block, log_memory
 
 GRAPH_KEY = "saved_graph.pkl"
 
@@ -22,11 +23,14 @@ def load_graph():
     bucket_name = os.environ["S3_BUCKET_NAME"]
     client = _s3_client()
     try:
-        response = client.get_object(Bucket=bucket_name, Key=GRAPH_KEY)
-        return pickle.loads(response["Body"].read())
+        with timed_block("s3_get_object_load_graph"):
+            response = client.get_object(Bucket=bucket_name, Key=GRAPH_KEY)
+            graph = pickle.loads(response["Body"].read())
+        log_memory("s3_graph_loaded")
+        return graph
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code")
-        if error_code in {"NoSuchKey", "NoSuchBucket", "404"}:
+        if error_code in {"NoSuchKey", "404"}:
             return None
         raise
 
@@ -36,6 +40,9 @@ def save_graph(graph):
     bucket_name = os.environ["S3_BUCKET_NAME"]
     client = _s3_client()
     buffer = io.BytesIO()
-    pickle.dump(graph, buffer)
+    with timed_block("pickle_dump_graph"):
+        pickle.dump(graph, buffer)
     buffer.seek(0)
-    client.put_object(Bucket=bucket_name, Key=GRAPH_KEY, Body=buffer.getvalue())
+    with timed_block("s3_put_object_save_graph"):
+        client.put_object(Bucket=bucket_name, Key=GRAPH_KEY, Body=buffer)
+    log_memory("s3_graph_saved")

@@ -85,6 +85,8 @@ function App() {
     const graphRef = useRef();
     const searchInputRef = useRef();
     const uploadPollingRef = useRef(null);
+    const graphLoadPromiseRef = useRef(null);
+    const architectureLoadedRef = useRef(false);
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
     const apiFetch = async (url, options = {}) => {
@@ -116,6 +118,11 @@ function App() {
     };
 
     const fetchGraph = async () => {
+        if (graphLoadPromiseRef.current) {
+            return graphLoadPromiseRef.current;
+        }
+
+        const loadPromise = (async () => {
         if (!accessKey) {
             setGraphData(null);
             return;
@@ -141,6 +148,10 @@ function App() {
                     setGraphData(data);
                     setIsBootingBackend(false);
                     return;
+                }
+                if (response.status === 502 || response.status === 503) {
+                    await sleep(Math.min(1000 * 2 ** (attempt - 1), 8000));
+                    continue;
                 }
                 if (response.status === 404) {
                     const fallbackResponse = await apiFetch(`${API_BASE}/api/graph/dummy`);
@@ -169,6 +180,12 @@ function App() {
         setUploadError("Backend is still waking up. Please refresh in a moment.");
         setGraphData(null);
         setIsBootingBackend(false);
+        })();
+
+        graphLoadPromiseRef.current = loadPromise.finally(() => {
+            graphLoadPromiseRef.current = null;
+        });
+        return graphLoadPromiseRef.current;
     };
 
     // Keyboard shortcut for Cmd+G to focus search
@@ -296,42 +313,43 @@ function App() {
         };
     }, []);
 
-    const pollJobStatus = (jobId) =>
-        new Promise((resolve, reject) => {
-            uploadPollingRef.current = setInterval(async () => {
-                try {
-                    const response = await apiFetch(`${API_BASE}/api/jobs/${jobId}`);
-                    if (!response.ok) {
-                        const errorData = await response.json();
-                        throw new Error(
-                            errorData.detail || "Failed to fetch job status"
-                        );
-                    }
-                    const data = await response.json();
-                    setUploadStatus(data.status);
-                    if (data.status === "done" || data.status === "error") {
-                        clearInterval(uploadPollingRef.current);
-                        uploadPollingRef.current = null;
-                        if (data.status === "done") {
-                            resolve(data);
-                            return;
-                        }
-                        reject(
-                            new Error(
-                                data.error ||
-                                    "Upload processing failed in background job"
-                            )
-                        );
-                    }
-                } catch (error) {
-                    clearInterval(uploadPollingRef.current);
-                    uploadPollingRef.current = null;
-                    reject(error);
+    const pollJobStatus = async (jobId) => {
+        const maxPolls = 30;
+        for (let attempt = 1; attempt <= maxPolls; attempt++) {
+            try {
+                const response = await apiFetch(`${API_BASE}/api/jobs/${jobId}`);
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(
+                        errorData.detail || "Failed to fetch job status"
+                    );
                 }
-            }, 2000);
-        });
+                const data = await response.json();
+                setUploadStatus(data.status);
+                if (data.status === "done") {
+                    return data;
+                }
+                if (data.status === "error") {
+                    throw new Error(
+                        data.error || "Upload processing failed in background job"
+                    );
+                }
+            } catch (error) {
+                if (attempt === maxPolls) {
+                    throw error;
+                }
+            }
+            await sleep(Math.min(1500 * 2 ** Math.floor(attempt / 5), 8000));
+        }
+
+        throw new Error("Timed out waiting for upload job completion");
+    };
 
     const showAgentArchitecture = async () => {
+        if (architectureLoadedRef.current && agentArchitectureDiagram) {
+            setShowMermaid(true);
+            return;
+        }
         try {
             const response = await apiFetch(
                 `${API_BASE}/api/agent/architecture`
@@ -339,6 +357,7 @@ function App() {
             const data = await response.json();
             if (data.mermaid) {
                 setAgentArchitectureDiagram(data.mermaid);
+                architectureLoadedRef.current = true;
                 setShowMermaid(true);
             }
         } catch (error) {
@@ -361,7 +380,7 @@ function App() {
     };
 
     const handleSearch = async (query) => {
-        if (!query.trim()) return;
+        if (!query.trim() || isSearching) return;
 
         // Check for special search syntax
         if (query.startsWith(':topic=')) {

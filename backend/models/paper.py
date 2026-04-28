@@ -4,7 +4,7 @@ from typing import List, Optional
 class Paper(BaseModel):
     title: str
     file_path: str
-    text: str
+    text: Optional[str] = None
     summary: Optional[str] = None
     topics: List[str] = []
     embedding: Optional[List[float]] = None

@@ -1,6 +1,5 @@
 from pypdf import PdfReader
 import re
-from keybert import KeyBERT
 from rapidfuzz import fuzz
 from io import BytesIO
 
@@ -19,6 +18,8 @@ def extract_text_from_pdf(pdf_input):
 
 def extract_topics(paper_text, current_topics=None):
     """Extract topics from paper text using AWS Bedrock."""
+    from keybert import KeyBERT
+
     kw_model = KeyBERT(model="all-MiniLM-L6-v2")
 
     keywords = kw_model.extract_keywords(paper_text, keyphrase_ngram_range=(1, 3), stop_words="english", top_n=15)

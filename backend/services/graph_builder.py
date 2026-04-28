@@ -2,10 +2,10 @@ from models.graph import PaperGraph
 from models.paper import Paper
 from services.llm_service import TopicExtractor, OpenAILLMClient
 from services.pdf_preprocessor import extract_text_from_pdf
-from services.verification import verify_bipartite, find_optimal_topic_merge
-import os
 import logging
+import os
 from pathlib import Path
+from services.observability import timed_block
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +14,25 @@ _all_topics_seen = set()
 
 # Global dict to store topic synonyms (persistent across uploads)
 _topic_synonyms_cache = {}
+MAX_TOPICS_TRACKED = int(os.getenv("MAX_TOPICS_TRACKED", "5000") or "5000")
+MAX_TOPIC_SYNONYMS_CACHE = int(os.getenv("MAX_TOPIC_SYNONYMS_CACHE", "5000") or "5000")
+MAX_PERSISTED_TEXT_CHARS = int(os.getenv("MAX_PERSISTED_TEXT_CHARS", "0") or "0")
+
+
+def _cap_set_size(items: set, max_size: int) -> None:
+    if max_size <= 0 or len(items) <= max_size:
+        return
+    # Keep arbitrary subset when we exceed the cap.
+    while len(items) > max_size:
+        items.pop()
+
+
+def _cap_dict_size(items: dict, max_size: int) -> None:
+    if max_size <= 0 or len(items) <= max_size:
+        return
+    keys = list(items.keys())
+    for key in keys[: len(items) - max_size]:
+        items.pop(key, None)
 
 class GraphBuilder:
     def __init__(self):
@@ -88,6 +107,7 @@ class GraphBuilder:
         # Use OpenAI assistant (reads assistant_id from environment)
         client = OpenAILLMClient()
         extractor = TopicExtractor(client)
+        from services.verification import verify_bipartite, find_optimal_topic_merge
         
         # Process papers one at a time, adding each to graph immediately
         for paper in self.papers:
@@ -133,6 +153,12 @@ class GraphBuilder:
                     exc,
                 )
                 paper.embedding = []
+
+            # Drop or truncate retained full text to reduce graph memory footprint.
+            if MAX_PERSISTED_TEXT_CHARS <= 0:
+                paper.text = None
+            elif paper.text:
+                paper.text = paper.text[:MAX_PERSISTED_TEXT_CHARS]
             
             # Update accumulated topics with new topics from this paper
             new_topics = set(topics) - accumulated_topics
@@ -145,6 +171,7 @@ class GraphBuilder:
             global_new_topics = set(topics) - _all_topics_seen
             if global_new_topics:
                 _all_topics_seen.update(global_new_topics)
+                _cap_set_size(_all_topics_seen, MAX_TOPICS_TRACKED)
             
             # Add paper to graph immediately after processing
             graph.add_paper(paper)
@@ -184,6 +211,7 @@ class GraphBuilder:
                 logger.info(f"Generating synonyms for {len(new_topics)} new topics...")
                 new_synonyms = client.generate_topic_synonyms(new_topics)
                 _topic_synonyms_cache.update(new_synonyms)
+                _cap_dict_size(_topic_synonyms_cache, MAX_TOPIC_SYNONYMS_CACHE)
                 logger.info(f"Generated synonyms for {len(new_synonyms)} topics")
             else:
                 logger.info("All topics already have cached synonyms")
@@ -204,7 +232,8 @@ class GraphBuilder:
         
         # Add semantic edges between similar papers
         logger.info("Computing semantic similarities between papers...")
-        graph.add_semantic_edges()
+        with timed_block("add_semantic_edges"):
+            graph.add_semantic_edges()
         logger.info("Semantic edges added")
         
         return graph

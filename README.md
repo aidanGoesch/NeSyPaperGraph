@@ -19,7 +19,7 @@ NeSy Paper Graph processes academic PDFs to create an interactive bipartite grap
 
 ### 🔗 Intelligent Graph Construction
 - **Bipartite graph validation** ensuring structural integrity between papers and topics
-- **Semantic topic merging** using sentence-transformers (all-MiniLM-L6-v2) to identify and consolidate similar topics
+- **Semantic topic merging** using LLM-generated synonym groups and graph merge rules
 - **Incremental graph building** allowing papers to be added without rebuilding the entire graph
 - **Topic synonym detection** preventing duplicate topics across uploads
 
@@ -41,7 +41,7 @@ NeSy Paper Graph processes academic PDFs to create an interactive bipartite grap
 - FastAPI + Uvicorn
 - LangGraph + LangChain (OpenAI integration)
 - NetworkX (graph data structures)
-- Sentence-Transformers (semantic similarity)
+- OpenAI Embeddings (semantic similarity)
 - PyPDF (document parsing)
 
 **Frontend:**
@@ -72,6 +72,7 @@ cp .env.example .env
 # S3_BUCKET_NAME
 # FRONTEND_URL
 # APP_ACCESS_KEY (optional: required by backend for private access)
+# USE_KEYBERT_FALLBACK (optional, default false; enabling increases memory usage)
 
 # Start server
 uvicorn main:app --reload
@@ -138,9 +139,25 @@ AWS_REGION=us-east-1
 S3_BUCKET_NAME=
 FRONTEND_URL=https://your-vercel-app.vercel.app
 APP_ACCESS_KEY=your-shared-secret
+USE_KEYBERT_FALLBACK=false
 
 # Frontend (Vercel)
 REACT_APP_API_URL=https://your-railway-service.railway.app
+```
+
+### Memory/Latency Guardrails (Recommended on low-memory hosts)
+Set these backend env vars to keep memory bounded:
+
+```bash
+MAX_JOB_HISTORY=200
+JOB_TTL_SECONDS=3600
+MAX_TOPICS_TRACKED=5000
+MAX_TOPIC_SYNONYMS_CACHE=5000
+MAX_PERSISTED_TEXT_CHARS=0
+SEMANTIC_SIMILARITY_THRESHOLD=0.5
+SEMANTIC_MAX_NEIGHBORS_PER_PAPER=20
+MAX_GAP_ANALYSIS_TOPICS=200
+MAX_GAP_ANALYSIS_PAIRS=4000
 ```
 
 ### Deploy Backend to Railway
@@ -174,7 +191,7 @@ aws s3 cp backend/storage/saved_graph.pkl s3://nesy-paper-graph/saved_graph.pkl
 - [ ] Job status transitions `pending -> processing -> done` through `/api/jobs/{job_id}`.
 - [ ] Frontend refreshes graph after job completes.
 - [ ] Graph persists across backend restart/redeploy (loaded from S3).
-- [ ] Sentence-transformer model loads on cold start without runtime download errors.
+- [ ] `/api/graph/load` remains responsive under cold start and does not trigger heavy recomputation.
 
 ## Future Enhancements
 

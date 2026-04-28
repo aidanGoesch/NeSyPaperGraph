@@ -471,7 +471,7 @@ Topics (one per line):"""
                             
                             # Get full paper content
                             paper = paper_data['data']
-                            paper_content = getattr(paper, 'text', '')
+                            paper_content = getattr(paper, 'text', '') or ''
                             
                             # If paper text is too long, truncate but keep substantial content
                             if len(paper_content) > 8000:
@@ -620,7 +620,8 @@ Topics (one per line):"""
                                 break
                     
                     if title_match or topic_match:
-                        summary = getattr(paper, 'summary', None) or paper.text[:500] + "..."
+                        paper_text = getattr(paper, "text", "") or ""
+                        summary = getattr(paper, 'summary', None) or paper_text[:500] + "..."
                         matching_papers.append({
                             "title": paper.title,
                             "author": getattr(paper, 'authors', None) or 'Unknown Author',
@@ -713,7 +714,7 @@ Topics (one per line):"""
                             search_results.append({
                                 "title": paper_title,
                                 "author": getattr(paper_data, 'authors', None) or 'Unknown',
-                                "summary": getattr(paper_data, 'summary', None) or paper_data.text[:500] + "...",
+                                "summary": getattr(paper_data, 'summary', None) or ((getattr(paper_data, "text", "") or "")[:500] + "..."),
                                 "topics": getattr(paper_data, 'topics', []),
                                 "node_id": paper_title
                             })

@@ -1,8 +1,7 @@
 from models.graph import PaperGraph
 from models.paper import Paper
 import time
-from ortools.sat.python import cp_model
-from z3 import *
+import os
 from typing import List, Dict, Tuple, Set
 
 
@@ -15,6 +14,8 @@ def verify_bipartite(pg: PaperGraph, new_nodes: set = None, new_edges: set = Non
         new_nodes: Set of new node names to verify (None = verify all)
         new_edges: Set of new edge tuples to verify (None = verify all)
     """
+    from z3 import Bool, Not, Solver, Xor, sat, unsat
+
     solver = Solver()
 
     # If incremental, only check new elements
@@ -154,6 +155,8 @@ def get_transitive_synonym_groups(topics: List[str], topic_synonyms: Dict[str, L
 
 def set_cover(pg : PaperGraph):
     """Takes a subgraph and returns the set of papers that you would need to read to cover all topics"""
+    from z3 import Bool, Optimize, Or, Sum, sat
+
     # Collect all the topics 
     topics = {n for n, attr in pg.graph.nodes(data=True) if attr['type'] == 'topic'}
     papers = {n for n, attr in pg.graph.nodes(data=True) if attr['type'] == 'paper'}
@@ -185,6 +188,13 @@ def set_cover(pg : PaperGraph):
         return []
 
 def solve_gaps_with_cpsat(gap_data, k):
+    try:
+        from ortools.sat.python import cp_model
+    except Exception:
+        # Fallback when OR-Tools is unavailable: pick top-k by interestingness.
+        ranked = sorted(gap_data, key=lambda row: row[2], reverse=True)
+        return [(a, b) for a, b, _, _ in ranked[:k]]
+
     model = cp_model.CpModel()
 
     # Create integer data structures
@@ -265,7 +275,12 @@ def identify_research_gap(pg: PaperGraph, k=5, weight=1, top_n=5000):
         
         return total_similarity / count if count > 0 else 0
 
+    max_topics = int(os.getenv("MAX_GAP_ANALYSIS_TOPICS", "200") or "200")
+    max_pairs = int(os.getenv("MAX_GAP_ANALYSIS_PAIRS", "4000") or "4000")
+
     topics = [n for n, attr in pg.graph.nodes(data=True) if attr['type'] == 'topic']
+    if max_topics > 0 and len(topics) > max_topics:
+        topics = topics[:max_topics]
     num_topics = len(topics)
     print(f"[Gap Analysis] Found {num_topics} topics")
 
@@ -275,10 +290,14 @@ def identify_research_gap(pg: PaperGraph, k=5, weight=1, top_n=5000):
     print("[Gap Analysis] Enumerating and scoring gaps...")
     gap_data = []  # (topic_a, topic_b, interestingness, cost)
 
+    pair_count = 0
     for i in range(num_topics):
         for j in range(i + 1, num_topics):  # remove symmetric duplicates
+            if max_pairs > 0 and pair_count >= max_pairs:
+                break
             a = topics[i]
             b = topics[j]
+            pair_count += 1
 
             path_length = len(pg.find_path(a, b))
 
@@ -292,6 +311,8 @@ def identify_research_gap(pg: PaperGraph, k=5, weight=1, top_n=5000):
                 cost = papers_a + papers_b
 
                 gap_data.append((a, b, interesting, cost))
+        if max_pairs > 0 and pair_count >= max_pairs:
+            break
 
     print(f"[Gap Analysis] Total raw gaps: {len(gap_data)}")
 

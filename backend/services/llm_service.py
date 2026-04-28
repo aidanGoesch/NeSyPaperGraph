@@ -15,6 +15,7 @@ DEBUG_LLM = os.getenv("DEBUG_LLM", "0").lower() in {"1", "true", "yes", "y"}
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3") or "3")
 LLM_BACKOFF_BASE_SECONDS = float(os.getenv("LLM_BACKOFF_BASE_SECONDS", "1.0") or "1.0")
 LLM_SLEEP_BETWEEN_CALLS_MS = int(os.getenv("LLM_SLEEP_BETWEEN_CALLS_MS", "0") or "0")
+USE_KEYBERT_FALLBACK = os.getenv("USE_KEYBERT_FALLBACK", "0").lower() in {"1", "true", "yes", "y"}
 
 _LLM_MAX_CONCURRENT = int(os.getenv("LLM_MAX_CONCURRENT", "0") or "0")
 _llm_semaphore = threading.Semaphore(_LLM_MAX_CONCURRENT) if _LLM_MAX_CONCURRENT > 0 else None
@@ -565,6 +566,10 @@ Extract the title, authors, and publication date in JSON format."""
         topics = self._extract_from_text(text, current_topics)
         if topics:
             return topics
+
+        if not USE_KEYBERT_FALLBACK:
+            logger.warning("[Topics] LLM topic extraction failed and KeyBERT fallback is disabled")
+            return []
 
         # Fallback: use KeyBERT-based topic extraction if LLM could not provide topics
         logger.warning("[Topics] LLM topic extraction failed; falling back to KeyBERT-based topics")
