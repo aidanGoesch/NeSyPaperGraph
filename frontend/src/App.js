@@ -193,6 +193,51 @@ function App() {
         return graphLoadPromiseRef.current;
     };
 
+    const monitorUploadJob = async (jobId) => {
+        const maxPolls = 240; // up to ~20 minutes at 5s max backoff
+        for (let attempt = 1; attempt <= maxPolls; attempt++) {
+            try {
+                const response = await apiFetch(`${API_BASE}/api/jobs/${jobId}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    if (activeUploadJobsRef.current.has(jobId)) {
+                        if (data.status === "processing") {
+                            const index = data.paper_index || 0;
+                            const total = data.paper_total || 0;
+                            setUploadStatus(`processing (${index}/${total})`);
+                        } else if (data.status === "pending") {
+                            setUploadStatus(
+                                `queued (#${data.queue_position || 1})`
+                            );
+                        }
+                    }
+                    if (data.status === "done") {
+                        activeUploadJobsRef.current.delete(jobId);
+                        await fetchGraph();
+                        if (activeUploadJobsRef.current.size === 0) {
+                            setIsUploading(false);
+                            setUploadStatus("done");
+                        }
+                        return;
+                    }
+                    if (data.status === "error") {
+                        activeUploadJobsRef.current.delete(jobId);
+                        setUploadError(data.error || "Upload processing failed");
+                        if (activeUploadJobsRef.current.size === 0) {
+                            setIsUploading(false);
+                            setUploadStatus("error");
+                        }
+                        return;
+                    }
+                }
+            } catch (error) {
+                // Keep trying; SSE may still deliver updates.
+                console.warn("Upload job monitor error:", error);
+            }
+            await sleep(Math.min(1000 * 2 ** Math.floor(attempt / 10), 5000));
+        }
+    };
+
     // Keyboard shortcut for Cmd+G to focus search
     useEffect(() => {
         const handleKeyDown = (e) => {
@@ -397,6 +442,8 @@ function App() {
                     setUploadStatus("done");
                 }
             }
+            // Ensure graph is refreshed from backend even if stream payload is stale.
+            fetchGraph();
         });
 
         source.addEventListener("job_error", (event) => {
@@ -642,6 +689,7 @@ function App() {
                     `queued (#${data.queue_position || activeUploadJobsRef.current.size})`
                 );
                 setUploadError(null);
+                monitorUploadJob(data.job_id);
             } catch (error) {
                 console.error("Upload error:", error);
                 setUploadError(
@@ -729,15 +777,38 @@ function App() {
                     {isUploading ? "⏳ Processing..." : "📁 Upload Papers"}
                 </button>
                 {isUploading && (
-                    <div className="loading" style={{ marginTop: "10px" }}>
-                        Processing papers in background...
-                        {uploadStatus ? ` (${uploadStatus})` : ""}
-                    </div>
-                )}
-                {recentlyCompletedPapers.length > 0 && (
-                    <div style={{ marginTop: "10px" }}>
-                        <strong>Finished:</strong>{" "}
-                        {recentlyCompletedPapers.join(" • ")}
+                    <div
+                        style={{
+                            position: "fixed",
+                            top: "72px",
+                            right: "20px",
+                            zIndex: 1500,
+                            background: isDarkMode ? "#2b2b2b" : "white",
+                            color: isDarkMode ? "#f5f5f5" : "#222",
+                            border: isDarkMode
+                                ? "1px solid #4a4a4a"
+                                : "1px solid #d9d9d9",
+                            borderRadius: "16px",
+                            padding: "10px 14px",
+                            boxShadow: "0 6px 16px rgba(0,0,0,0.18)",
+                            maxWidth: "320px",
+                        }}
+                    >
+                        <div style={{ fontWeight: 600 }}>
+                            Processing papers
+                            {uploadStatus ? ` - ${uploadStatus}` : ""}
+                        </div>
+                        {recentlyCompletedPapers.length > 0 && (
+                            <div
+                                style={{
+                                    marginTop: "6px",
+                                    fontSize: "12px",
+                                    opacity: 0.9,
+                                }}
+                            >
+                                Done: {recentlyCompletedPapers.join(" • ")}
+                            </div>
+                        )}
                     </div>
                 )}
                 {uploadError && (
