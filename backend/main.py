@@ -97,9 +97,15 @@ async def enforce_access_key(request: Request, call_next):
 
     return await call_next(request)
 
+configured_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("FRONTEND_URL", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.environ.get("FRONTEND_URL", "http://localhost:3000")],
+    allow_origins=configured_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

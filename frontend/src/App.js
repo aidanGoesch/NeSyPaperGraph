@@ -101,6 +101,20 @@ function App() {
         return response;
     };
 
+    const probeBackendReachable = async () => {
+        try {
+            // no-cors probe distinguishes "backend down" from "CORS blocked for API requests"
+            await fetch(`${API_BASE}/health`, {
+                method: "GET",
+                mode: "no-cors",
+                cache: "no-store",
+            });
+            return true;
+        } catch {
+            return false;
+        }
+    };
+
     const fetchGraph = async () => {
         if (!accessKey) {
             setGraphData(null);
@@ -111,9 +125,10 @@ function App() {
         setBackendBootMessage("Waking backend...");
         setUploadError(null);
 
-        for (let attempt = 1; attempt <= 20; attempt++) {
+        const maxAttempts = 8;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             setBackendBootMessage(
-                `Waking backend... (${attempt}/20)`
+                `Waking backend... (${attempt}/${maxAttempts})`
             );
             try {
                 const response = await apiFetch(`${API_BASE}/api/graph/load`);
@@ -138,9 +153,17 @@ function App() {
                 }
             } catch (error) {
                 console.error("Error loading graph:", error);
+                const backendReachable = await probeBackendReachable();
+                if (backendReachable) {
+                    setUploadError(
+                        "Backend is reachable, but browser access is blocked. Check FRONTEND_URL CORS origin and APP_ACCESS_KEY."
+                    );
+                    setIsBootingBackend(false);
+                    return;
+                }
             }
 
-            await sleep(1500);
+            await sleep(Math.min(1500 * 2 ** (attempt - 1), 10000));
         }
 
         setUploadError("Backend is still waking up. Please refresh in a moment.");
