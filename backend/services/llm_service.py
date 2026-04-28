@@ -254,89 +254,55 @@ class OpenAILLMClient:
 
     def generate_summary(self, text: str) -> str:
         """Generate a summary of the paper text"""
-        # Truncate text if too long
-        max_chars = 30000
+        # Keep summary input tighter so output tokens are available.
+        max_chars = int(os.getenv("SUMMARY_MAX_INPUT_CHARS", "12000") or "12000")
         original_len = len(text)
         truncated = False
         if original_len > max_chars:
             text = text[:max_chars] + "..."
             truncated = True
         
-        prompt = f"""Provide a comprehensive summary of this research paper. Do not include any headings or titles. Start directly with the content covering:
-1. Main research question/objective
-2. Key methodology or approach  
-3. Primary findings/results
-4. Conclusions and implications
+        prompt = f"""Summarize this research paper in 4-6 concise sentences.
+Requirements:
+- Start immediately with content (no heading/title/preamble)
+- Cover objective, method, key results, and implications
+- Keep total length under 180 words
 
 Paper text:
 {text}"""
 
-        # Retry up to 3 times on failure
-        for attempt in range(LLM_MAX_RETRIES):
-            try:
-                if DEBUG_LLM:
-                    logger.info(
-                        f"[LLM] Summary request start | model={self.model_name} | "
-                        f"prompt_chars={len(prompt)} | text_truncated={truncated} | "
-                        f"attempt={attempt + 1}/{LLM_MAX_RETRIES}"
-                    )
+        if DEBUG_LLM:
+            logger.info(
+                f"[LLM] Summary request start | model={self.model_name} | "
+                f"prompt_chars={len(prompt)} | text_truncated={truncated}"
+            )
 
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_completion_tokens=500
-                )
-                
-                summary = response.choices[0].message.content
-                if summary:
-                    if DEBUG_LLM:
-                        finish_reason = getattr(response.choices[0], "finish_reason", None)
-                        logger.info(
-                            f"[LLM] Summary response received | model={getattr(response, 'model', self.model_name)} | "
-                            f"finish_reason={finish_reason} | summary_len={len(summary)}"
-                        )
-                    return summary.strip()
-                
-                finish_reason = getattr(response.choices[0], "finish_reason", None)
-                logger.warning(
-                    f"Empty summary response (attempt {attempt + 1}/{LLM_MAX_RETRIES}) | "
-                    f"model={getattr(response, 'model', self.model_name)} | finish_reason={finish_reason}"
-                )
-                if attempt < LLM_MAX_RETRIES - 1:
-                    backoff = LLM_BACKOFF_BASE_SECONDS * (2 ** attempt)
-                    time.sleep(backoff)  # Wait before retry
-                    
-            except Exception as e:
-                message = str(e)
-                lower_msg = message.lower()
-                is_transient = any(
-                    kw in lower_msg
-                    for kw in ["rate limit", "429", "timeout", "timed out", "server error", "503"]
-                )
-                logger.warning(
-                    f"Summary generation error (attempt {attempt + 1}/{LLM_MAX_RETRIES}): {message} | "
-                    f"transient={is_transient}"
-                )
-                if is_transient and attempt < LLM_MAX_RETRIES - 1:
-                    backoff = LLM_BACKOFF_BASE_SECONDS * (2 ** attempt)
-                    time.sleep(backoff)
-                else:
-                    # For non-transient errors, break early
-                    break
+        try:
+            summary = self._generate_with_api(
+                prompt=prompt,
+                context="summary_primary",
+                max_tokens=900,
+            ).strip()
+            if summary:
+                return summary
+            logger.warning("Primary summary request returned empty content")
+        except Exception as e:
+            logger.warning(f"Primary summary generation failed: {e}")
 
         # All retries failed - attempt alternate simple prompt
         logger.error("Failed to generate summary after primary attempts, trying alternate prompt")
-        alt_prompt = f"""Summarize this research paper in 3-5 sentences as an abstract suitable for a reader familiar with the field.
+        reduced_text = text[: min(len(text), max_chars // 2)]
+        alt_prompt = f"""Write a short abstract-style summary in 3-5 sentences.
+Keep it under 120 words and include method + core finding.
 
 Paper text:
-{text}"""
+{reduced_text}"""
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": alt_prompt}],
-                max_completion_tokens=300
-            )
-            summary = response.choices[0].message.content or ""
+            summary = self._generate_with_api(
+                prompt=alt_prompt,
+                context="summary_alternate",
+                max_tokens=500,
+            ).strip()
             if summary:
                 logger.warning(
                     "Using summary generated from alternate prompt after failures with primary prompt"
@@ -358,6 +324,8 @@ Paper text:
             return ""
 
         snippet = text[:max_chars]
+        # Remove frequent UI/nav artifacts from extracted text.
+        snippet = re.sub(r"(?im)^\s*(menu|home|about|contact)\s*$", "", snippet)
         # Naive sentence splitting
         sentences = re.split(r'(?<=[.!?])\s+', snippet)
         sentences = [s.strip() for s in sentences if s.strip()]
