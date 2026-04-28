@@ -30,6 +30,7 @@ function App() {
     const [followUpQuestion, setFollowUpQuestion] = useState("");
     const [highlightPath, setHighlightPath] = useState(null);
     const [uploadStatus, setUploadStatus] = useState(null);
+    const [recentlyCompletedPapers, setRecentlyCompletedPapers] = useState([]);
 
     // Function to handle paper citation clicks
     const handlePaperCitationClick = (paperTitle) => {
@@ -367,6 +368,12 @@ function App() {
                 setUploadStatus(
                     `${statusLabel} (${payload.paper_index || 0}/${payload.paper_total || 0})`
                 );
+                if (payload.status === "processed" && payload.paper_title) {
+                    setRecentlyCompletedPapers((prev) => {
+                        const next = [payload.paper_title, ...prev.filter((title) => title !== payload.paper_title)];
+                        return next.slice(0, 5);
+                    });
+                }
                 setIsUploading(true);
             }
         });
@@ -595,6 +602,7 @@ function App() {
             setIsUploading(true);
             setUploadError(null);
             setUploadStatus("queued");
+            setRecentlyCompletedPapers([]);
 
             try {
                 // Create FormData to send files
@@ -670,12 +678,7 @@ function App() {
                 <h1>Paper Graph Visualization</h1>
             </header>
             <main className="app-main">
-                {isUploading ? (
-                    <div className="loading">
-                        Processing papers and extracting topics...
-                        {uploadStatus ? ` (${uploadStatus})` : ""}
-                    </div>
-                ) : isBootingBackend ? (
+                {isBootingBackend ? (
                     <div className="skeleton-wrapper">
                         <div className="skeleton-title" />
                         <div className="skeleton-graph" />
@@ -707,7 +710,6 @@ function App() {
                     onChange={handleFileUpload}
                     style={{ display: "none" }}
                     id="file-upload"
-                    webkitdirectory=""
                 />
                 <button
                     onClick={() =>
@@ -718,6 +720,18 @@ function App() {
                 >
                     {isUploading ? "⏳ Processing..." : "📁 Upload Papers"}
                 </button>
+                {isUploading && (
+                    <div className="loading" style={{ marginTop: "10px" }}>
+                        Processing papers in background...
+                        {uploadStatus ? ` (${uploadStatus})` : ""}
+                    </div>
+                )}
+                {recentlyCompletedPapers.length > 0 && (
+                    <div style={{ marginTop: "10px" }}>
+                        <strong>Finished:</strong>{" "}
+                        {recentlyCompletedPapers.join(" • ")}
+                    </div>
+                )}
                 {uploadError && (
                     <div style={{ color: "red", marginTop: "10px" }}>
                         Error: {uploadError}
