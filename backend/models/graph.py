@@ -10,6 +10,7 @@ class PaperGraph:
         self.topic_merge_groups = {}  # Dictionary mapping group_id -> list of topics to merge
         self.new_nodes = set()  # Track nodes added since last verification
         self.new_edges = set()  # Track edges added since last verification
+        self.paper_content_hashes = set()  # Track processed file hashes for dedup
     
     def add_paper(self, paper: Paper):
         self.graph.add_node(paper.title, type='paper', data=paper)

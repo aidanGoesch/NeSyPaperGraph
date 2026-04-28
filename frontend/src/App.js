@@ -84,7 +84,8 @@ function App() {
     const [isFadingOut, setIsFadingOut] = useState(false);
     const graphRef = useRef();
     const searchInputRef = useRef();
-    const uploadPollingRef = useRef(null);
+    const eventSourceRef = useRef(null);
+    const activeUploadJobsRef = useRef(new Set());
     const graphLoadPromiseRef = useRef(null);
     const architectureLoadedRef = useRef(false);
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -306,44 +307,113 @@ function App() {
     }, [accessKey]);
 
     useEffect(() => {
-        return () => {
-            if (uploadPollingRef.current) {
-                clearInterval(uploadPollingRef.current);
+        if (!accessKey) {
+            if (eventSourceRef.current) {
+                eventSourceRef.current.close();
+                eventSourceRef.current = null;
             }
-        };
-    }, []);
-
-    const pollJobStatus = async (jobId) => {
-        const maxPolls = 30;
-        for (let attempt = 1; attempt <= maxPolls; attempt++) {
-            try {
-                const response = await apiFetch(`${API_BASE}/api/jobs/${jobId}`);
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(
-                        errorData.detail || "Failed to fetch job status"
-                    );
-                }
-                const data = await response.json();
-                setUploadStatus(data.status);
-                if (data.status === "done") {
-                    return data;
-                }
-                if (data.status === "error") {
-                    throw new Error(
-                        data.error || "Upload processing failed in background job"
-                    );
-                }
-            } catch (error) {
-                if (attempt === maxPolls) {
-                    throw error;
-                }
-            }
-            await sleep(Math.min(1500 * 2 ** Math.floor(attempt / 5), 8000));
+            return;
         }
 
-        throw new Error("Timed out waiting for upload job completion");
-    };
+        const streamUrl = `${API_BASE}/api/graph/stream?access_key=${encodeURIComponent(accessKey)}`;
+        const source = new EventSource(streamUrl);
+        eventSourceRef.current = source;
+
+        const parsePayload = (event) => {
+            try {
+                return JSON.parse(event.data);
+            } catch (error) {
+                console.error("Failed to parse SSE payload:", error);
+                return null;
+            }
+        };
+
+        source.addEventListener("graph_snapshot", (event) => {
+            const payload = parsePayload(event);
+            if (payload?.graph) {
+                setGraphData(payload.graph);
+            }
+        });
+
+        source.addEventListener("job_queued", (event) => {
+            const payload = parsePayload(event);
+            if (!payload) return;
+            if (activeUploadJobsRef.current.has(payload.job_id)) {
+                setIsUploading(true);
+                setUploadStatus(`queued (#${payload.queue_position || 1})`);
+            }
+        });
+
+        source.addEventListener("job_started", (event) => {
+            const payload = parsePayload(event);
+            if (!payload) return;
+            if (activeUploadJobsRef.current.has(payload.job_id)) {
+                setIsUploading(true);
+                setUploadStatus(`processing (0/${payload.paper_total || 0})`);
+            }
+        });
+
+        source.addEventListener("paper_processed", (event) => {
+            const payload = parsePayload(event);
+            if (!payload) return;
+            if (payload.graph) {
+                setGraphData(payload.graph);
+            }
+            if (activeUploadJobsRef.current.has(payload.job_id)) {
+                const statusLabel =
+                    payload.status === "processed"
+                        ? "processed"
+                        : `skipped:${payload.reason || "unknown"}`;
+                setUploadStatus(
+                    `${statusLabel} (${payload.paper_index || 0}/${payload.paper_total || 0})`
+                );
+                setIsUploading(true);
+            }
+        });
+
+        source.addEventListener("job_done", (event) => {
+            const payload = parsePayload(event);
+            if (!payload) return;
+            if (payload.graph) {
+                setGraphData(payload.graph);
+            }
+            if (activeUploadJobsRef.current.has(payload.job_id)) {
+                activeUploadJobsRef.current.delete(payload.job_id);
+                if (activeUploadJobsRef.current.size === 0) {
+                    setIsUploading(false);
+                    setUploadStatus("done");
+                }
+            }
+        });
+
+        source.addEventListener("job_error", (event) => {
+            const payload = parsePayload(event);
+            if (!payload) return;
+            if (activeUploadJobsRef.current.has(payload.job_id)) {
+                activeUploadJobsRef.current.delete(payload.job_id);
+                setUploadError(payload.error || "Upload processing failed");
+                if (activeUploadJobsRef.current.size === 0) {
+                    setIsUploading(false);
+                    setUploadStatus("error");
+                }
+            }
+        });
+
+        source.onerror = () => {
+            if (activeUploadJobsRef.current.size > 0) {
+                setUploadError(
+                    "Realtime stream disconnected. Graph may lag until connection resumes."
+                );
+            }
+        };
+
+        return () => {
+            if (eventSourceRef.current) {
+                eventSourceRef.current.close();
+                eventSourceRef.current = null;
+            }
+        };
+    }, [API_BASE, accessKey]);
 
     const showAgentArchitecture = async () => {
         if (architectureLoadedRef.current && agentArchitectureDiagram) {
@@ -524,12 +594,9 @@ function App() {
         if (files.length > 0) {
             setIsUploading(true);
             setUploadError(null);
-            setUploadStatus("pending");
+            setUploadStatus("queued");
 
             try {
-                // Clear existing graph data first
-                setGraphData(null);
-
                 // Create FormData to send files
                 const formData = new FormData();
                 for (let i = 0; i < files.length; i++) {
@@ -556,10 +623,10 @@ function App() {
                 if (!data.job_id) {
                     throw new Error("Upload did not return a job_id");
                 }
-
-                await pollJobStatus(data.job_id);
-                await fetchGraph();
-                setUploadStatus("done");
+                activeUploadJobsRef.current.add(data.job_id);
+                setUploadStatus(
+                    `queued (#${data.queue_position || activeUploadJobsRef.current.size})`
+                );
                 setUploadError(null);
             } catch (error) {
                 console.error("Upload error:", error);
@@ -569,7 +636,6 @@ function App() {
                 setUploadStatus("error");
                 // Keep graph data as null on error
             } finally {
-                setIsUploading(false);
                 // Reset file input
                 event.target.value = "";
             }

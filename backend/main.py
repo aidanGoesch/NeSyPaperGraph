@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from api.graph import router as graph_router
+from api.graph import router as graph_router, start_queue_worker, stop_queue_worker
 from services.storage_service import load_graph
 from services.observability import log_memory, timed_block
 from dotenv import load_dotenv
@@ -82,11 +82,17 @@ async def lifespan(app: FastAPI):
     app.state.jobs = {}
     app.state.graph = None
     app.state.graph_lock = asyncio.Lock()
+    app.state.upload_queue = asyncio.Queue()
+    app.state.queue_worker_task = None
+    app.state.event_subscribers = set()
     app.state.agent = None
     app.state.agent_graph_identity = None
+    start_queue_worker(app)
     log_memory("startup_initialized_state")
 
     yield
+
+    await stop_queue_worker(app)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -111,6 +117,8 @@ async def enforce_access_key(request: Request, call_next):
         return await call_next(request)
 
     provided_key = request.headers.get("x-access-key", "").strip()
+    if not provided_key and path == "/api/graph/stream":
+        provided_key = request.query_params.get("access_key", "").strip()
     if not provided_key:
         auth_header = request.headers.get("authorization", "")
         if auth_header.lower().startswith("bearer "):
@@ -166,6 +174,13 @@ def get_job_status(job_id: str):
     job = app.state.jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("queued"):
+        queue_items = list(getattr(app.state.upload_queue, "_queue", []))
+        queued_job_ids = [item[0] for item in queue_items if item]
+        if job_id in queued_job_ids:
+            job["queue_position"] = queued_job_ids.index(job_id) + 1
+        elif job.get("status") == "pending":
+            job["queue_position"] = 0
     return job
 
 @app.get("/health")

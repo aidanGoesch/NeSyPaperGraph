@@ -4,6 +4,7 @@ from typing import List, Optional
 class Paper(BaseModel):
     title: str
     file_path: str
+    content_hash: Optional[str] = None
     text: Optional[str] = None
     summary: Optional[str] = None
     topics: List[str] = []

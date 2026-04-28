@@ -5,6 +5,7 @@ from services.pdf_preprocessor import extract_text_from_pdf
 import logging
 import os
 from pathlib import Path
+from typing import Callable, Optional
 from services.observability import timed_block
 
 logger = logging.getLogger(__name__)
@@ -58,8 +59,25 @@ class GraphBuilder:
                     return True
         return False
 
+    @staticmethod
+    def _ensure_graph_metadata(graph: PaperGraph) -> None:
+        """Backfill graph metadata fields for graphs loaded from old snapshots."""
+        if not hasattr(graph, "paper_content_hashes") or graph.paper_content_hashes is None:
+            graph.paper_content_hashes = set()
 
-    def build_graph(self, files_data=None, file_path: str = None, existing_graph=None) -> PaperGraph:
+    def _is_duplicate_hash(self, paper: Paper, graph: PaperGraph) -> bool:
+        if not paper.content_hash:
+            return False
+        return paper.content_hash in graph.paper_content_hashes
+
+
+    def build_graph(
+        self,
+        files_data=None,
+        file_path: str = None,
+        existing_graph=None,
+        on_paper_processed: Optional[Callable[[dict], None]] = None,
+    ) -> PaperGraph:
         """
         Builds a graph from PDF files.
         Processes papers sequentially, adding each to the graph immediately,
@@ -75,12 +93,16 @@ class GraphBuilder:
         # Use existing graph or create new one
         if existing_graph:
             graph = existing_graph
+            self._ensure_graph_metadata(graph)
             # Extract existing papers and topics
             self.papers = []
             self.topics = set()
             for node, data in graph.graph.nodes(data=True):
                 if data.get('type') == 'paper':
-                    self.papers.append(data['data'])
+                    existing_paper = data['data']
+                    self.papers.append(existing_paper)
+                    if getattr(existing_paper, "content_hash", None):
+                        graph.paper_content_hashes.add(existing_paper.content_hash)
                 elif data.get('type') == 'topic':
                     self.topics.add(node)
             
@@ -92,11 +114,12 @@ class GraphBuilder:
             self.papers = []
             self.topics = set()
             graph = PaperGraph()
+            self._ensure_graph_metadata(graph)
         
         if files_data is not None:
-            self.get_papers_from_data(files_data)
+            papers_to_process = self.get_papers_from_data(files_data)
         elif file_path is not None:
-            self.get_papers(file_path)
+            papers_to_process = self.get_papers(file_path)
         else:
             raise ValueError("Either files_data or file_path must be provided")
         
@@ -110,10 +133,36 @@ class GraphBuilder:
         from services.verification import verify_bipartite, find_optimal_topic_merge
         
         # Process papers one at a time, adding each to graph immediately
-        for paper in self.papers:
+        total_papers = len(papers_to_process)
+        for paper_index, paper in enumerate(papers_to_process, start=1):
             # Check for duplicate papers by normalized title
             if self._is_duplicate_paper(paper, graph):
                 logger.info(f"Skipping duplicate paper: {paper.title}")
+                if on_paper_processed:
+                    on_paper_processed(
+                        {
+                            "status": "skipped",
+                            "reason": "duplicate_title",
+                            "paper_title": paper.title,
+                            "paper_index": paper_index,
+                            "paper_total": total_papers,
+                            "graph": graph,
+                        }
+                    )
+                continue
+            if self._is_duplicate_hash(paper, graph):
+                logger.info(f"Skipping duplicate paper hash: {paper.title}")
+                if on_paper_processed:
+                    on_paper_processed(
+                        {
+                            "status": "skipped",
+                            "reason": "duplicate_hash",
+                            "paper_title": paper.title,
+                            "paper_index": paper_index,
+                            "paper_total": total_papers,
+                            "graph": graph,
+                        }
+                    )
                 continue
             # Truncate very long texts to avoid excessive processing time
             # Keep first 50000 characters (enough for topic extraction)
@@ -125,6 +174,17 @@ class GraphBuilder:
             # Skip paper if topic extraction failed
             if not topics:
                 logger.warning(f"Skipping paper due to failed topic extraction: {paper.title}")
+                if on_paper_processed:
+                    on_paper_processed(
+                        {
+                            "status": "skipped",
+                            "reason": "topic_extraction_failed",
+                            "paper_title": paper.title,
+                            "paper_index": paper_index,
+                            "paper_total": total_papers,
+                            "graph": graph,
+                        }
+                    )
                 continue
             
             paper.topics = topics
@@ -175,6 +235,8 @@ class GraphBuilder:
             
             # Add paper to graph immediately after processing
             graph.add_paper(paper)
+            if paper.content_hash:
+                graph.paper_content_hashes.add(paper.content_hash)
             
             # Verify bipartiteness incrementally after adding paper
             if not verify_bipartite(graph, graph.new_nodes, graph.new_edges):
@@ -194,12 +256,35 @@ class GraphBuilder:
                 
                 # Clear the incremental tracking for this failed addition
                 graph.clear_incremental_tracking()
+                if paper.content_hash:
+                    graph.paper_content_hashes.discard(paper.content_hash)
+                if on_paper_processed:
+                    on_paper_processed(
+                        {
+                            "status": "skipped",
+                            "reason": "verification_failed",
+                            "paper_title": paper.title,
+                            "paper_index": paper_index,
+                            "paper_total": total_papers,
+                            "graph": graph,
+                        }
+                    )
                 continue
             
             # Clear tracking after successful verification
             graph.clear_incremental_tracking()
+            if on_paper_processed:
+                on_paper_processed(
+                    {
+                        "status": "processed",
+                        "paper_title": paper.title,
+                        "paper_index": paper_index,
+                        "paper_total": total_papers,
+                        "graph": graph,
+                    }
+                )
         
-        logger.info(f"Processed {len(self.papers)} papers, {len(self.topics)} unique topics in this batch")
+        logger.info(f"Processed {len(papers_to_process)} papers, {len(self.topics)} unique topics in this batch")
         
         # Generate synonyms for all topics in the graph
         all_topics = [node for node, data in graph.graph.nodes(data=True) if data.get('type') == 'topic']
@@ -251,7 +336,13 @@ class GraphBuilder:
         client = OpenAILLMClient()
         extractor = TopicExtractor(client)
         
-        for filename, file_content in files_data:
+        parsed_papers = []
+        for file_tuple in files_data:
+            if len(file_tuple) == 3:
+                filename, file_content, content_hash = file_tuple
+            else:
+                filename, file_content = file_tuple
+                content_hash = None
             # Extract text from PDF
             text = extract_text_from_pdf(file_content)
             
@@ -268,13 +359,15 @@ class GraphBuilder:
             paper = Paper(
                 title=title,
                 file_path=filename,  # Keep original filename for reference
+                content_hash=content_hash,
                 text=text,
                 authors=metadata.get('authors', []),
                 publication_date=metadata.get('publication_date')
             )
+            parsed_papers.append(paper)
             self.papers.append(paper)
         
-        return self.papers
+        return parsed_papers
 
     def get_papers(self, file_path: str) -> list[Paper]:
         """
@@ -288,6 +381,7 @@ class GraphBuilder:
         
         path = Path(file_path)
         
+        parsed_papers = []
         for pdf_file in path.rglob("*.pdf"):
             # Extract text from PDF
             text = extract_text_from_pdf(str(pdf_file))
@@ -309,9 +403,10 @@ class GraphBuilder:
                 authors=metadata.get('authors', []),
                 publication_date=metadata.get('publication_date')
             )
+            parsed_papers.append(paper)
             self.papers.append(paper)
         
-        return self.papers
+        return parsed_papers
 
 
 def get_all_topics_seen():
