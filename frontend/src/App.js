@@ -7,6 +7,14 @@ import "./App.css";
 
 function App() {
     const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000";
+    const ACCESS_KEY_STORAGE_KEY = "nesy_access_key";
+    const [accessKey, setAccessKey] = useState(
+        () => localStorage.getItem(ACCESS_KEY_STORAGE_KEY) || ""
+    );
+    const [accessKeyInput, setAccessKeyInput] = useState("");
+    const [authError, setAuthError] = useState(null);
+    const [isBootingBackend, setIsBootingBackend] = useState(false);
+    const [backendBootMessage, setBackendBootMessage] = useState("");
     const [graphData, setGraphData] = useState(null);
     const [isDarkMode, setIsDarkMode] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
@@ -77,22 +85,67 @@ function App() {
     const graphRef = useRef();
     const searchInputRef = useRef();
     const uploadPollingRef = useRef(null);
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const apiFetch = async (url, options = {}) => {
+        const headers = { ...(options.headers || {}) };
+        if (accessKey) {
+            headers["X-Access-Key"] = accessKey;
+        }
+        const response = await fetch(url, { ...options, headers });
+        if (response.status === 401) {
+            setAuthError("Invalid access key. Please try again.");
+            setAccessKey("");
+            localStorage.removeItem(ACCESS_KEY_STORAGE_KEY);
+        }
+        return response;
+    };
 
     const fetchGraph = async () => {
-        try {
-            const response = await fetch(`${API_BASE}/api/graph/load`);
-            if (response.ok) {
-                const data = await response.json();
-                setGraphData(data);
-                return;
-            }
-            const fallbackResponse = await fetch(`${API_BASE}/api/graph/dummy`);
-            const fallbackData = await fallbackResponse.json();
-            setGraphData(fallbackData);
-        } catch (error) {
-            console.error("Error loading graph:", error);
+        if (!accessKey) {
             setGraphData(null);
+            return;
         }
+
+        setIsBootingBackend(true);
+        setBackendBootMessage("Waking backend...");
+        setUploadError(null);
+
+        for (let attempt = 1; attempt <= 20; attempt++) {
+            setBackendBootMessage(
+                `Waking backend... (${attempt}/20)`
+            );
+            try {
+                const response = await apiFetch(`${API_BASE}/api/graph/load`);
+                if (response.status === 401) {
+                    setIsBootingBackend(false);
+                    return;
+                }
+                if (response.ok) {
+                    const data = await response.json();
+                    setGraphData(data);
+                    setIsBootingBackend(false);
+                    return;
+                }
+                if (response.status === 404) {
+                    const fallbackResponse = await apiFetch(`${API_BASE}/api/graph/dummy`);
+                    if (fallbackResponse.ok) {
+                        const fallbackData = await fallbackResponse.json();
+                        setGraphData(fallbackData);
+                        setIsBootingBackend(false);
+                        return;
+                    }
+                }
+            } catch (error) {
+                console.error("Error loading graph:", error);
+            }
+
+            await sleep(1500);
+        }
+
+        setUploadError("Backend is still waking up. Please refresh in a moment.");
+        setGraphData(null);
+        setIsBootingBackend(false);
     };
 
     // Keyboard shortcut for Cmd+G to focus search
@@ -205,10 +258,12 @@ function App() {
         }
     }, [chatHistory, showChatPanel]);
 
-    // Load saved graph on startup, fallback to dummy if none exists
+    // Load graph when access key is available
     useEffect(() => {
-        fetchGraph();
-    }, []);
+        if (accessKey) {
+            fetchGraph();
+        }
+    }, [accessKey]);
 
     useEffect(() => {
         return () => {
@@ -222,7 +277,7 @@ function App() {
         new Promise((resolve, reject) => {
             uploadPollingRef.current = setInterval(async () => {
                 try {
-                    const response = await fetch(`${API_BASE}/api/jobs/${jobId}`);
+                    const response = await apiFetch(`${API_BASE}/api/jobs/${jobId}`);
                     if (!response.ok) {
                         const errorData = await response.json();
                         throw new Error(
@@ -255,7 +310,7 @@ function App() {
 
     const showAgentArchitecture = async () => {
         try {
-            const response = await fetch(
+            const response = await apiFetch(
                 `${API_BASE}/api/agent/architecture`
             );
             const data = await response.json();
@@ -266,6 +321,20 @@ function App() {
         } catch (error) {
             console.error("Error fetching architecture:", error);
         }
+    };
+
+    const handleAccessKeySubmit = async (event) => {
+        event.preventDefault();
+        const enteredKey = accessKeyInput.trim();
+        if (!enteredKey) {
+            setAuthError("Please enter your access key.");
+            return;
+        }
+
+        setAuthError(null);
+        setAccessKey(enteredKey);
+        localStorage.setItem(ACCESS_KEY_STORAGE_KEY, enteredKey);
+        setAccessKeyInput("");
     };
 
     const handleSearch = async (query) => {
@@ -342,7 +411,7 @@ function App() {
         }, 200);
 
         try {
-            const response = await fetch(`${API_BASE}/api/search`, {
+            const response = await apiFetch(`${API_BASE}/api/search`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -426,7 +495,7 @@ function App() {
                 }
 
                 // Upload files to backend
-                const response = await fetch(
+                const response = await apiFetch(
                     `${API_BASE}/api/graph/upload`,
                     {
                         method: "POST",
@@ -467,6 +536,23 @@ function App() {
 
     return (
         <div className={`app ${isDarkMode ? "dark" : "light"}`}>
+            {!accessKey && (
+                <div className="auth-overlay">
+                    <form className="auth-card" onSubmit={handleAccessKeySubmit}>
+                        <h2>Private Access</h2>
+                        <p>Enter your access key to use NeSyPaperGraph.</p>
+                        <input
+                            type="password"
+                            value={accessKeyInput}
+                            onChange={(e) => setAccessKeyInput(e.target.value)}
+                            placeholder="Access key"
+                            autoFocus
+                        />
+                        {authError && <div className="auth-error">{authError}</div>}
+                        <button type="submit">Unlock</button>
+                    </form>
+                </div>
+            )}
             <div className="theme-toggle">
                 <button onClick={() => setIsDarkMode(!isDarkMode)}>
                     {isDarkMode ? "☀️" : "🌙"}
@@ -480,6 +566,17 @@ function App() {
                     <div className="loading">
                         Processing papers and extracting topics...
                         {uploadStatus ? ` (${uploadStatus})` : ""}
+                    </div>
+                ) : isBootingBackend ? (
+                    <div className="skeleton-wrapper">
+                        <div className="skeleton-title" />
+                        <div className="skeleton-graph" />
+                        <div className="skeleton-row">
+                            <div className="skeleton-pill" />
+                            <div className="skeleton-pill" />
+                            <div className="skeleton-pill" />
+                        </div>
+                        <div className="skeleton-status">{backendBootMessage}</div>
                     </div>
                 ) : graphData ? (
                     <GraphVisualization
@@ -509,7 +606,7 @@ function App() {
                         document.getElementById("file-upload").click()
                     }
                     className="upload-button"
-                    disabled={isUploading}
+                    disabled={isUploading || !accessKey}
                 >
                     {isUploading ? "⏳ Processing..." : "📁 Upload Papers"}
                 </button>

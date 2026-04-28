@@ -2,9 +2,11 @@ import signal
 import sys
 from contextlib import asynccontextmanager
 import asyncio
+import secrets
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from api.graph import router as graph_router
 from services.question_agent import QuestionAgent
@@ -64,6 +66,36 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.middleware("http")
+async def enforce_access_key(request: Request, call_next):
+    """
+    Optional shared-key guard for API routes.
+    Set APP_ACCESS_KEY in env to require clients to send X-Access-Key.
+    """
+    required_key = os.environ.get("APP_ACCESS_KEY", "").strip()
+    path = request.url.path
+
+    # Leave health checks and CORS preflight unauthenticated.
+    if (
+        not required_key
+        or request.method == "OPTIONS"
+        or path == "/health"
+        or not path.startswith("/api/")
+    ):
+        return await call_next(request)
+
+    provided_key = request.headers.get("x-access-key", "").strip()
+    if not provided_key:
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            provided_key = auth_header[7:].strip()
+
+    if not secrets.compare_digest(provided_key, required_key):
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,

@@ -71,6 +71,7 @@ cp .env.example .env
 # AWS_REGION
 # S3_BUCKET_NAME
 # FRONTEND_URL
+# APP_ACCESS_KEY (optional: required by backend for private access)
 
 # Start server
 uvicorn main:app --reload
@@ -136,6 +137,7 @@ AWS_SECRET_ACCESS_KEY=
 AWS_REGION=us-east-1
 S3_BUCKET_NAME=
 FRONTEND_URL=https://your-vercel-app.vercel.app
+APP_ACCESS_KEY=your-shared-secret
 
 # Frontend (Vercel)
 REACT_APP_API_URL=https://your-railway-service.railway.app
