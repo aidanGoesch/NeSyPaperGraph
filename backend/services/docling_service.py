@@ -1,4 +1,5 @@
 import os
+import gc
 from typing import Any
 from tempfile import NamedTemporaryFile
 import resource
@@ -51,25 +52,45 @@ class DoclingService:
             self._converter = DocumentConverter()
             logger.info("After Docling init: %.0f MB", mem_mb())
             log_memory("docling_after_converter_init")
+        tmp_path: str | None = None
+        conversion_result: Any = None
+        document: Any = None
+        try:
+            with NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(pdf_bytes)
+                tmp.flush()
+                tmp_path = tmp.name
 
-        with NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
-            tmp.write(pdf_bytes)
-            tmp.flush()
-            conversion_result = self._converter.convert(tmp.name)
+            log_memory("docling_before_convert_call")
+            conversion_result = self._converter.convert(tmp_path)
+            log_memory("docling_after_convert_call")
             document = getattr(conversion_result, "document", None)
-        logger.info("After parse: %.0f MB", mem_mb())
+            logger.info("After parse: %.0f MB", mem_mb())
 
-        text = self._extract_text(document)
-        if self.max_text_chars > 0:
-            text = text[: self.max_text_chars]
+            text = self._extract_text(document)
+            if self.max_text_chars > 0:
+                text = text[: self.max_text_chars]
 
-        metadata = self._extract_metadata(document)
-        return {
-            "text": text,
-            "title": metadata.get("title"),
-            "authors": metadata.get("authors", []),
-            "publication_date": metadata.get("publication_date"),
-        }
+            metadata = self._extract_metadata(document)
+            parsed = {
+                "text": text,
+                "title": metadata.get("title"),
+                "authors": metadata.get("authors", []),
+                "publication_date": metadata.get("publication_date"),
+            }
+
+            conversion_result = None
+            document = None
+            log_memory("docling_after_result_extraction")
+            return parsed
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    logger.exception("Failed to delete temporary Docling PDF file: %s", tmp_path)
+            gc.collect()
+            log_memory("docling_after_gc_collect")
 
     def _extract_text(self, document: Any) -> str:
         if document is None:

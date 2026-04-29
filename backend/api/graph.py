@@ -327,10 +327,13 @@ async def process_upload_queue(app) -> None:
 
 
 def start_queue_worker(app) -> None:
-    if getattr(app.state, "queue_worker_task", None) is not None:
+    worker_task = getattr(app.state, "queue_worker_task", None)
+    if worker_task is not None and not worker_task.done():
         return
-    app.state.upload_queue = asyncio.Queue()
-    app.state.event_subscribers = set()
+    if getattr(app.state, "upload_queue", None) is None:
+        app.state.upload_queue = asyncio.Queue()
+    if getattr(app.state, "event_subscribers", None) is None:
+        app.state.event_subscribers = set()
     app.state.queue_worker_task = asyncio.create_task(process_upload_queue(app))
 
 
