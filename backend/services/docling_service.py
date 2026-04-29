@@ -41,7 +41,9 @@ class DoclingService:
             return self._empty_result("docling_error")
 
     def _run_docling(self, pdf_bytes: bytes) -> dict[str, Any]:
+        log_memory("docling_before_import_document_converter")
         from docling.document_converter import DocumentConverter
+        log_memory("docling_after_import_document_converter")
 
         def mem_mb() -> float:
             return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
