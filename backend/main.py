@@ -189,6 +189,10 @@ def get_job_status(job_id: str):
 def health():
     return {"status": "ok"}
 
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
 @app.post("/api/search")
 async def search(request: SearchRequest):
     # Import lazily to avoid loading LangGraph stack at startup.
