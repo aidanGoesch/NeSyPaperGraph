@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 SSE_HEARTBEAT_SECONDS = 15
+INGEST_SNAPSHOT_EVERY_PAPERS = int(
+    os.getenv("INGEST_SNAPSHOT_EVERY_PAPERS", "5") or "5"
+)
 
 
 def prune_jobs(jobs: dict) -> None:
@@ -116,7 +119,7 @@ def get_dummy_graph():
     return graph_to_dict(graph)
 
 async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, str]]):
-    """Run one queued PDF processing job and persist updates incrementally."""
+    """Run one queued PDF processing job and persist updates with batched snapshots."""
     jobs = app.state.jobs
     jobs[job_id]["status"] = "processing"
     jobs[job_id]["queued"] = False
@@ -167,7 +170,6 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
 
             if not filtered_files:
                 if existing_graph:
-                    save_graph(existing_graph)
                     app.state.graph = existing_graph
                 jobs[job_id]["status"] = "done"
                 jobs[job_id]["processing"] = False
@@ -186,6 +188,7 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
                 return
 
             builder = GraphBuilder()
+            snapshot_every = max(0, INGEST_SNAPSHOT_EVERY_PAPERS)
 
             def on_paper_processed(payload: dict) -> None:
                 nonlocal progress_count
@@ -193,17 +196,6 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
                 paper_title = payload.get("paper_title")
                 jobs[job_id]["paper_index"] = progress_count
                 jobs[job_id]["current_paper"] = paper_title
-
-                if payload.get("status") == "processed":
-                    graph_snapshot = payload.get("graph")
-                    if graph_snapshot is not None:
-                        save_graph(graph_snapshot)
-                        app.state.graph = graph_snapshot
-                        graph_payload = build_graph_payload(graph_snapshot)
-                    else:
-                        graph_payload = None
-                else:
-                    graph_payload = None
 
                 event_payload = {
                     "job_id": job_id,
@@ -213,8 +205,17 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
                     "status": payload.get("status"),
                     "reason": payload.get("reason"),
                 }
-                if graph_payload is not None:
-                    event_payload["graph"] = graph_payload
+                should_include_snapshot = (
+                    payload.get("status") == "processed"
+                    and snapshot_every > 0
+                    and progress_count % snapshot_every == 0
+                )
+                if should_include_snapshot:
+                    graph_snapshot = payload.get("graph")
+                    if graph_snapshot is not None:
+                        app.state.graph = graph_snapshot
+                        with timed_block("ingest_snapshot_payload_build"):
+                            event_payload["graph"] = build_graph_payload(graph_snapshot)
                 broadcast_event(app, "paper_processed", event_payload)
 
             with timed_block("build_graph_job"):
@@ -252,6 +253,8 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
         jobs[job_id]["finished_at"] = time.time()
         jobs[job_id]["paper_index"] = len(files_data)
         jobs[job_id]["current_paper"] = None
+        with timed_block("ingest_job_done_payload_build"):
+            final_graph_payload = build_graph_payload(updated_graph)
         broadcast_event(
             app,
             "job_done",
@@ -260,7 +263,7 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
                 "status": "done",
                 "paper_total": len(files_data),
                 "paper_index": len(files_data),
-                "graph": build_graph_payload(updated_graph),
+                "graph": final_graph_payload,
             },
         )
         log_memory(f"job_{job_id}_done")

@@ -16,6 +16,7 @@ LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3") or "3")
 LLM_BACKOFF_BASE_SECONDS = float(os.getenv("LLM_BACKOFF_BASE_SECONDS", "1.0") or "1.0")
 LLM_SLEEP_BETWEEN_CALLS_MS = int(os.getenv("LLM_SLEEP_BETWEEN_CALLS_MS", "0") or "0")
 USE_KEYBERT_FALLBACK = os.getenv("USE_KEYBERT_FALLBACK", "0").lower() in {"1", "true", "yes", "y"}
+TOPIC_CONTEXT_MAX_ITEMS = int(os.getenv("TOPIC_CONTEXT_MAX_ITEMS", "200") or "200")
 
 _LLM_MAX_CONCURRENT = int(os.getenv("LLM_MAX_CONCURRENT", "0") or "0")
 _llm_semaphore = threading.Semaphore(_LLM_MAX_CONCURRENT) if _LLM_MAX_CONCURRENT > 0 else None
@@ -118,15 +119,46 @@ class OpenAILLMClient:
 
     def generate_embedding(self, text: str) -> list[float]:
         """Generate embedding vector for text using OpenAI embeddings API."""
-        embedding_input = (text or "").strip()
-        if not embedding_input:
+        embeddings = self.generate_embeddings([text])
+        return embeddings[0] if embeddings else []
+
+    def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
+        """Generate embedding vectors for a batch of texts."""
+        if not texts:
             return []
+
+        cleaned_inputs = []
+        index_map = []
+        output_vectors: list[list[float]] = [[] for _ in texts]
+        for index, text in enumerate(texts):
+            normalized = (text or "").strip()
+            if not normalized:
+                continue
+            cleaned_inputs.append(normalized)
+            index_map.append(index)
+
+        if not cleaned_inputs:
+            return output_vectors
+
+        with_embedding_context = f"embed_batch_size_{len(cleaned_inputs)}"
+        if DEBUG_LLM:
+            logger.info(
+                "[LLM] Embedding batch request | model=%s | batch_size=%s",
+                self.embedding_model_name,
+                len(cleaned_inputs),
+            )
 
         response = self.client.embeddings.create(
             model=self.embedding_model_name,
-            input=embedding_input,
+            input=cleaned_inputs,
         )
-        return response.data[0].embedding
+        for result_index, item in enumerate(response.data):
+            original_index = index_map[result_index]
+            output_vectors[original_index] = item.embedding
+
+        if DEBUG_LLM:
+            logger.info("[LLM] Embedding batch complete | context=%s", with_embedding_context)
+        return output_vectors
 
     def generate(self, prompt, system_prompt=None, context: str | None = None):
         """
@@ -578,7 +610,10 @@ Extract the title, authors, and publication date in JSON format."""
         existing_topics_str = ""
         if current_topics:
             # Convert to list if it's a set
-            topics_list = list(current_topics) if isinstance(current_topics, set) else current_topics
+            topics_list = list(current_topics) if isinstance(current_topics, set) else list(current_topics)
+            topics_list = sorted({str(topic).strip() for topic in topics_list if str(topic).strip()})
+            if TOPIC_CONTEXT_MAX_ITEMS > 0 and len(topics_list) > TOPIC_CONTEXT_MAX_ITEMS:
+                topics_list = topics_list[:TOPIC_CONTEXT_MAX_ITEMS]
             existing_topics_str = f"\n\nExisting Topics Database:\n{json.dumps(topics_list, indent=2)}\n\nPlease prioritize reusing these topics when relevant."
         
         prompt = f"""{existing_topics_str}

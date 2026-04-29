@@ -5,7 +5,7 @@ from services.pdf_preprocessor import extract_text_from_pdf
 import logging
 import os
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from services.observability import timed_block
 
 logger = logging.getLogger(__name__)
@@ -18,6 +18,7 @@ _topic_synonyms_cache = {}
 MAX_TOPICS_TRACKED = int(os.getenv("MAX_TOPICS_TRACKED", "5000") or "5000")
 MAX_TOPIC_SYNONYMS_CACHE = int(os.getenv("MAX_TOPIC_SYNONYMS_CACHE", "5000") or "5000")
 MAX_PERSISTED_TEXT_CHARS = int(os.getenv("MAX_PERSISTED_TEXT_CHARS", "0") or "0")
+INGEST_EMBED_BATCH_SIZE = int(os.getenv("INGEST_EMBED_BATCH_SIZE", "8") or "8")
 
 
 def _cap_set_size(items: set, max_size: int) -> None:
@@ -132,10 +133,95 @@ class GraphBuilder:
         extractor = TopicExtractor(client)
         from services.verification import verify_bipartite, find_optimal_topic_merge
         
-        # Process papers one at a time, adding each to graph immediately
         total_papers = len(papers_to_process)
+        embed_batch_size = max(1, INGEST_EMBED_BATCH_SIZE)
+        pending_embedding_batch: list[dict[str, Any]] = []
+
+        def finalize_paper_into_graph(
+            paper: Paper, paper_index: int, paper_total: int
+        ) -> None:
+            # Drop or truncate retained full text to reduce graph memory footprint.
+            if MAX_PERSISTED_TEXT_CHARS <= 0:
+                paper.text = None
+            elif paper.text:
+                paper.text = paper.text[:MAX_PERSISTED_TEXT_CHARS]
+
+            graph.add_paper(paper)
+            if paper.content_hash:
+                graph.paper_content_hashes.add(paper.content_hash)
+
+            with timed_block("verify_bipartite_incremental"):
+                valid_increment = verify_bipartite(
+                    graph, graph.new_nodes, graph.new_edges
+                )
+            if not valid_increment:
+                logger.error(
+                    "Bipartite verification failed after adding paper: %s. Rolling back.",
+                    paper.title,
+                )
+                if paper.title in graph.graph:
+                    paper_topics = list(graph.graph.neighbors(paper.title))
+                    graph.graph.remove_node(paper.title)
+                    for topic in paper_topics:
+                        if topic in graph.graph and graph.graph.degree(topic) == 0:
+                            graph.graph.remove_node(topic)
+                            logger.info("Removed orphaned topic: %s", topic)
+                graph.clear_incremental_tracking()
+                if paper.content_hash:
+                    graph.paper_content_hashes.discard(paper.content_hash)
+                if on_paper_processed:
+                    on_paper_processed(
+                        {
+                            "status": "skipped",
+                            "reason": "verification_failed",
+                            "paper_title": paper.title,
+                            "paper_index": paper_index,
+                            "paper_total": paper_total,
+                            "graph": graph,
+                        }
+                    )
+                return
+
+            graph.clear_incremental_tracking()
+            if on_paper_processed:
+                on_paper_processed(
+                    {
+                        "status": "processed",
+                        "paper_title": paper.title,
+                        "paper_index": paper_index,
+                        "paper_total": paper_total,
+                        "graph": graph,
+                    }
+                )
+
+        def flush_embedding_batch() -> None:
+            if not pending_embedding_batch:
+                return
+            embedding_texts = [
+                item["embedding_text"] for item in pending_embedding_batch
+            ]
+            try:
+                with timed_block("embed_batch_request"):
+                    vectors = client.generate_embeddings(embedding_texts)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to generate batched embeddings for %s papers: %s",
+                    len(pending_embedding_batch),
+                    exc,
+                )
+                vectors = [[] for _ in pending_embedding_batch]
+
+            for batch_index, item in enumerate(pending_embedding_batch):
+                paper = item["paper"]
+                paper.embedding = vectors[batch_index] if batch_index < len(vectors) else []
+                finalize_paper_into_graph(
+                    paper=paper,
+                    paper_index=item["paper_index"],
+                    paper_total=item["paper_total"],
+                )
+            pending_embedding_batch.clear()
+
         for paper_index, paper in enumerate(papers_to_process, start=1):
-            # Check for duplicate papers by normalized title
             if self._is_duplicate_paper(paper, graph):
                 logger.info(f"Skipping duplicate paper: {paper.title}")
                 if on_paper_processed:
@@ -164,16 +250,19 @@ class GraphBuilder:
                         }
                     )
                 continue
-            # Truncate very long texts to avoid excessive processing time
-            # Keep first 50000 characters (enough for topic extraction)
-            text_for_extraction = paper.text[:50000] if len(paper.text) > 50000 else paper.text
-            
-            # Extract topics, passing in all accumulated topics (global + from previous papers in this batch)
-            topics = extractor.extract_topics(text_for_extraction, current_topics=accumulated_topics)
-            
-            # Skip paper if topic extraction failed
+
+            text_for_extraction = (
+                paper.text[:50000] if len(paper.text) > 50000 else paper.text
+            )
+
+            with timed_block("extract_topics_per_paper"):
+                topics = extractor.extract_topics(
+                    text_for_extraction, current_topics=accumulated_topics
+                )
             if not topics:
-                logger.warning(f"Skipping paper due to failed topic extraction: {paper.title}")
+                logger.warning(
+                    "Skipping paper due to failed topic extraction: %s", paper.title
+                )
                 if on_paper_processed:
                     on_paper_processed(
                         {
@@ -186,103 +275,43 @@ class GraphBuilder:
                         }
                     )
                 continue
-            
-            paper.topics = topics
-            
-            # Generate summary (with internal fallbacks)
-            summary = client.generate_summary(text_for_extraction)
 
+            paper.topics = topics
+
+            with timed_block("generate_summary_per_paper"):
+                summary = client.generate_summary(text_for_extraction)
             if not summary and text_for_extraction:
                 logger.warning(
-                    f"[Summary] Empty summary returned for paper '{paper.title}'. "
-                    f"Using heuristic summary based on source text."
-                )
-                # As a last resort, use the start of the text as a pseudo-summary
-                summary = text_for_extraction[:1000]
-
-            paper.summary = summary
-            
-            # Generate embedding from summary (more concise than full text)
-            embedding_text = paper.summary if paper.summary else text_for_extraction[:1000]
-            try:
-                paper.embedding = client.generate_embedding(embedding_text)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to generate OpenAI embedding for '%s': %s",
+                    "[Summary] Empty summary returned for paper '%s'. Using heuristic summary based on source text.",
                     paper.title,
-                    exc,
                 )
-                paper.embedding = []
+                summary = text_for_extraction[:1000]
+            paper.summary = summary
 
-            # Drop or truncate retained full text to reduce graph memory footprint.
-            if MAX_PERSISTED_TEXT_CHARS <= 0:
-                paper.text = None
-            elif paper.text:
-                paper.text = paper.text[:MAX_PERSISTED_TEXT_CHARS]
-            
-            # Update accumulated topics with new topics from this paper
             new_topics = set(topics) - accumulated_topics
             if new_topics:
                 accumulated_topics.update(new_topics)
-            
-            self.topics.update(set(topics))  # Track topics for this batch
-            
-            # Add topics to global set of all topics seen (if not already there)
+            self.topics.update(set(topics))
             global_new_topics = set(topics) - _all_topics_seen
             if global_new_topics:
                 _all_topics_seen.update(global_new_topics)
                 _cap_set_size(_all_topics_seen, MAX_TOPICS_TRACKED)
-            
-            # Add paper to graph immediately after processing
-            graph.add_paper(paper)
-            if paper.content_hash:
-                graph.paper_content_hashes.add(paper.content_hash)
-            
-            # Verify bipartiteness incrementally after adding paper
-            if not verify_bipartite(graph, graph.new_nodes, graph.new_edges):
-                logger.error(f"Bipartite verification failed after adding paper: {paper.title}. Rolling back.")
-                
-                # Remove the paper node
-                if paper.title in graph.graph:
-                    # Get topics connected to this paper before removing
-                    paper_topics = list(graph.graph.neighbors(paper.title))
-                    graph.graph.remove_node(paper.title)
-                    
-                    # Remove orphaned topics (topics with no remaining connections)
-                    for topic in paper_topics:
-                        if topic in graph.graph and graph.graph.degree(topic) == 0:
-                            graph.graph.remove_node(topic)
-                            logger.info(f"Removed orphaned topic: {topic}")
-                
-                # Clear the incremental tracking for this failed addition
-                graph.clear_incremental_tracking()
-                if paper.content_hash:
-                    graph.paper_content_hashes.discard(paper.content_hash)
-                if on_paper_processed:
-                    on_paper_processed(
-                        {
-                            "status": "skipped",
-                            "reason": "verification_failed",
-                            "paper_title": paper.title,
-                            "paper_index": paper_index,
-                            "paper_total": total_papers,
-                            "graph": graph,
-                        }
-                    )
-                continue
-            
-            # Clear tracking after successful verification
-            graph.clear_incremental_tracking()
-            if on_paper_processed:
-                on_paper_processed(
-                    {
-                        "status": "processed",
-                        "paper_title": paper.title,
-                        "paper_index": paper_index,
-                        "paper_total": total_papers,
-                        "graph": graph,
-                    }
-                )
+
+            embedding_text = (
+                paper.summary if paper.summary else text_for_extraction[:1000]
+            )
+            pending_embedding_batch.append(
+                {
+                    "paper": paper,
+                    "paper_index": paper_index,
+                    "paper_total": total_papers,
+                    "embedding_text": embedding_text,
+                }
+            )
+            if len(pending_embedding_batch) >= embed_batch_size:
+                flush_embedding_batch()
+
+        flush_embedding_batch()
         
         logger.info(f"Processed {len(papers_to_process)} papers, {len(self.topics)} unique topics in this batch")
         
@@ -344,10 +373,12 @@ class GraphBuilder:
                 filename, file_content = file_tuple
                 content_hash = None
             # Extract text from PDF
-            text = extract_text_from_pdf(file_content)
+            with timed_block("extract_pdf_text_per_paper"):
+                text = extract_text_from_pdf(file_content)
             
             # Extract metadata using LLM (with internal heuristic fallback)
-            metadata = extractor.extract_paper_metadata(text)
+            with timed_block("extract_metadata_per_paper"):
+                metadata = extractor.extract_paper_metadata(text)
             
             # Use extracted title if available, otherwise use filename
             title = metadata.get('title') or Path(filename).stem
@@ -384,10 +415,12 @@ class GraphBuilder:
         parsed_papers = []
         for pdf_file in path.rglob("*.pdf"):
             # Extract text from PDF
-            text = extract_text_from_pdf(str(pdf_file))
+            with timed_block("extract_pdf_text_per_paper"):
+                text = extract_text_from_pdf(str(pdf_file))
             
             # Extract metadata using LLM (with internal heuristic fallback)
-            metadata = extractor.extract_paper_metadata(text)
+            with timed_block("extract_metadata_per_paper"):
+                metadata = extractor.extract_paper_metadata(text)
             
             # Use extracted title if available, otherwise use filename
             title = metadata.get('title') or pdf_file.stem
