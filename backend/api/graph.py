@@ -144,117 +144,125 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
 
         async with app.state.graph_lock:
             existing_graph = app.state.graph
-            if existing_graph is None:
-                with timed_block("load_graph_for_job"):
-                    existing_graph = load_graph()
+        if existing_graph is None:
+            with timed_block("load_graph_for_job"):
+                loaded_graph = load_graph()
+            async with app.state.graph_lock:
+                if app.state.graph is None:
+                    app.state.graph = loaded_graph
+                existing_graph = app.state.graph
 
-            existing_hashes = getattr(existing_graph, "paper_content_hashes", set()) if existing_graph else set()
-            filtered_files = []
-            progress_count = 0
-            for filename, file_bytes, content_hash in files_data:
-                if content_hash and content_hash in existing_hashes:
-                    progress_count += 1
-                    jobs[job_id]["paper_index"] = progress_count
-                    jobs[job_id]["current_paper"] = filename
-                    broadcast_event(
-                        app,
-                        "paper_processed",
-                        {
-                            "job_id": job_id,
-                            "paper_title": filename,
-                            "paper_index": progress_count,
-                            "paper_total": len(files_data),
-                            "status": "skipped",
-                            "reason": "duplicate_hash",
-                        },
-                    )
-                    continue
-                filtered_files.append((filename, file_bytes, content_hash))
-
-            if not filtered_files:
-                if existing_graph:
-                    app.state.graph = existing_graph
-                jobs[job_id]["status"] = "done"
-                jobs[job_id]["processing"] = False
-                jobs[job_id]["paper_index"] = len(files_data)
-                jobs[job_id]["finished_at"] = time.time()
+        existing_hashes = (
+            getattr(existing_graph, "paper_content_hashes", set()) if existing_graph else set()
+        )
+        filtered_files = []
+        progress_count = 0
+        for filename, file_bytes, content_hash in files_data:
+            if content_hash and content_hash in existing_hashes:
+                progress_count += 1
+                jobs[job_id]["paper_index"] = progress_count
+                jobs[job_id]["current_paper"] = filename
                 broadcast_event(
                     app,
-                    "job_done",
+                    "paper_processed",
                     {
                         "job_id": job_id,
-                        "status": "done",
+                        "paper_title": filename,
+                        "paper_index": progress_count,
                         "paper_total": len(files_data),
-                        "paper_index": len(files_data),
+                        "status": "skipped",
+                        "reason": "duplicate_hash",
                     },
                 )
-                return
+                continue
+            filtered_files.append((filename, file_bytes, content_hash))
 
-            builder = GraphBuilder()
-            snapshot_every = max(0, INGEST_SNAPSHOT_EVERY_PAPERS)
-            checkpoint_every = max(0, INGEST_CHECKPOINT_EVERY_PAPERS)
-            processed_count = 0
-
-            def on_paper_processed(payload: dict) -> None:
-                nonlocal progress_count, processed_count
-                progress_count += 1
-                paper_title = payload.get("paper_title")
-                jobs[job_id]["paper_index"] = progress_count
-                jobs[job_id]["current_paper"] = paper_title
-                status = payload.get("status")
-                if status == "processed":
-                    processed_count += 1
-
-                event_payload = {
+        if not filtered_files:
+            if existing_graph:
+                async with app.state.graph_lock:
+                    app.state.graph = existing_graph
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["processing"] = False
+            jobs[job_id]["paper_index"] = len(files_data)
+            jobs[job_id]["finished_at"] = time.time()
+            broadcast_event(
+                app,
+                "job_done",
+                {
                     "job_id": job_id,
-                    "paper_title": paper_title,
-                    "paper_index": progress_count,
+                    "status": "done",
                     "paper_total": len(files_data),
-                    "status": status,
-                    "reason": payload.get("reason"),
-                }
-                should_include_snapshot = (
-                    status == "processed"
-                    and snapshot_every > 0
-                    and progress_count % snapshot_every == 0
+                    "paper_index": len(files_data),
+                },
+            )
+            return
+
+        builder = GraphBuilder()
+        snapshot_every = max(0, INGEST_SNAPSHOT_EVERY_PAPERS)
+        checkpoint_every = max(0, INGEST_CHECKPOINT_EVERY_PAPERS)
+        processed_count = 0
+
+        def on_paper_processed(payload: dict) -> None:
+            nonlocal progress_count, processed_count
+            progress_count += 1
+            paper_title = payload.get("paper_title")
+            jobs[job_id]["paper_index"] = progress_count
+            jobs[job_id]["current_paper"] = paper_title
+            status = payload.get("status")
+            if status == "processed":
+                processed_count += 1
+
+            event_payload = {
+                "job_id": job_id,
+                "paper_title": paper_title,
+                "paper_index": progress_count,
+                "paper_total": len(files_data),
+                "status": status,
+                "reason": payload.get("reason"),
+            }
+            should_include_snapshot = (
+                status == "processed"
+                and snapshot_every > 0
+                and progress_count % snapshot_every == 0
+            )
+            graph_snapshot = payload.get("graph")
+            if status == "processed" and graph_snapshot is not None:
+                if checkpoint_every > 0 and processed_count % checkpoint_every == 0:
+                    with timed_block("save_graph_checkpoint"):
+                        save_graph(graph_snapshot)
+                if should_include_snapshot:
+                    app.state.graph = graph_snapshot
+                    with timed_block("ingest_snapshot_payload_build"):
+                        event_payload["graph"] = build_graph_payload(graph_snapshot)
+            broadcast_event(app, "paper_processed", event_payload)
+
+        with timed_block("build_graph_job"):
+            from services.verification import verify_bipartite
+
+            if existing_graph:
+                updated_graph = builder.build_graph(
+                    files_data=filtered_files,
+                    existing_graph=existing_graph,
+                    on_paper_processed=on_paper_processed,
                 )
-                graph_snapshot = payload.get("graph")
-                if status == "processed" and graph_snapshot is not None:
-                    if checkpoint_every > 0 and processed_count % checkpoint_every == 0:
-                        with timed_block("save_graph_checkpoint"):
-                            save_graph(graph_snapshot)
-                    if should_include_snapshot:
-                        app.state.graph = graph_snapshot
-                        with timed_block("ingest_snapshot_payload_build"):
-                            event_payload["graph"] = build_graph_payload(graph_snapshot)
-                broadcast_event(app, "paper_processed", event_payload)
+                logger.info(
+                    "Verifying %s new nodes and %s new edges...",
+                    len(updated_graph.new_nodes),
+                    len(updated_graph.new_edges),
+                )
+                verify_bipartite(updated_graph, updated_graph.new_nodes, updated_graph.new_edges)
+                updated_graph.clear_incremental_tracking()
+            else:
+                updated_graph = builder.build_graph(
+                    files_data=filtered_files,
+                    on_paper_processed=on_paper_processed,
+                )
+                logger.info("Verifying entire graph...")
+                verify_bipartite(updated_graph)
 
-            with timed_block("build_graph_job"):
-                from services.verification import verify_bipartite
-
-                if existing_graph:
-                    updated_graph = builder.build_graph(
-                        files_data=filtered_files,
-                        existing_graph=existing_graph,
-                        on_paper_processed=on_paper_processed,
-                    )
-                    logger.info(
-                        "Verifying %s new nodes and %s new edges...",
-                        len(updated_graph.new_nodes),
-                        len(updated_graph.new_edges),
-                    )
-                    verify_bipartite(updated_graph, updated_graph.new_nodes, updated_graph.new_edges)
-                    updated_graph.clear_incremental_tracking()
-                else:
-                    updated_graph = builder.build_graph(
-                        files_data=filtered_files,
-                        on_paper_processed=on_paper_processed,
-                    )
-                    logger.info("Verifying entire graph...")
-                    verify_bipartite(updated_graph)
-
-            with timed_block("save_graph_job"):
-                save_graph(updated_graph)
+        with timed_block("save_graph_job"):
+            save_graph(updated_graph)
+        async with app.state.graph_lock:
             app.state.graph = updated_graph
             app.state.agent = None
             app.state.agent_graph_identity = None
