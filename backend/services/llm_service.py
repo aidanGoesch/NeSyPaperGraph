@@ -287,18 +287,18 @@ class OpenAILLMClient:
     def generate_summary(self, text: str) -> str:
         """Generate a summary of the paper text"""
         # Keep summary input tighter so output tokens are available.
-        max_chars = int(os.getenv("SUMMARY_MAX_INPUT_CHARS", "12000") or "12000")
+        max_chars = int(os.getenv("SUMMARY_MAX_INPUT_CHARS", "4500") or "4500")
         original_len = len(text)
         truncated = False
         if original_len > max_chars:
             text = text[:max_chars] + "..."
             truncated = True
         
-        prompt = f"""Summarize this research paper in 4-6 concise sentences.
+        prompt = f"""Summarize this research paper in 3-4 concise sentences.
 Requirements:
 - Start immediately with content (no heading/title/preamble)
 - Cover objective, method, key results, and implications
-- Keep total length under 180 words
+- Keep total length under 120 words
 
 Paper text:
 {text}"""
@@ -313,7 +313,7 @@ Paper text:
             summary = self._generate_with_api(
                 prompt=prompt,
                 context="summary_primary",
-                max_tokens=900,
+                max_tokens=450,
             ).strip()
             if summary:
                 return summary
@@ -324,8 +324,8 @@ Paper text:
         # All retries failed - attempt alternate simple prompt
         logger.error("Failed to generate summary after primary attempts, trying alternate prompt")
         reduced_text = text[: min(len(text), max_chars // 2)]
-        alt_prompt = f"""Write a short abstract-style summary in 3-5 sentences.
-Keep it under 120 words and include method + core finding.
+        alt_prompt = f"""Write a short abstract-style summary in 2-3 sentences.
+Keep it under 80 words and include method + core finding.
 
 Paper text:
 {reduced_text}"""
@@ -333,7 +333,7 @@ Paper text:
             summary = self._generate_with_api(
                 prompt=alt_prompt,
                 context="summary_alternate",
-                max_tokens=500,
+                max_tokens=250,
             ).strip()
             if summary:
                 logger.warning(

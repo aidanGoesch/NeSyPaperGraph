@@ -23,6 +23,9 @@ SSE_HEARTBEAT_SECONDS = 15
 INGEST_SNAPSHOT_EVERY_PAPERS = int(
     os.getenv("INGEST_SNAPSHOT_EVERY_PAPERS", "5") or "5"
 )
+INGEST_CHECKPOINT_EVERY_PAPERS = int(
+    os.getenv("INGEST_CHECKPOINT_EVERY_PAPERS", "3") or "3"
+)
 
 
 def prune_jobs(jobs: dict) -> None:
@@ -189,30 +192,38 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
 
             builder = GraphBuilder()
             snapshot_every = max(0, INGEST_SNAPSHOT_EVERY_PAPERS)
+            checkpoint_every = max(0, INGEST_CHECKPOINT_EVERY_PAPERS)
+            processed_count = 0
 
             def on_paper_processed(payload: dict) -> None:
-                nonlocal progress_count
+                nonlocal progress_count, processed_count
                 progress_count += 1
                 paper_title = payload.get("paper_title")
                 jobs[job_id]["paper_index"] = progress_count
                 jobs[job_id]["current_paper"] = paper_title
+                status = payload.get("status")
+                if status == "processed":
+                    processed_count += 1
 
                 event_payload = {
                     "job_id": job_id,
                     "paper_title": paper_title,
                     "paper_index": progress_count,
                     "paper_total": len(files_data),
-                    "status": payload.get("status"),
+                    "status": status,
                     "reason": payload.get("reason"),
                 }
                 should_include_snapshot = (
-                    payload.get("status") == "processed"
+                    status == "processed"
                     and snapshot_every > 0
                     and progress_count % snapshot_every == 0
                 )
-                if should_include_snapshot:
-                    graph_snapshot = payload.get("graph")
-                    if graph_snapshot is not None:
+                graph_snapshot = payload.get("graph")
+                if status == "processed" and graph_snapshot is not None:
+                    if checkpoint_every > 0 and processed_count % checkpoint_every == 0:
+                        with timed_block("save_graph_checkpoint"):
+                            save_graph(graph_snapshot)
+                    if should_include_snapshot:
                         app.state.graph = graph_snapshot
                         with timed_block("ingest_snapshot_payload_build"):
                             event_payload["graph"] = build_graph_payload(graph_snapshot)

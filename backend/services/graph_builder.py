@@ -19,6 +19,7 @@ MAX_TOPICS_TRACKED = int(os.getenv("MAX_TOPICS_TRACKED", "5000") or "5000")
 MAX_TOPIC_SYNONYMS_CACHE = int(os.getenv("MAX_TOPIC_SYNONYMS_CACHE", "5000") or "5000")
 MAX_PERSISTED_TEXT_CHARS = int(os.getenv("MAX_PERSISTED_TEXT_CHARS", "0") or "0")
 INGEST_EMBED_BATCH_SIZE = int(os.getenv("INGEST_EMBED_BATCH_SIZE", "8") or "8")
+SUMMARY_SOURCE_MAX_CHARS = int(os.getenv("SUMMARY_SOURCE_MAX_CHARS", "7000") or "7000")
 
 
 def _cap_set_size(items: set, max_size: int) -> None:
@@ -278,14 +279,15 @@ class GraphBuilder:
 
             paper.topics = topics
 
+            summary_source_text = text_for_extraction[:SUMMARY_SOURCE_MAX_CHARS]
             with timed_block("generate_summary_per_paper"):
-                summary = client.generate_summary(text_for_extraction)
-            if not summary and text_for_extraction:
+                summary = client.generate_summary(summary_source_text)
+            if not summary and summary_source_text:
                 logger.warning(
                     "[Summary] Empty summary returned for paper '%s'. Using heuristic summary based on source text.",
                     paper.title,
                 )
-                summary = text_for_extraction[:1000]
+                summary = summary_source_text[:1000]
             paper.summary = summary
 
             new_topics = set(topics) - accumulated_topics
