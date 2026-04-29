@@ -537,6 +537,10 @@ Extract the title, authors, and publication date in JSON format."""
         logger.error("Failed to extract valid metadata via LLM after all attempts; using heuristic parser")
         return self._heuristic_metadata(text)
 
+    def heuristic_metadata(self, text: str) -> dict:
+        """Public wrapper for heuristic metadata extraction."""
+        return self._heuristic_metadata(text)
+
     def extract_topics(self, text, current_topics=None, max_chars=8000):
         """
         Extract exactly 8 topics from text.

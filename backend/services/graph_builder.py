@@ -1,6 +1,7 @@
 from models.graph import PaperGraph
 from models.paper import Paper
 from services.llm_service import TopicExtractor, OpenAILLMClient
+from services.grobid_service import GrobidService
 from services.pdf_preprocessor import extract_text_from_pdf
 import logging
 import os
@@ -362,10 +363,10 @@ class GraphBuilder:
         Args:
             files_data: List of tuples (filename, file_content_bytes)
         """
-        # Initialize LLM client for metadata extraction
-        from .llm_service import OpenAILLMClient, TopicExtractor
-        client = OpenAILLMClient()
-        extractor = TopicExtractor(client)
+        metadata_extractor = TopicExtractor(None)
+        grobid = GrobidService()
+        grobid_success_count = 0
+        fallback_count = 0
         
         parsed_papers = []
         for file_tuple in files_data:
@@ -378,9 +379,15 @@ class GraphBuilder:
             with timed_block("extract_pdf_text_per_paper"):
                 text = extract_text_from_pdf(file_content)
             
-            # Extract metadata using LLM (with internal heuristic fallback)
-            with timed_block("extract_metadata_per_paper"):
-                metadata = extractor.extract_paper_metadata(text)
+            metadata = None
+            if grobid.enabled:
+                metadata = grobid.extract_metadata(file_content)
+                if metadata.get("ok"):
+                    grobid_success_count += 1
+            if not metadata or not metadata.get("ok"):
+                fallback_count += 1
+                with timed_block("metadata_fallback_heuristic_per_paper"):
+                    metadata = metadata_extractor.heuristic_metadata(text)
             
             # Use extracted title if available, otherwise use filename
             title = metadata.get('title') or Path(filename).stem
@@ -399,6 +406,13 @@ class GraphBuilder:
             )
             parsed_papers.append(paper)
             self.papers.append(paper)
+
+        logger.info(
+            "Metadata extraction summary | papers=%s | grobid_success=%s | heuristic_fallback=%s",
+            len(parsed_papers),
+            grobid_success_count,
+            fallback_count,
+        )
         
         return parsed_papers
 
@@ -407,10 +421,10 @@ class GraphBuilder:
         Gets all of the pdfs in the given file path and all of its sub folders.
         Legacy method for backward compatibility.
         """
-        # Initialize LLM client for metadata extraction
-        from .llm_service import OpenAILLMClient, TopicExtractor
-        client = OpenAILLMClient()
-        extractor = TopicExtractor(client)
+        metadata_extractor = TopicExtractor(None)
+        grobid = GrobidService()
+        grobid_success_count = 0
+        fallback_count = 0
         
         path = Path(file_path)
         
@@ -420,9 +434,16 @@ class GraphBuilder:
             with timed_block("extract_pdf_text_per_paper"):
                 text = extract_text_from_pdf(str(pdf_file))
             
-            # Extract metadata using LLM (with internal heuristic fallback)
-            with timed_block("extract_metadata_per_paper"):
-                metadata = extractor.extract_paper_metadata(text)
+            metadata = None
+            if grobid.enabled:
+                with pdf_file.open("rb") as handle:
+                    metadata = grobid.extract_metadata(handle.read())
+                if metadata.get("ok"):
+                    grobid_success_count += 1
+            if not metadata or not metadata.get("ok"):
+                fallback_count += 1
+                with timed_block("metadata_fallback_heuristic_per_paper"):
+                    metadata = metadata_extractor.heuristic_metadata(text)
             
             # Use extracted title if available, otherwise use filename
             title = metadata.get('title') or pdf_file.stem
@@ -440,6 +461,13 @@ class GraphBuilder:
             )
             parsed_papers.append(paper)
             self.papers.append(paper)
+
+        logger.info(
+            "Metadata extraction summary | papers=%s | grobid_success=%s | heuristic_fallback=%s",
+            len(parsed_papers),
+            grobid_success_count,
+            fallback_count,
+        )
         
         return parsed_papers
 

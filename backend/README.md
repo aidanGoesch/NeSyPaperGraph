@@ -28,6 +28,7 @@ backend/
 
 ## Core Features
 - PDF upload and text extraction
+- GROBID-first metadata extraction (title/authors/date) with heuristic fallback
 - LLM-based topic extraction
 - Graph generation and analysis
 - Paper recommendation system (stretch goal)
@@ -37,3 +38,11 @@ backend/
 pip install -r requirements.txt
 uvicorn main:app --reload
 ```
+
+## GROBID Metadata Extraction
+- Ingest metadata now uses GROBID when available, then falls back to a local heuristic parser.
+- Relevant env vars:
+  - `GROBID_ENABLED=true`
+  - `GROBID_URL=http://localhost:8070`
+  - `GROBID_TIMEOUT_SECONDS=8.0`
+- When using Docker Compose, backend is configured to call `http://grobid:8070`.
