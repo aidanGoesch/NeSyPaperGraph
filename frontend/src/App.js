@@ -1,12 +1,16 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import { marked } from "marked";
 import GraphVisualization from "./GraphVisualization";
+import TopicWorkspace from "./components/topic-workspace/TopicWorkspace";
+import { useWorkspaceStore } from "./state/workspaceStore";
 import mermaid from "mermaid";
 import "./App.css";
+import "./components/topic-workspace/topicWorkspace.css";
 
 function App() {
     const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000";
+    const FORCE_DUMMY_DATA = process.env.REACT_APP_USE_DUMMY_DATA === "true";
     const ACCESS_KEY_STORAGE_KEY = "nesy_access_key";
     const [accessKey, setAccessKey] = useState(
         () => localStorage.getItem(ACCESS_KEY_STORAGE_KEY) || ""
@@ -32,6 +36,9 @@ function App() {
     const [highlightPath, setHighlightPath] = useState(null);
     const [uploadStatus, setUploadStatus] = useState(null);
     const [recentlyCompletedPapers, setRecentlyCompletedPapers] = useState([]);
+    const [activeView, setActiveView] = useState("graph");
+    const [pendingFocus, setPendingFocus] = useState(null);
+    const visibleGraphData = graphData || lastGraphData;
 
     // Function to handle paper citation clicks
     const handlePaperCitationClick = (paperTitle) => {
@@ -92,19 +99,27 @@ function App() {
     const architectureLoadedRef = useRef(false);
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    const apiFetch = async (url, options = {}) => {
-        const headers = { ...(options.headers || {}) };
-        if (accessKey) {
-            headers["X-Access-Key"] = accessKey;
-        }
-        const response = await fetch(url, { ...options, headers });
-        if (response.status === 401) {
-            setAuthError("Invalid access key. Please try again.");
-            setAccessKey("");
-            localStorage.removeItem(ACCESS_KEY_STORAGE_KEY);
-        }
-        return response;
-    };
+    const apiFetch = useCallback(
+        async (url, options = {}) => {
+            const headers = { ...(options.headers || {}) };
+            if (accessKey) {
+                headers["X-Access-Key"] = accessKey;
+            }
+            const response = await fetch(url, { ...options, headers });
+            if (response.status === 401) {
+                setAuthError("Invalid access key. Please try again.");
+                setAccessKey("");
+                localStorage.removeItem(ACCESS_KEY_STORAGE_KEY);
+            }
+            return response;
+        },
+        [accessKey]
+    );
+    const workspaceStore = useWorkspaceStore({
+        apiBase: API_BASE,
+        apiFetch,
+        isEnabled: Boolean(accessKey),
+    });
 
     const probeBackendReachable = async () => {
         try {
@@ -125,6 +140,15 @@ function App() {
             return graphLoadPromiseRef.current;
         }
 
+        const loadDummyGraph = async () => {
+            const fallbackResponse = await apiFetch(`${API_BASE}/api/graph/dummy`);
+            if (!fallbackResponse.ok) return false;
+            const fallbackData = await fallbackResponse.json();
+            setGraphData(fallbackData);
+            setLastGraphData(fallbackData);
+            return true;
+        };
+
         const loadPromise = (async () => {
         if (!accessKey) {
             setGraphData(null);
@@ -134,6 +158,14 @@ function App() {
         setIsBootingBackend(true);
         setBackendBootMessage("Waking backend...");
         setUploadError(null);
+
+        if (FORCE_DUMMY_DATA) {
+            const loadedDummy = await loadDummyGraph();
+            if (loadedDummy) {
+                setIsBootingBackend(false);
+                return;
+            }
+        }
 
         const maxAttempts = 8;
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -157,12 +189,10 @@ function App() {
                     await sleep(Math.min(1000 * 2 ** (attempt - 1), 8000));
                     continue;
                 }
-                if (response.status === 404) {
-                    const fallbackResponse = await apiFetch(`${API_BASE}/api/graph/dummy`);
-                    if (fallbackResponse.ok) {
-                        const fallbackData = await fallbackResponse.json();
-                        setGraphData(fallbackData);
-                        setLastGraphData(fallbackData);
+                // If loading a persisted graph fails, fall back to dummy graph.
+                if (response.status === 404 || response.status >= 500) {
+                    const loadedDummy = await loadDummyGraph();
+                    if (loadedDummy) {
                         setIsBootingBackend(false);
                         return;
                     }
@@ -475,6 +505,17 @@ function App() {
         };
     }, [API_BASE, accessKey]);
 
+    useEffect(() => {
+        if (activeView !== "graph" || !pendingFocus || !graphRef.current) return;
+        if (pendingFocus.type === "paper" && graphRef.current.focusOnPaper) {
+            graphRef.current.focusOnPaper(pendingFocus.value);
+        }
+        if (pendingFocus.type === "topic" && graphRef.current.focusOnTopic) {
+            graphRef.current.focusOnTopic(pendingFocus.value);
+        }
+        setPendingFocus(null);
+    }, [activeView, pendingFocus, visibleGraphData]);
+
     const showAgentArchitecture = async () => {
         if (architectureLoadedRef.current && agentArchitectureDiagram) {
             setShowMermaid(true);
@@ -703,8 +744,6 @@ function App() {
         }
     };
 
-    const visibleGraphData = graphData || lastGraphData;
-
     return (
         <div className={`app ${isDarkMode ? "dark" : "light"}`}>
             {!accessKey && (
@@ -724,13 +763,40 @@ function App() {
                     </form>
                 </div>
             )}
-            <div className="theme-toggle">
-                <button onClick={() => setIsDarkMode(!isDarkMode)}>
-                    {isDarkMode ? "☀️" : "🌙"}
-                </button>
-            </div>
             <header className="app-header">
+                <div className="header-left-controls">
+                    <button
+                        onClick={() =>
+                            document.getElementById("file-upload").click()
+                        }
+                        className="upload-button"
+                        disabled={!accessKey}
+                    >
+                        {isUploading ? "📁 Upload More Papers" : "📁 Upload Papers"}
+                    </button>
+                    <div className="theme-toggle">
+                        <button onClick={() => setIsDarkMode(!isDarkMode)}>
+                            {isDarkMode ? "☀️" : "🌙"}
+                        </button>
+                    </div>
+                </div>
                 <h1>Paper Graph Visualization</h1>
+                <div className="view-toggle">
+                    <button
+                        type="button"
+                        className={activeView === "graph" ? "active" : ""}
+                        onClick={() => setActiveView("graph")}
+                    >
+                        Graph View
+                    </button>
+                    <button
+                        type="button"
+                        className={activeView === "workspace" ? "active" : ""}
+                        onClick={() => setActiveView("workspace")}
+                    >
+                        Topic Workspace
+                    </button>
+                </div>
             </header>
             <main className="app-main">
                 {isBootingBackend ? (
@@ -744,6 +810,22 @@ function App() {
                         </div>
                         <div className="skeleton-status">{backendBootMessage}</div>
                     </div>
+                ) : activeView === "workspace" && visibleGraphData ? (
+                    <TopicWorkspace
+                        graphData={visibleGraphData}
+                        workspaceStore={workspaceStore}
+                        onFocusPaper={(paperTitle) => {
+                            setHighlightPath(null);
+                            setActiveView("graph");
+                            setPendingFocus({ type: "paper", value: paperTitle });
+                        }}
+                        onSetGraphHighlight={(pathPayload) =>
+                            setHighlightPath({
+                                mode: "selection",
+                                nodes: pathPayload?.nodes || [],
+                            })
+                        }
+                    />
                 ) : visibleGraphData ? (
                     <GraphVisualization
                         key={visibleGraphData.papers?.length || 0}
@@ -766,15 +848,6 @@ function App() {
                     style={{ display: "none" }}
                     id="file-upload"
                 />
-                <button
-                    onClick={() =>
-                        document.getElementById("file-upload").click()
-                    }
-                    className="upload-button"
-                    disabled={!accessKey}
-                >
-                    {isUploading ? "📁 Upload More Papers" : "📁 Upload Papers"}
-                </button>
                 {isUploading && (
                     <div
                         style={{
@@ -815,7 +888,21 @@ function App() {
                         Error: {uploadError}
                     </div>
                 )}
-                {!showChatPanel && (
+                {workspaceStore.syncWarning && (
+                    <div
+                        style={{
+                            marginTop: "10px",
+                            color: "#b65c00",
+                            background: "rgba(255, 193, 7, 0.12)",
+                            border: "1px solid rgba(182, 92, 0, 0.45)",
+                            borderRadius: "8px",
+                            padding: "8px 10px",
+                        }}
+                    >
+                        {workspaceStore.syncWarning}
+                    </div>
+                )}
+                {activeView === "graph" && !showChatPanel && (
                     <input
                         type="text"
                         placeholder="Ask a Question... (or :topic=name, :paper=title)"
@@ -844,7 +931,7 @@ function App() {
                         ref={searchInputRef}
                     />
                 )}
-                {showChatPanel && (
+                {activeView === "graph" && showChatPanel && (
                     <div
                         className={`chat-panel-wrapper ${
                             isDarkMode ? "dark" : "light"

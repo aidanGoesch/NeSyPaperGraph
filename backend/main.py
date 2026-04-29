@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from api.graph import router as graph_router, start_queue_worker, stop_queue_worker
+from api.workspace import router as workspace_router
 from services.storage_service import load_graph
 from services.observability import log_memory, timed_block
 from dotenv import load_dotenv
@@ -159,6 +160,7 @@ app.add_middleware(
 )
 
 app.include_router(graph_router, prefix="/api")
+app.include_router(workspace_router, prefix="/api")
 
 @app.get("/api/agent/architecture")
 def get_agent_architecture():

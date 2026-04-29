@@ -38,22 +38,28 @@ body {
   color: #ccc;
 }
 
+.header-left-controls {
+  position: absolute;
+  left: 20px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .theme-toggle {
-  position: fixed;
-  bottom: 10px;
-  left: 10px;
-  z-index: 1000;
+  position: static;
 }
 
 .theme-toggle button {
   background: rgba(0, 0, 0, 0.1);
-  border: none;
-  border-radius: 50%;
-  width: 40px;
-  height: 40px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 8px;
+  width: 38px;
+  height: 34px;
   font-size: 16px;
   cursor: pointer;
   transition: all 0.3s ease;
+  padding: 0;
 }
 
 .theme-toggle button:hover {
@@ -86,18 +92,15 @@ body {
 }
 
 .upload-button {
-  position: fixed;
-  bottom: 20px;
-  right: 20px;
+  position: static;
   background: rgba(0, 0, 0, 0.05);
   color: #333;
   border: 1px solid rgba(0, 0, 0, 0.1);
-  padding: 12px 20px;
-  font-size: 14px;
+  padding: 8px 12px;
+  font-size: 13px;
   border-radius: 6px;
   cursor: pointer;
   transition: all 0.5s ease;
-  z-index: 1000;
 }
 
 .app.dark .upload-button {
