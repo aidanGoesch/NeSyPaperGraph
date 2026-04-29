@@ -4,7 +4,7 @@ from tempfile import NamedTemporaryFile
 import resource
 import logging
 
-from services.observability import timed_block
+from services.observability import timed_block, log_memory
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,7 @@ class DoclingService:
         self._converter = None
 
     def parse_pdf(self, pdf_bytes: bytes) -> dict[str, Any]:
+        log_memory("docling_parse_pdf_start")
         if not self.enabled:
             return self._empty_result("disabled")
         if not pdf_bytes:
@@ -32,8 +33,10 @@ class DoclingService:
                 parsed = self._run_docling(pdf_bytes)
             parsed["source"] = "docling"
             parsed["ok"] = bool(parsed.get("text"))
+            log_memory("docling_parse_pdf_end")
             return parsed
         except Exception:
+            log_memory("docling_parse_pdf_error")
             return self._empty_result("docling_error")
 
     def _run_docling(self, pdf_bytes: bytes) -> dict[str, Any]:
@@ -44,8 +47,10 @@ class DoclingService:
 
         if self._converter is None:
             logger.info("Before Docling init: %.0f MB", mem_mb())
+            log_memory("docling_before_converter_init")
             self._converter = DocumentConverter()
             logger.info("After Docling init: %.0f MB", mem_mb())
+            log_memory("docling_after_converter_init")
 
         with NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
             tmp.write(pdf_bytes)

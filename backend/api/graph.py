@@ -141,6 +141,7 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
     try:
         if not os.getenv("OPENAI_API_KEY"):
             raise RuntimeError("OPENAI_API_KEY environment variable not set")
+        log_memory(f"job_{job_id}_before_graph_load")
 
         async with app.state.graph_lock:
             existing_graph = app.state.graph
@@ -151,6 +152,7 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
                 if app.state.graph is None:
                     app.state.graph = loaded_graph
                 existing_graph = app.state.graph
+        log_memory(f"job_{job_id}_after_graph_load")
 
         existing_hashes = (
             getattr(existing_graph, "paper_content_hashes", set()) if existing_graph else set()
@@ -197,6 +199,7 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
             )
             return
 
+        log_memory(f"job_{job_id}_before_build_graph")
         builder = GraphBuilder()
         snapshot_every = max(0, INGEST_SNAPSHOT_EVERY_PAPERS)
         checkpoint_every = max(0, INGEST_CHECKPOINT_EVERY_PAPERS)
@@ -259,13 +262,16 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
                 )
                 logger.info("Verifying entire graph...")
                 verify_bipartite(updated_graph)
+        log_memory(f"job_{job_id}_after_build_graph")
 
         with timed_block("save_graph_job"):
             save_graph(updated_graph)
+        log_memory(f"job_{job_id}_after_save_graph")
         async with app.state.graph_lock:
             app.state.graph = updated_graph
             app.state.agent = None
             app.state.agent_graph_identity = None
+        log_memory(f"job_{job_id}_after_graph_state_commit")
 
         jobs[job_id]["status"] = "done"
         jobs[job_id]["processing"] = False
@@ -356,6 +362,7 @@ async def upload_papers(
         raise HTTPException(status_code=400, detail="No files provided")
     
     # Read all files into memory (don't save to disk)
+    log_memory("upload_endpoint_before_file_read")
     files_data = []
     filenames = []
     for file in files:
@@ -370,6 +377,7 @@ async def upload_papers(
         file_hash = hashlib.sha256(contents).hexdigest()
         files_data.append((file.filename, contents, file_hash))
         filenames.append(file.filename)
+    log_memory("upload_endpoint_after_file_read")
 
     if not files_data:
         raise HTTPException(status_code=400, detail="No valid PDF files found")
@@ -449,6 +457,7 @@ async def graph_stream(request: Request):
 async def load_saved_graph(request: Request):
     """Load previously saved graph data"""
     try:
+        log_memory("graph_load_endpoint_start")
         async with request.app.state.graph_lock:
             graph = request.app.state.graph
             if graph is None:
@@ -456,6 +465,7 @@ async def load_saved_graph(request: Request):
                     logger.info("Loading graph from S3...")
                     graph = load_graph()
                 request.app.state.graph = graph
+        log_memory("graph_load_endpoint_after_graph_lock")
 
         if graph is None:
             raise HTTPException(status_code=404, detail="No saved graph found")

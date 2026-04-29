@@ -7,7 +7,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Callable, Optional
-from services.observability import timed_block
+from services.observability import timed_block, log_memory
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,7 @@ class GraphBuilder:
             existing_graph: Existing PaperGraph to update, or None to create new
         """
         global _topic_synonyms_cache
+        log_memory("graph_builder_build_graph_start")
         
         # Use existing graph or create new one
         if existing_graph:
@@ -132,6 +133,7 @@ class GraphBuilder:
         
         # Use OpenAI assistant (reads assistant_id from environment)
         client = OpenAILLMClient()
+        log_memory("graph_builder_after_openai_client_init")
         extractor = TopicExtractor(client)
         from services.verification import verify_bipartite, find_optimal_topic_merge
         
@@ -315,6 +317,7 @@ class GraphBuilder:
                 flush_embedding_batch()
 
         flush_embedding_batch()
+        log_memory("graph_builder_after_embedding_batches")
         
         logger.info(f"Processed {len(papers_to_process)} papers, {len(self.topics)} unique topics in this batch")
         
@@ -352,6 +355,7 @@ class GraphBuilder:
         with timed_block("add_semantic_edges"):
             graph.add_semantic_edges()
         logger.info("Semantic edges added")
+        log_memory("graph_builder_build_graph_end")
         
         return graph
 
@@ -365,6 +369,7 @@ class GraphBuilder:
         """
         metadata_extractor = TopicExtractor(None)
         docling = DoclingService()
+        log_memory("graph_builder_get_papers_from_data_start")
         docling_success_count = 0
         fallback_count = 0
         metadata_complete_count = 0
@@ -419,6 +424,7 @@ class GraphBuilder:
             fallback_count,
             metadata_complete_count,
         )
+        log_memory("graph_builder_get_papers_from_data_end")
         
         return parsed_papers
 

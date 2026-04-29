@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+log_memory("module_loaded_after_imports")
 
 def signal_handler(sig, frame):
     print('\nShutting down gracefully...')
@@ -80,6 +81,7 @@ def get_current_graph(app: FastAPI):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log_memory("lifespan_enter")
     app.state.jobs = {}
     app.state.graph = None
     app.state.graph_lock = asyncio.Lock()
@@ -93,7 +95,9 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    log_memory("lifespan_before_shutdown")
     await stop_queue_worker(app)
+    log_memory("lifespan_after_shutdown")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -101,6 +105,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
 async def enforce_access_key(request: Request, call_next):
+    log_memory(f"http_request_start {request.method} {request.url.path}")
     """
     Optional shared-key guard for API routes.
     Set APP_ACCESS_KEY in env to require clients to send X-Access-Key.
@@ -128,7 +133,9 @@ async def enforce_access_key(request: Request, call_next):
     if not secrets.compare_digest(provided_key, required_key):
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
-    return await call_next(request)
+    response = await call_next(request)
+    log_memory(f"http_request_end {request.method} {request.url.path}")
+    return response
 
 configured_origins = [
     origin.strip()
