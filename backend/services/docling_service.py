@@ -1,8 +1,12 @@
 import os
 from typing import Any
 from tempfile import NamedTemporaryFile
+import resource
+import logging
 
 from services.observability import timed_block
+
+logger = logging.getLogger(__name__)
 
 
 class DoclingService:
@@ -15,6 +19,7 @@ class DoclingService:
         }
         self.max_pages = int(os.getenv("DOCLING_MAX_PAGES", "2") or "2")
         self.max_text_chars = int(os.getenv("DOCLING_MAX_TEXT_CHARS", "8000") or "8000")
+        self._converter = None
 
     def parse_pdf(self, pdf_bytes: bytes) -> dict[str, Any]:
         if not self.enabled:
@@ -34,12 +39,20 @@ class DoclingService:
     def _run_docling(self, pdf_bytes: bytes) -> dict[str, Any]:
         from docling.document_converter import DocumentConverter
 
+        def mem_mb() -> float:
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+        if self._converter is None:
+            logger.info("Before Docling init: %.0f MB", mem_mb())
+            self._converter = DocumentConverter()
+            logger.info("After Docling init: %.0f MB", mem_mb())
+
         with NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
             tmp.write(pdf_bytes)
             tmp.flush()
-            converter = DocumentConverter()
-            conversion_result = converter.convert(tmp.name)
+            conversion_result = self._converter.convert(tmp.name)
             document = getattr(conversion_result, "document", None)
+        logger.info("After parse: %.0f MB", mem_mb())
 
         text = self._extract_text(document)
         if self.max_text_chars > 0:
