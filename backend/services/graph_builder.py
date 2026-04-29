@@ -1,7 +1,7 @@
 from models.graph import PaperGraph
 from models.paper import Paper
 from services.llm_service import TopicExtractor, OpenAILLMClient
-from services.grobid_service import GrobidService
+from services.docling_service import DoclingService
 from services.pdf_preprocessor import extract_text_from_pdf
 import logging
 import os
@@ -364,9 +364,10 @@ class GraphBuilder:
             files_data: List of tuples (filename, file_content_bytes)
         """
         metadata_extractor = TopicExtractor(None)
-        grobid = GrobidService()
-        grobid_success_count = 0
+        docling = DoclingService()
+        docling_success_count = 0
         fallback_count = 0
+        metadata_complete_count = 0
         
         parsed_papers = []
         for file_tuple in files_data:
@@ -375,19 +376,23 @@ class GraphBuilder:
             else:
                 filename, file_content = file_tuple
                 content_hash = None
-            # Extract text from PDF
-            with timed_block("extract_pdf_text_per_paper"):
-                text = extract_text_from_pdf(file_content)
-            
-            metadata = None
-            if grobid.enabled:
-                metadata = grobid.extract_metadata(file_content)
-                if metadata.get("ok"):
-                    grobid_success_count += 1
-            if not metadata or not metadata.get("ok"):
+            parsed_doc = docling.parse_pdf(file_content)
+            metadata = {
+                "title": parsed_doc.get("title"),
+                "authors": parsed_doc.get("authors", []),
+                "publication_date": parsed_doc.get("publication_date"),
+            }
+            text = parsed_doc.get("text") or ""
+            if parsed_doc.get("ok"):
+                docling_success_count += 1
+            else:
                 fallback_count += 1
+                with timed_block("docling_fallback_extract_text_per_paper"):
+                    text = extract_text_from_pdf(file_content)
                 with timed_block("metadata_fallback_heuristic_per_paper"):
                     metadata = metadata_extractor.heuristic_metadata(text)
+            if metadata.get("title") and metadata.get("authors") and metadata.get("publication_date"):
+                metadata_complete_count += 1
             
             # Use extracted title if available, otherwise use filename
             title = metadata.get('title') or Path(filename).stem
@@ -408,10 +413,11 @@ class GraphBuilder:
             self.papers.append(paper)
 
         logger.info(
-            "Metadata extraction summary | papers=%s | grobid_success=%s | heuristic_fallback=%s",
+            "Metadata extraction summary | papers=%s | docling_success=%s | heuristic_fallback=%s | metadata_complete=%s",
             len(parsed_papers),
-            grobid_success_count,
+            docling_success_count,
             fallback_count,
+            metadata_complete_count,
         )
         
         return parsed_papers
@@ -422,28 +428,35 @@ class GraphBuilder:
         Legacy method for backward compatibility.
         """
         metadata_extractor = TopicExtractor(None)
-        grobid = GrobidService()
-        grobid_success_count = 0
+        docling = DoclingService()
+        docling_success_count = 0
         fallback_count = 0
+        metadata_complete_count = 0
         
         path = Path(file_path)
         
         parsed_papers = []
         for pdf_file in path.rglob("*.pdf"):
             # Extract text from PDF
-            with timed_block("extract_pdf_text_per_paper"):
-                text = extract_text_from_pdf(str(pdf_file))
-            
-            metadata = None
-            if grobid.enabled:
-                with pdf_file.open("rb") as handle:
-                    metadata = grobid.extract_metadata(handle.read())
-                if metadata.get("ok"):
-                    grobid_success_count += 1
-            if not metadata or not metadata.get("ok"):
+            with pdf_file.open("rb") as handle:
+                file_content = handle.read()
+            parsed_doc = docling.parse_pdf(file_content)
+            metadata = {
+                "title": parsed_doc.get("title"),
+                "authors": parsed_doc.get("authors", []),
+                "publication_date": parsed_doc.get("publication_date"),
+            }
+            text = parsed_doc.get("text") or ""
+            if parsed_doc.get("ok"):
+                docling_success_count += 1
+            else:
                 fallback_count += 1
+                with timed_block("docling_fallback_extract_text_per_paper"):
+                    text = extract_text_from_pdf(str(pdf_file))
                 with timed_block("metadata_fallback_heuristic_per_paper"):
                     metadata = metadata_extractor.heuristic_metadata(text)
+            if metadata.get("title") and metadata.get("authors") and metadata.get("publication_date"):
+                metadata_complete_count += 1
             
             # Use extracted title if available, otherwise use filename
             title = metadata.get('title') or pdf_file.stem
@@ -463,10 +476,11 @@ class GraphBuilder:
             self.papers.append(paper)
 
         logger.info(
-            "Metadata extraction summary | papers=%s | grobid_success=%s | heuristic_fallback=%s",
+            "Metadata extraction summary | papers=%s | docling_success=%s | heuristic_fallback=%s | metadata_complete=%s",
             len(parsed_papers),
-            grobid_success_count,
+            docling_success_count,
             fallback_count,
+            metadata_complete_count,
         )
         
         return parsed_papers

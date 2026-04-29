@@ -28,7 +28,7 @@ backend/
 
 ## Core Features
 - PDF upload and text extraction
-- GROBID-first metadata extraction (title/authors/date) with heuristic fallback
+- Docling-first PDF parsing + metadata extraction (title/authors/date) with heuristic fallback
 - LLM-based topic extraction
 - Graph generation and analysis
 - Paper recommendation system (stretch goal)
@@ -39,10 +39,10 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-## GROBID Metadata Extraction
-- Ingest metadata now uses GROBID when available, then falls back to a local heuristic parser.
+## Docling Ingest Parsing
+- Ingest parsing now uses Docling first for text + metadata extraction, then falls back to legacy parsing and local heuristic metadata if Docling fails.
 - Relevant env vars:
-  - `GROBID_ENABLED=true`
-  - `GROBID_URL=http://localhost:8070`
-  - `GROBID_TIMEOUT_SECONDS=8.0`
-- When using Docker Compose, backend is configured to call `http://grobid:8070`.
+  - `DOCLING_ENABLED=true`
+  - `DOCLING_MAX_PAGES=2`
+  - `DOCLING_MAX_TEXT_CHARS=8000`
+- Rollback toggle: set `DOCLING_ENABLED=false` to use legacy parsing path only.
