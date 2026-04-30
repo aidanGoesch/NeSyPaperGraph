@@ -47,16 +47,26 @@ export default function ToReadInbox({
     const [addError, setAddError] = useState("");
     const [itemBusyState, setItemBusyState] = useState({});
     const [itemErrors, setItemErrors] = useState({});
+    const [ingestingItems, setIngestingItems] = useState([]);
     const [draggingItemId, setDraggingItemId] = useState(null);
     const [dragOverItemId, setDragOverItemId] = useState(null);
     const dragPreviewRef = useRef(null);
 
+    const ingestingItemIdSet = useMemo(
+        () => new Set(ingestingItems.map((item) => item.id)),
+        [ingestingItems]
+    );
+
     const visibleItems = useMemo(
         () =>
             themeFilter
-                ? readingItems.filter((item) => item.linkedThemeId === themeFilter)
-                : readingItems,
-        [readingItems, themeFilter]
+                ? readingItems.filter(
+                      (item) =>
+                          item.linkedThemeId === themeFilter &&
+                          !ingestingItemIdSet.has(item.id)
+                  )
+                : readingItems.filter((item) => !ingestingItemIdSet.has(item.id)),
+        [readingItems, themeFilter, ingestingItemIdSet]
     );
 
     const setItemBusy = (itemId, isBusy) => {
@@ -74,6 +84,19 @@ export default function ToReadInbox({
             delete next[itemId];
             return next;
         });
+    };
+
+    const trackIngestingItem = (item) => {
+        const label = item.title || item.url || "Untitled item";
+        setIngestingItems((prev) =>
+            prev.some((entry) => entry.id === item.id)
+                ? prev
+                : [...prev, { id: item.id, label }]
+        );
+    };
+
+    const untrackIngestingItem = (itemId) => {
+        setIngestingItems((prev) => prev.filter((entry) => entry.id !== itemId));
     };
 
     const handleAddPaperLink = async () => {
@@ -217,6 +240,18 @@ export default function ToReadInbox({
                 </div>
             </div>
             {addError && <p className="inbox-error-text">{addError}</p>}
+            {ingestingItems.length > 0 && (
+                <div className="inbox-ingesting-status">
+                    <strong>Ingesting into graph ({ingestingItems.length})</strong>
+                    <div className="inbox-ingesting-list">
+                        {ingestingItems.map((entry) => (
+                            <span key={entry.id} className="inbox-ingesting-pill">
+                                {entry.label}
+                            </span>
+                        ))}
+                    </div>
+                </div>
+            )}
             <div
                 className={`inbox-items ${
                     draggingItemId ? "inbox-items-dragging" : ""
@@ -314,6 +349,7 @@ export default function ToReadInbox({
                                         if (!onMarkReadingItemDone) return;
                                         setItemBusy(item.id, true);
                                         clearItemError(item.id);
+                                        trackIngestingItem(item);
                                         try {
                                             await onMarkReadingItemDone(item);
                                         } catch (error) {
@@ -326,6 +362,7 @@ export default function ToReadInbox({
                                                 status: item.status || "reading",
                                             });
                                         } finally {
+                                            untrackIngestingItem(item.id);
                                             setItemBusy(item.id, false);
                                         }
                                     }}

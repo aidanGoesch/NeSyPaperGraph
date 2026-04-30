@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from api.graph import router as graph_router, start_queue_worker, stop_queue_worker
 from api.workspace import router as workspace_router
 from services.storage_service import load_graph
@@ -34,6 +34,11 @@ signal.signal(signal.SIGINT, signal_handler)
 
 class SearchRequest(BaseModel):
     query: str
+
+
+class TopicSearchRequest(BaseModel):
+    query: str
+    top_k: int = Field(default=10, ge=1, le=50)
 
 
 def prune_jobs(jobs: dict) -> None:
@@ -297,3 +302,21 @@ async def search(request: SearchRequest):
     except Exception as e:
         print(f"Error processing question: {e}")
         return {"query": request.query, "error": str(e), "status": "error"}
+
+
+@app.post("/api/topic-search")
+def topic_search(request: TopicSearchRequest):
+    from services.paper_search_service import PaperSearchService
+
+    graph_obj = get_current_graph(app)
+    try:
+        service = PaperSearchService(graph_obj=graph_obj)
+        results = service.search_papers(request.query, top_k=request.top_k)
+        return {
+            "query": request.query,
+            "results": results,
+            "status": "success",
+        }
+    except Exception as exc:
+        print(f"Error processing topic search: {exc}")
+        return {"query": request.query, "error": str(exc), "status": "error"}

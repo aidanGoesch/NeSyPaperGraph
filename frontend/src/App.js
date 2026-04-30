@@ -1428,6 +1428,8 @@ function App() {
                     <TopicWorkspace
                         graphData={visibleGraphData}
                         workspaceStore={workspaceStore}
+                        apiBase={API_BASE}
+                        apiFetch={apiFetch}
                         onResolveReadingUrl={resolveReadingUrlMetadata}
                         onIngestReadingItem={ingestReadingItemToGraph}
                         onFocusPaper={(paperTitle) => {
