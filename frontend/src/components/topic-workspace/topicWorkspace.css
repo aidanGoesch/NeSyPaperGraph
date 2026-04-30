@@ -467,6 +467,10 @@
   gap: 6px;
 }
 
+.theme-queue-list-dragging .theme-queue-item {
+  transition: transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
+}
+
 .theme-queue-item {
   display: flex;
   align-items: center;
@@ -475,6 +479,40 @@
   border-radius: 8px;
   padding: 8px 10px;
   background: rgba(255, 255, 255, 0.9);
+}
+
+.theme-queue-item-drop-target {
+  border-color: #4caf50;
+  box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.2);
+}
+
+.theme-queue-item-dragging {
+  opacity: 0.35;
+  transform: scale(0.985);
+}
+
+.theme-queue-drag-handle {
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 6px;
+  background: transparent;
+  color: #888;
+  font-weight: 700;
+  letter-spacing: 1px;
+  cursor: grab;
+  padding: 4px 6px;
+  line-height: 1;
+}
+
+.theme-queue-drag-handle:active {
+  cursor: grabbing;
+}
+
+.theme-queue-drag-preview {
+  opacity: 0.96;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2);
+  border-color: rgba(76, 175, 80, 0.6);
+  transform: scale(1.01);
+  z-index: 9999;
 }
 
 .theme-queue-title {
@@ -525,6 +563,21 @@
   margin: 0;
 }
 
+.theme-linked-paper-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.theme-linked-paper-card {
+  width: 100%;
+}
+
+.theme-queue-item-empty {
+  border-style: dashed;
+  opacity: 0.85;
+}
+
 .workspace-panel-inbox {
   overflow: hidden;
 }
@@ -534,18 +587,57 @@
   padding: 0 10px 10px;
 }
 
+.inbox-items-dragging .inbox-item {
+  transition: transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
+}
+
 .inbox-item {
   border: 1px solid rgba(0, 0, 0, 0.1);
   border-radius: 8px;
   padding: 8px;
   margin-bottom: 8px;
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.inbox-item-drop-target {
+  border-color: #4caf50;
+  box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.2);
+}
+
+.inbox-item-dragging {
+  opacity: 0.35;
+  transform: scale(0.985);
 }
 
 .inbox-item-main {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: 8px;
+}
+
+.inbox-drag-handle {
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 6px;
+  background: transparent;
+  color: #888;
+  font-weight: 700;
+  letter-spacing: 1px;
+  cursor: grab;
+  padding: 4px 6px;
+  line-height: 1;
+}
+
+.inbox-drag-handle:active {
+  cursor: grabbing;
+}
+
+.inbox-drag-preview {
+  opacity: 0.96;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2);
+  border-color: rgba(76, 175, 80, 0.6);
+  transform: scale(1.01);
+  z-index: 9999;
 }
 
 .inbox-item-link {

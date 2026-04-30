@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 
 const READING_STATES = ["inbox", "queued", "reading", "done"];
 
@@ -33,6 +33,7 @@ export default function ToReadInbox({
     onAddReadingItem,
     onUpdateReadingItem,
     onRemoveReadingItem,
+    onReorderReadingItem,
     onFocusPaper,
     onResolveReadingUrl,
     onMarkReadingItemDone,
@@ -46,22 +47,16 @@ export default function ToReadInbox({
     const [addError, setAddError] = useState("");
     const [itemBusyState, setItemBusyState] = useState({});
     const [itemErrors, setItemErrors] = useState({});
+    const [draggingItemId, setDraggingItemId] = useState(null);
+    const [dragOverItemId, setDragOverItemId] = useState(null);
+    const dragPreviewRef = useRef(null);
 
-    const sortedItems = useMemo(
-        () =>
-            [...readingItems].sort(
-                (a, b) =>
-                    new Date(b.updatedAt || b.createdAt).getTime() -
-                    new Date(a.updatedAt || a.createdAt).getTime()
-            ),
-        [readingItems]
-    );
     const visibleItems = useMemo(
         () =>
             themeFilter
-                ? sortedItems.filter((item) => item.linkedThemeId === themeFilter)
-                : sortedItems,
-        [sortedItems, themeFilter]
+                ? readingItems.filter((item) => item.linkedThemeId === themeFilter)
+                : readingItems,
+        [readingItems, themeFilter]
     );
 
     const setItemBusy = (itemId, isBusy) => {
@@ -115,6 +110,33 @@ export default function ToReadInbox({
         setThemeInput("");
         setStatusInput("inbox");
         setIsResolvingAdd(false);
+    };
+
+    const handleDragStart = (event, itemId) => {
+        setDraggingItemId(itemId);
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", itemId);
+
+        const sourceItem = event.currentTarget.closest(".inbox-item");
+        if (!sourceItem) return;
+        const previewNode = sourceItem.cloneNode(true);
+        previewNode.classList.add("inbox-drag-preview");
+        previewNode.style.width = `${sourceItem.getBoundingClientRect().width}px`;
+        previewNode.style.position = "fixed";
+        previewNode.style.top = "-9999px";
+        previewNode.style.left = "-9999px";
+        document.body.appendChild(previewNode);
+        dragPreviewRef.current = previewNode;
+        event.dataTransfer.setDragImage(previewNode, 28, 20);
+    };
+
+    const handleDragEnd = () => {
+        setDraggingItemId(null);
+        setDragOverItemId(null);
+        if (dragPreviewRef.current) {
+            dragPreviewRef.current.remove();
+            dragPreviewRef.current = null;
+        }
     };
 
     return (
@@ -195,10 +217,53 @@ export default function ToReadInbox({
                 </div>
             </div>
             {addError && <p className="inbox-error-text">{addError}</p>}
-            <div className="inbox-items">
+            <div
+                className={`inbox-items ${
+                    draggingItemId ? "inbox-items-dragging" : ""
+                }`}
+            >
                 {visibleItems.map((item) => (
-                    <div key={item.id} className="inbox-item">
+                    <div
+                        key={item.id}
+                        className={`inbox-item ${
+                            draggingItemId === item.id ? "inbox-item-dragging" : ""
+                        } ${
+                            dragOverItemId === item.id &&
+                            draggingItemId &&
+                            draggingItemId !== item.id
+                                ? "inbox-item-drop-target"
+                                : ""
+                        }`}
+                        onDragEnter={() => {
+                            if (!draggingItemId || draggingItemId === item.id) return;
+                            setDragOverItemId(item.id);
+                            if (onReorderReadingItem) {
+                                onReorderReadingItem(draggingItemId, item.id);
+                            }
+                        }}
+                        onDragOver={(event) => {
+                            if (!draggingItemId || draggingItemId === item.id) return;
+                            event.preventDefault();
+                        }}
+                        onDrop={(event) => {
+                            event.preventDefault();
+                            handleDragEnd();
+                        }}
+                    >
                         <div className="inbox-item-main">
+                            <button
+                                type="button"
+                                className="inbox-drag-handle"
+                                title="Drag to reorder"
+                                aria-label="Drag to reorder"
+                                draggable
+                                onDragStart={(event) => {
+                                    handleDragStart(event, item.id);
+                                }}
+                                onDragEnd={handleDragEnd}
+                            >
+                                :::
+                            </button>
                             <div className="inbox-item-text">
                                 <strong>{item.title || "Untitled item"}</strong>
                                 {item.url && (

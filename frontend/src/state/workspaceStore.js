@@ -62,6 +62,25 @@ function reducer(state, action) {
                     (item) => item.id !== action.payload.id
                 ),
             };
+        case "REORDER_READING_ITEM": {
+            const { sourceId, targetId } = action.payload;
+            if (!sourceId || !targetId || sourceId === targetId) return state;
+            const sourceIndex = state.readingItems.findIndex(
+                (item) => item.id === sourceId
+            );
+            const targetIndex = state.readingItems.findIndex(
+                (item) => item.id === targetId
+            );
+            if (sourceIndex < 0 || targetIndex < 0) return state;
+
+            const nextItems = [...state.readingItems];
+            const [moved] = nextItems.splice(sourceIndex, 1);
+            nextItems.splice(targetIndex, 0, moved);
+            return {
+                ...state,
+                readingItems: nextItems,
+            };
+        }
         case "CREATE_THEME_NOTE":
             return {
                 ...state,
@@ -368,6 +387,12 @@ export function useWorkspaceStore(options = {}) {
             },
             removeReadingItem(id) {
                 dispatch({ type: "REMOVE_READING_ITEM", payload: { id } });
+            },
+            reorderReadingItem(sourceId, targetId) {
+                dispatch({
+                    type: "REORDER_READING_ITEM",
+                    payload: { sourceId, targetId },
+                });
             },
             createThemeNote(input) {
                 const themeTitle = input.themeTitle?.trim() || "Untitled Theme";

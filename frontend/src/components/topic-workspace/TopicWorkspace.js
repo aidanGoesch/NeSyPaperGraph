@@ -317,6 +317,7 @@ export default function TopicWorkspace({
                     themeQueueItems={themeQueueItems}
                     onSelectTheme={setSelectedThemeId}
                     onUpsertTheme={actions.upsertThemeNote}
+                    onReorderReadingItem={actions.reorderReadingItem}
                     onSelectThemePaper={(paperTitle) => {
                         setSelectedClusterId(null);
                         setSelectedTreeNode(null);
@@ -338,10 +339,14 @@ export default function TopicWorkspace({
                 onAddReadingItem={actions.addReadingItem}
                 onUpdateReadingItem={actions.updateReadingItem}
                 onRemoveReadingItem={actions.removeReadingItem}
+                onReorderReadingItem={actions.reorderReadingItem}
                 onFocusPaper={onFocusPaper}
                 onResolveReadingUrl={onResolveReadingUrl}
                 onMarkReadingItemDone={async (item) => {
                     const result = await onIngestReadingItem(item);
+                    if (item.linkedThemeId && result?.paper_title) {
+                        actions.linkPaperToTheme(item.linkedThemeId, result.paper_title);
+                    }
                     actions.removeReadingItem(item.id);
                     if (result?.paper_title) {
                         setSelectedClusterId(null);
