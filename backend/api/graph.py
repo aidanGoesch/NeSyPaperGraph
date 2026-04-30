@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 SSE_HEARTBEAT_SECONDS = 15
 INGEST_SNAPSHOT_EVERY_PAPERS = int(
-    os.getenv("INGEST_SNAPSHOT_EVERY_PAPERS", "0") or "0"
+    os.getenv("INGEST_SNAPSHOT_EVERY_PAPERS", "5") or "5"
 )
 INGEST_CHECKPOINT_EVERY_PAPERS = int(
     os.getenv("INGEST_CHECKPOINT_EVERY_PAPERS", "3") or "3"
@@ -66,6 +66,11 @@ def prune_jobs(jobs: dict) -> None:
         )
         for job_id, _ in sorted_jobs[: len(jobs) - max_jobs]:
             jobs.pop(job_id, None)
+
+
+def _active_processing_jobs(jobs: dict) -> int:
+    return sum(1 for job in jobs.values() if job.get("processing"))
+
 
 def graph_to_dict(graph):
     """Convert PaperGraph to dictionary format for frontend"""
@@ -488,7 +493,8 @@ async def upload_papers(
             ),
         )
     job_id = str(uuid4())
-    queue_position = queue.qsize() + 1
+    processing_jobs = _active_processing_jobs(jobs)
+    queue_position = queue.qsize() + processing_jobs + 1
     jobs[job_id] = {
         "status": "pending",
         "queued": True,
@@ -513,11 +519,18 @@ async def upload_papers(
             "job_id": job_id,
             "status": "pending",
             "queue_position": queue_position,
+            "jobs_ahead": max(0, queue_position - 1),
             "paper_total": len(files_data),
             "filenames": filenames,
         },
     )
-    return {"job_id": job_id, "status": "pending", "queue_position": queue_position}
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "queue_position": queue_position,
+        "jobs_ahead": max(0, queue_position - 1),
+        "paper_total": len(files_data),
+    }
 
 
 @router.get("/graph/stream")

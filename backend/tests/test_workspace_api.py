@@ -10,6 +10,10 @@ def _workspace_payload():
                 "linkedThemeId": None,
                 "title": "Interesting Read",
                 "url": "https://example.com",
+                "semanticScholarPaperId": "ss-abc123",
+                "authors": ["First Author", "Second Author"],
+                "year": 2024,
+                "venue": "ACL",
                 "quickNote": "note",
                 "createdAt": "2024-01-01T00:00:00Z",
                 "updatedAt": "2024-01-01T00:00:00Z",
@@ -88,3 +92,28 @@ def test_workspace_put_validation_error(client):
     }
     response = client.put("/api/workspace/state", json=bad_payload)
     assert response.status_code == 422
+
+
+def test_workspace_put_accepts_legacy_items_without_semantic_scholar_fields(
+    client, monkeypatch
+):
+    stored = {}
+
+    def _load():
+        return stored.get("state")
+
+    def _save(state):
+        stored["state"] = state
+
+    monkeypatch.setattr("api.workspace.load_workspace_state", _load)
+    monkeypatch.setattr("api.workspace.save_workspace_state", _save)
+    monkeypatch.setattr("api.workspace.utc_now_iso", lambda: "2026-01-01T00:00:00Z")
+
+    payload = _workspace_payload()
+    payload["readingItems"][0].pop("semanticScholarPaperId", None)
+    payload["readingItems"][0].pop("authors", None)
+    payload["readingItems"][0].pop("year", None)
+    payload["readingItems"][0].pop("venue", None)
+
+    response = client.put("/api/workspace/state", json=payload)
+    assert response.status_code == 200

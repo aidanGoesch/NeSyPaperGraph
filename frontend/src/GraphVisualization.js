@@ -2,6 +2,12 @@ import React, { useEffect, useMemo, useRef, useState, forwardRef, useImperativeH
 import ReactMarkdown from 'react-markdown';
 import * as d3 from 'd3';
 
+const PAPER_NODE_RADIUS = 10;
+const TOPIC_NODE_MIN_RADIUS = 18;
+const TOPIC_NODE_MAX_RADIUS = 50;
+const TOPIC_SIZE_EXPONENT = 1.35;
+const COLLISION_PADDING = 12;
+
 const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, onTopicClick, highlightPath }, ref) => {
   const svgRef = useRef();
   const containerRef = useRef();
@@ -58,6 +64,35 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       });
     });
     return fallbackLinks;
+  };
+
+  const buildTopicPaperCounts = (topics, links, paperTitles) => {
+    const topicToConnectedPapers = new Map(
+      (topics || []).map((topic) => [topic, new Set()])
+    );
+
+    (links || []).forEach((link) => {
+      if (link?.type === 'semantic') return;
+
+      const sourceId = normalizeLinkEndpoint(link.source);
+      const targetId = normalizeLinkEndpoint(link.target);
+      const sourceIsTopic = topicToConnectedPapers.has(sourceId);
+      const targetIsTopic = topicToConnectedPapers.has(targetId);
+
+      if (sourceIsTopic && paperTitles.has(targetId)) {
+        topicToConnectedPapers.get(sourceId).add(targetId);
+      }
+      if (targetIsTopic && paperTitles.has(sourceId)) {
+        topicToConnectedPapers.get(targetId).add(sourceId);
+      }
+    });
+
+    return new Map(
+      Array.from(topicToConnectedPapers.entries()).map(([topic, connectedPapers]) => [
+        topic,
+        connectedPapers.size,
+      ])
+    );
   };
 
   const getConnectedPapersForTopic = (topicName, links, papers) => {
@@ -224,16 +259,42 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       return;
     }
 
+    const links = buildLinks(data.papers, data.edges);
+    const paperTitles = new Set((data.papers || []).map((paper) => paper.title));
+    const topicPaperCounts = buildTopicPaperCounts(data.topics, links, paperTitles);
+    const topicCounts = Array.from(topicPaperCounts.values());
+    const minTopicCount = topicCounts.length > 0 ? Math.min(...topicCounts) : 0;
+    const maxTopicCount = topicCounts.length > 0 ? Math.max(...topicCounts) : 0;
+
+    const getTopicNodeRadius =
+      minTopicCount === maxTopicCount
+        ? () =>
+            minTopicCount <= 1
+              ? TOPIC_NODE_MIN_RADIUS
+              : (TOPIC_NODE_MIN_RADIUS + TOPIC_NODE_MAX_RADIUS) / 2
+        : d3
+            .scalePow()
+            .exponent(TOPIC_SIZE_EXPONENT)
+            .domain([minTopicCount, maxTopicCount])
+            .range([TOPIC_NODE_MIN_RADIUS, TOPIC_NODE_MAX_RADIUS]);
+
     const nodes = [
       ...data.papers.map((paper) => ({
         id: paper.title,
         type: 'paper',
         title: paper.title,
+        radius: PAPER_NODE_RADIUS,
       })),
-      ...data.topics.map((topic) => ({ id: topic, type: 'topic' }))
+      ...data.topics.map((topic) => {
+        const paperCount = topicPaperCounts.get(topic) || 0;
+        return {
+          id: topic,
+          type: 'topic',
+          paperCount,
+          radius: Math.max(TOPIC_NODE_MIN_RADIUS, getTopicNodeRadius(paperCount)),
+        };
+      }),
     ];
-
-    const links = buildLinks(data.papers, data.edges);
 
     const highlightedNodeSet = new Set(
       Array.isArray(highlightPath?.nodes) ? highlightPath.nodes : []
@@ -258,10 +319,20 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     };
 
     const simulation = d3.forceSimulation(nodes)
-      .force("link", d3.forceLink(links).id(d => d.id).distance(120))
+      .force("link", d3.forceLink(links)
+        .id(d => d.id)
+        .distance((d) => {
+          const targetId = d?.target?.id || d?.target;
+          const degree = links.filter((l) => {
+            const sourceId = l?.source?.id || l?.source;
+            return sourceId === targetId;
+          }).length;
+          return Math.max(60, 150 - degree * 5);
+        }))
       .force("charge", d3.forceManyBody().strength(-400))
       .force("center", d3.forceCenter(width / 2, height / 2))
-      .force("collision", d3.forceCollide().radius(30));
+      .force("collision", d3.forceCollide().radius((d) => (d.radius || PAPER_NODE_RADIUS) + COLLISION_PADDING))
+      .alphaDecay(0.01);
 
     simulationRef.current = simulation;
     nodesRef.current = nodes;
@@ -298,7 +369,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
           return 6;
         }
         
-        return d.type === 'semantic' ? ((d.weight - 0.25) * 5) : 5;
+        return d.type === 'semantic' ? ((d.weight - 0.25) * 4) : 4;
       })
       .attr("stroke-opacity", d => {
         if (d.type === 'semantic') {
@@ -318,7 +389,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       .selectAll("circle")
       .data(nodes)
       .enter().append("circle")
-      .attr("r", d => d.type === 'paper' ? 10 : 15)
+      .attr("r", (d) => d.radius || PAPER_NODE_RADIUS)
       .attr("fill", d => {
         if (highlightedNodeSet.has(d.id)) {
           return d.type === 'paper' ? "#FF6B35" : "#FF1744";
@@ -429,8 +500,33 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       updatePanelPosition(); // follow node as simulation moves
     });
 
+    let preDragVelocityDecay = simulation.velocityDecay();
+
     function dragstarted(event, d) {
-      if (!event.active) simulation.alphaTarget(0.3).restart();
+      const syrupAnchors = new Map();
+      nodes.forEach((node) => {
+        if (node.id !== d.id) {
+          syrupAnchors.set(node.id, { x: node.x, y: node.y });
+        }
+      });
+
+      preDragVelocityDecay = simulation.velocityDecay();
+      simulation
+        .force(
+          "syrupX",
+          d3
+            .forceX((node) => syrupAnchors.get(node.id)?.x ?? node.x)
+            .strength((node) => (node.id === d.id ? 0 : 0.12))
+        )
+        .force(
+          "syrupY",
+          d3
+            .forceY((node) => syrupAnchors.get(node.id)?.y ?? node.y)
+            .strength((node) => (node.id === d.id ? 0 : 0.12))
+        )
+        .velocityDecay(0.9)
+        .alphaTarget(0.1)
+        .restart();
       d.fx = d.x;
       d.fy = d.y;
     }
@@ -441,9 +537,13 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     }
 
     function dragended(event, d) {
-      if (!event.active) simulation.alphaTarget(0);
-      d.fx = null;
-      d.fy = null;
+      simulation
+        .force("syrupX", null)
+        .force("syrupY", null)
+        .velocityDecay(preDragVelocityDecay)
+        .alphaTarget(0);
+      d.fx = event.x;
+      d.fy = event.y;
     }
 
     function updatePanelPosition() {

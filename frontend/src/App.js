@@ -12,6 +12,10 @@ const MAX_CHAT_HISTORY = 30;
 const MAX_SEARCH_RESULTS_PER_ENTRY = 8;
 const MAX_RESULT_SUMMARY_CHARS = 800;
 const MAX_ANSWER_CHARS = 12000;
+const MAX_UPLOAD_FILES_PER_REQUEST = 25;
+const MAX_UPLOAD_BATCH_BYTES = 40 * 1024 * 1024; // 40 MB per request
+const MAX_UPLOAD_BATCH_RETRIES = 3;
+const UPLOAD_BATCH_RETRY_BASE_MS = 1200;
 
 function capChatHistory(entries) {
     return entries.length > MAX_CHAT_HISTORY
@@ -39,6 +43,35 @@ function trimSearchResult(result) {
         topics: Array.isArray(result.topics) ? result.topics.slice(0, 12) : [],
         summary: (result.summary || "").slice(0, MAX_RESULT_SUMMARY_CHARS),
     };
+}
+
+function buildUploadBatches(files) {
+    const batches = [];
+    let currentBatch = [];
+    let currentBatchBytes = 0;
+
+    for (const file of files) {
+        const nextFileBytes = Math.max(0, Number(file?.size) || 0);
+        const wouldExceedCount = currentBatch.length >= MAX_UPLOAD_FILES_PER_REQUEST;
+        const wouldExceedBytes =
+            currentBatch.length > 0 &&
+            currentBatchBytes + nextFileBytes > MAX_UPLOAD_BATCH_BYTES;
+
+        if (wouldExceedCount || wouldExceedBytes) {
+            batches.push(currentBatch);
+            currentBatch = [];
+            currentBatchBytes = 0;
+        }
+
+        currentBatch.push(file);
+        currentBatchBytes += nextFileBytes;
+    }
+
+    if (currentBatch.length > 0) {
+        batches.push(currentBatch);
+    }
+
+    return batches;
 }
 
 function App() {
@@ -146,6 +179,8 @@ function App() {
     const searchInputRef = useRef();
     const eventSourceRef = useRef(null);
     const activeUploadJobsRef = useRef(new Set());
+    const uploadJobStateRef = useRef(new Map());
+    const pendingUploadAckCountRef = useRef(0);
     const graphLoadPromiseRef = useRef(null);
     const architectureLoadedRef = useRef(false);
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -155,6 +190,51 @@ function App() {
         setUploadProgressTotal(safeTotal);
         setUploadProgressCurrent(safeCurrent);
     };
+    const getAggregateUploadProgress = useCallback(() => {
+        let total = 0;
+        let completed = 0;
+        uploadJobStateRef.current.forEach((jobState) => {
+            const paperTotal = Math.max(0, Number(jobState?.paperTotal) || 0);
+            const paperCompleted = Math.max(
+                0,
+                Math.min(paperTotal, Number(jobState?.paperCompleted) || 0)
+            );
+            total += paperTotal;
+            completed += paperCompleted;
+        });
+        total += Math.max(0, Number(pendingUploadAckCountRef.current) || 0);
+        return { completed, total };
+    }, []);
+    const hasPendingUploadWork = useCallback(() => {
+        return (
+            activeUploadJobsRef.current.size > 0 ||
+            Math.max(0, Number(pendingUploadAckCountRef.current) || 0) > 0
+        );
+    }, []);
+    const upsertUploadJobState = useCallback(
+        (jobId, patch = {}) => {
+            const previous = uploadJobStateRef.current.get(jobId) || {
+                paperTotal: 0,
+                paperCompleted: 0,
+                status: "pending",
+                queuePosition: 1,
+            };
+            uploadJobStateRef.current.set(jobId, { ...previous, ...patch });
+            const aggregate = getAggregateUploadProgress();
+            setUploadProgress(aggregate.completed, aggregate.total);
+            return aggregate;
+        },
+        [getAggregateUploadProgress]
+    );
+    const removeUploadJobState = useCallback(
+        (jobId) => {
+            uploadJobStateRef.current.delete(jobId);
+            const aggregate = getAggregateUploadProgress();
+            setUploadProgress(aggregate.completed, aggregate.total);
+            return aggregate;
+        },
+        [getAggregateUploadProgress]
+    );
     const uploadProgressPercent =
         uploadProgressTotal > 0
             ? Math.min(
@@ -323,9 +403,15 @@ function App() {
                         if (data.status === "processing") {
                             const completed = data.paper_index || 0;
                             const total = data.paper_total || 0;
-                            const activePaper = total > 0 ? Math.min(completed + 1, total) : completed;
-                            setUploadStatus(`processing paper ${activePaper} / ${total}`);
-                            setUploadProgress(activePaper, total);
+                            upsertUploadJobState(jobId, {
+                                status: "processing",
+                                paperTotal: total,
+                                paperCompleted: completed,
+                            });
+                            const aggregate = getAggregateUploadProgress();
+                            setUploadStatus(
+                                `processing paper ${aggregate.completed} / ${aggregate.total}`
+                            );
                             const elapsed = formatElapsed(data.started_at);
                             const currentPaper = data.current_paper
                                 ? `Current: ${data.current_paper}`
@@ -337,17 +423,29 @@ function App() {
                             );
                         } else if (data.status === "pending") {
                             const total = data.paper_total || 0;
-                            setUploadStatus(`paper 0 / ${total}`);
-                            setUploadProgress(0, total);
+                            const queuePosition = data.queue_position || 1;
+                            upsertUploadJobState(jobId, {
+                                status: "pending",
+                                queuePosition,
+                                paperTotal: total,
+                                paperCompleted: 0,
+                            });
+                            const aggregate = getAggregateUploadProgress();
+                            setUploadStatus(
+                                `queued (#${queuePosition}) - paper ${aggregate.completed} / ${aggregate.total}`
+                            );
                             setUploadStatusDetail(
-                                "Waiting in upload queue..."
+                                queuePosition > 1
+                                    ? `Waiting in queue (${queuePosition - 1} job(s) ahead)...`
+                                    : "Waiting in upload queue..."
                             );
                         }
                     }
                     if (data.status === "done") {
                         activeUploadJobsRef.current.delete(jobId);
+                        removeUploadJobState(jobId);
                         await fetchGraph();
-                        if (activeUploadJobsRef.current.size === 0) {
+                        if (!hasPendingUploadWork()) {
                             setIsUploading(false);
                             setUploadStatus("done");
                             setUploadStatusDetail("");
@@ -360,8 +458,9 @@ function App() {
                     }
                     if (data.status === "error") {
                         activeUploadJobsRef.current.delete(jobId);
+                        removeUploadJobState(jobId);
                         setUploadError(data.error || "Upload processing failed");
-                        if (activeUploadJobsRef.current.size === 0) {
+                        if (!hasPendingUploadWork()) {
                             setIsUploading(false);
                             setUploadStatus("error");
                             setUploadStatusDetail("");
@@ -563,9 +662,22 @@ function App() {
             if (!payload) return;
             if (activeUploadJobsRef.current.has(payload.job_id)) {
                 setIsUploading(true);
-                setUploadStatus(`paper 0 / ${payload.paper_total || 0}`);
-                setUploadProgress(0, payload.paper_total || 0);
-                setUploadStatusDetail("Waiting in upload queue...");
+                const queuePosition = payload.queue_position || 1;
+                upsertUploadJobState(payload.job_id, {
+                    status: "pending",
+                    queuePosition,
+                    paperTotal: payload.paper_total || 0,
+                    paperCompleted: 0,
+                });
+                const aggregate = getAggregateUploadProgress();
+                setUploadStatus(
+                    `queued (#${queuePosition}) - paper ${aggregate.completed} / ${aggregate.total}`
+                );
+                setUploadStatusDetail(
+                    queuePosition > 1
+                        ? `Queued behind ${queuePosition - 1} job(s).`
+                        : "Waiting in upload queue..."
+                );
             }
         });
 
@@ -574,10 +686,15 @@ function App() {
             if (!payload) return;
             if (activeUploadJobsRef.current.has(payload.job_id)) {
                 setIsUploading(true);
+                upsertUploadJobState(payload.job_id, {
+                    status: "processing",
+                    paperTotal: payload.paper_total || 0,
+                    paperCompleted: 0,
+                });
+                const aggregate = getAggregateUploadProgress();
                 setUploadStatus(
-                    `processing paper 0 / ${payload.paper_total || 0}`
+                    `processing paper ${aggregate.completed} / ${aggregate.total}`
                 );
-                setUploadProgress(0, payload.paper_total || 0);
                 setUploadStatusDetail("Current: preparing upload batch");
             }
         });
@@ -589,16 +706,18 @@ function App() {
                 setGraphData(payload.graph);
             }
             if (activeUploadJobsRef.current.has(payload.job_id)) {
+                upsertUploadJobState(payload.job_id, {
+                    status: payload.status || "processing",
+                    paperTotal: payload.paper_total || 0,
+                    paperCompleted: payload.paper_index || 0,
+                });
+                const aggregate = getAggregateUploadProgress();
                 const statusLabel =
                     payload.status === "processed"
                         ? "processed"
                         : `skipped:${payload.reason || "unknown"}`;
                 setUploadStatus(
-                    `${statusLabel} paper ${payload.paper_index || 0} / ${payload.paper_total || 0}`
-                );
-                setUploadProgress(
-                    payload.paper_index || 0,
-                    payload.paper_total || 0
+                    `${statusLabel} paper ${aggregate.completed} / ${aggregate.total}`
                 );
                 setUploadStatusDetail(
                     payload.paper_title
@@ -623,7 +742,8 @@ function App() {
             }
             if (activeUploadJobsRef.current.has(payload.job_id)) {
                 activeUploadJobsRef.current.delete(payload.job_id);
-                if (activeUploadJobsRef.current.size === 0) {
+                removeUploadJobState(payload.job_id);
+                if (!hasPendingUploadWork()) {
                     setIsUploading(false);
                     setUploadStatus("done");
                     setUploadStatusDetail("");
@@ -642,8 +762,9 @@ function App() {
             if (!payload) return;
             if (activeUploadJobsRef.current.has(payload.job_id)) {
                 activeUploadJobsRef.current.delete(payload.job_id);
+                removeUploadJobState(payload.job_id);
                 setUploadError(payload.error || "Upload processing failed");
-                if (activeUploadJobsRef.current.size === 0) {
+                if (!hasPendingUploadWork()) {
                     setIsUploading(false);
                     setUploadStatus("error");
                     setUploadStatusDetail("");
@@ -897,59 +1018,219 @@ function App() {
     };
 
     const handleFileUpload = async (event) => {
-        const files = event.target.files;
+        const selectedFiles = Array.from(event.target.files || []);
+        const files = selectedFiles.filter(
+            (file) =>
+                file?.name &&
+                !file.name.startsWith(".") &&
+                file.name.toLowerCase().endsWith(".pdf")
+        );
         if (files.length > 0) {
+            const hadPendingJobs = activeUploadJobsRef.current.size > 0 || isUploading;
+            pendingUploadAckCountRef.current += files.length;
+            const aggregateBeforeUpload = getAggregateUploadProgress();
             setIsUploading(true);
             setUploadError(null);
-            setUploadStatus(`paper 0 / ${files.length}`);
-            setUploadProgress(0, files.length);
-            setUploadStatusDetail("Uploading files to local backend...");
+            if (!hadPendingJobs) {
+                setUploadStatus(
+                    `paper ${aggregateBeforeUpload.completed} / ${aggregateBeforeUpload.total}`
+                );
+                setUploadProgress(
+                    aggregateBeforeUpload.completed,
+                    aggregateBeforeUpload.total
+                );
+                setUploadStatusDetail("Uploading files to local backend...");
+            } else {
+                const baseDisplayedTotal = Math.max(
+                    0,
+                    Number(uploadProgressTotal) || 0
+                );
+                const baseDisplayedCurrent = Math.max(
+                    0,
+                    Number(uploadProgressCurrent) || 0
+                );
+                const baseTotal = Math.max(
+                    aggregateBeforeUpload.total,
+                    baseDisplayedTotal
+                );
+                const baseCurrent = Math.max(
+                    aggregateBeforeUpload.completed,
+                    Math.min(baseDisplayedCurrent, baseTotal)
+                );
+                const optimisticTotal = baseTotal + files.length;
+                setUploadStatus(
+                    `paper ${baseCurrent} / ${optimisticTotal}`
+                );
+                setUploadProgress(baseCurrent, optimisticTotal);
+                setUploadStatusDetail(
+                    `Appending ${files.length} paper(s) to existing upload queue...`
+                );
+            }
 
+            let pendingForThisSelection = files.length;
             try {
-                // Create FormData to send files
-                const formData = new FormData();
-                for (let i = 0; i < files.length; i++) {
-                    formData.append("files", files[i]);
+                const fileBatches = buildUploadBatches(files);
+                let failedBatchCount = 0;
+                let failedFileCount = 0;
+                let firstBatchErrorMessage = "";
+
+                for (let batchIndex = 0; batchIndex < fileBatches.length; batchIndex++) {
+                    const batch = fileBatches[batchIndex];
+                    const formData = new FormData();
+                    for (let i = 0; i < batch.length; i++) {
+                        formData.append("files", batch[i]);
+                    }
+
+                    setUploadStatusDetail(
+                        `Uploading batch ${batchIndex + 1} of ${fileBatches.length} (${batch.length} file(s))...`
+                    );
+                    let accepted = false;
+                    let lastBatchError = null;
+                    for (
+                        let attempt = 1;
+                        attempt <= MAX_UPLOAD_BATCH_RETRIES;
+                        attempt++
+                    ) {
+                        try {
+                            const response = await apiFetch(
+                                `${API_BASE}/api/graph/upload`,
+                                {
+                                    method: "POST",
+                                    body: formData,
+                                }
+                            );
+
+                            if (!response.ok) {
+                                const errorData = await response.json();
+                                const message =
+                                    errorData.detail || "Failed to upload files";
+                                const shouldRetry =
+                                    response.status === 429 ||
+                                    response.status >= 500;
+                                if (
+                                    shouldRetry &&
+                                    attempt < MAX_UPLOAD_BATCH_RETRIES
+                                ) {
+                                    await sleep(
+                                        UPLOAD_BATCH_RETRY_BASE_MS * attempt
+                                    );
+                                    continue;
+                                }
+                                throw new Error(message);
+                            }
+
+                            const data = await response.json();
+                            if (!data.job_id) {
+                                throw new Error("Upload did not return a job_id");
+                            }
+                            activeUploadJobsRef.current.add(data.job_id);
+                            const queuePosition =
+                                data.queue_position ||
+                                activeUploadJobsRef.current.size;
+                            const paperTotal = data.paper_total || batch.length;
+                            pendingUploadAckCountRef.current = Math.max(
+                                0,
+                                pendingUploadAckCountRef.current - paperTotal
+                            );
+                            pendingForThisSelection = Math.max(
+                                0,
+                                pendingForThisSelection - paperTotal
+                            );
+                            upsertUploadJobState(data.job_id, {
+                                status: "pending",
+                                queuePosition,
+                                paperTotal,
+                                paperCompleted: 0,
+                            });
+                            const aggregate = getAggregateUploadProgress();
+                            setUploadStatus(
+                                `queued (#${queuePosition}) - paper ${aggregate.completed} / ${aggregate.total}`
+                            );
+                            setUploadStatusDetail(
+                                queuePosition > 1
+                                    ? `Upload appended to queue (${queuePosition - 1} job(s) ahead).`
+                                    : "Upload accepted. Waiting for processing worker..."
+                            );
+                            setUploadError(null);
+                            monitorUploadJob(data.job_id);
+                            accepted = true;
+                            break;
+                        } catch (batchError) {
+                            lastBatchError = batchError;
+                            const message =
+                                batchError?.message || "Failed to upload files";
+                            const looksTransient =
+                                message.includes("Failed to fetch") ||
+                                message.includes("NetworkError") ||
+                                message.includes("network");
+                            if (
+                                looksTransient &&
+                                attempt < MAX_UPLOAD_BATCH_RETRIES
+                            ) {
+                                await sleep(UPLOAD_BATCH_RETRY_BASE_MS * attempt);
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+
+                    if (!accepted) {
+                        failedBatchCount += 1;
+                        failedFileCount += batch.length;
+                        pendingUploadAckCountRef.current = Math.max(
+                            0,
+                            pendingUploadAckCountRef.current - batch.length
+                        );
+                        pendingForThisSelection = Math.max(
+                            0,
+                            pendingForThisSelection - batch.length
+                        );
+                        if (!firstBatchErrorMessage) {
+                            firstBatchErrorMessage =
+                                lastBatchError?.message || "batch upload failed";
+                        }
+                        const aggregate = getAggregateUploadProgress();
+                        setUploadProgress(aggregate.completed, aggregate.total);
+                    }
                 }
 
-                // Upload files to backend
-                const response = await apiFetch(
-                    `${API_BASE}/api/graph/upload`,
-                    {
-                        method: "POST",
-                        body: formData,
-                    }
-                );
-
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(
-                        errorData.detail || "Failed to upload files"
+                if (failedBatchCount > 0) {
+                    const suffix = firstBatchErrorMessage
+                        ? ` Last error: ${firstBatchErrorMessage}`
+                        : "";
+                    setUploadError(
+                        `Some upload batches failed (${failedFileCount} file(s) across ${failedBatchCount} batch(es)).${suffix}`
                     );
                 }
-
-                const data = await response.json();
-                if (!data.job_id) {
-                    throw new Error("Upload did not return a job_id");
-                }
-                activeUploadJobsRef.current.add(data.job_id);
-                setUploadStatus(`paper 0 / 0`);
-                setUploadProgress(0, 0);
-                setUploadStatusDetail("Upload accepted. Waiting for processing worker...");
-                setUploadError(null);
-                monitorUploadJob(data.job_id);
             } catch (error) {
                 console.error("Upload error:", error);
+                pendingUploadAckCountRef.current = Math.max(
+                    0,
+                    pendingUploadAckCountRef.current - pendingForThisSelection
+                );
+                const aggregate = getAggregateUploadProgress();
                 setUploadError(
                     error.message || "Failed to upload and process files"
                 );
-                setUploadStatus("error");
-                setUploadProgress(0, 0);
+                if (activeUploadJobsRef.current.size === 0) {
+                    setUploadStatus("error");
+                    setIsUploading(false);
+                } else {
+                    setUploadStatus(
+                        `processing paper ${aggregate.completed} / ${aggregate.total}`
+                    );
+                }
+                setUploadProgress(aggregate.completed, aggregate.total);
                 // Keep graph data as null on error
             } finally {
                 // Reset file input
                 event.target.value = "";
             }
+        } else {
+            setUploadError(
+                "No PDF files found in the selected files/folder."
+            );
+            event.target.value = "";
         }
     };
 
@@ -1020,6 +1301,15 @@ function App() {
                         disabled={!accessKey}
                     >
                         {isUploading ? "📁 Upload More Papers" : "📁 Upload Papers"}
+                    </button>
+                    <button
+                        onClick={() =>
+                            document.getElementById("folder-upload").click()
+                        }
+                        className="upload-button"
+                        disabled={!accessKey}
+                    >
+                        {isUploading ? "📂 Add Folder" : "📂 Upload Folder"}
                     </button>
                     <div className="theme-toggle">
                         <button onClick={() => setIsDarkMode(!isDarkMode)}>
@@ -1093,6 +1383,16 @@ function App() {
                     onChange={handleFileUpload}
                     style={{ display: "none" }}
                     id="file-upload"
+                />
+                <input
+                    type="file"
+                    multiple
+                    webkitdirectory=""
+                    directory=""
+                    mozdirectory=""
+                    onChange={handleFileUpload}
+                    style={{ display: "none" }}
+                    id="folder-upload"
                 />
                 {isUploading && (
                     <div

@@ -210,10 +210,12 @@ def get_job_status(job_id: str):
     if job.get("queued"):
         queue_items = list(getattr(app.state.upload_queue, "_queue", []))
         queued_job_ids = [item[0] for item in queue_items if item]
+        processing_jobs = sum(1 for entry in app.state.jobs.values() if entry.get("processing"))
         if job_id in queued_job_ids:
-            job["queue_position"] = queued_job_ids.index(job_id) + 1
+            job["queue_position"] = queued_job_ids.index(job_id) + processing_jobs + 1
         elif job.get("status") == "pending":
-            job["queue_position"] = 0
+            job["queue_position"] = processing_jobs if processing_jobs > 0 else 0
+        job["jobs_ahead"] = max(0, job.get("queue_position", 0) - 1)
     return job
 
 @app.get("/health")
