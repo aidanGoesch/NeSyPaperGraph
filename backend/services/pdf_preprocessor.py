@@ -3,18 +3,19 @@ import re
 from rapidfuzz import fuzz
 from io import BytesIO
 
-def extract_text_from_pdf(pdf_input):
-    """Extract all text from a PDF file or bytes."""
+def extract_text_from_pdf(pdf_input, max_pages=None):
+    """Extract text from a PDF file or bytes, optionally capped to max_pages."""
     # Handle both file paths and bytes
     if isinstance(pdf_input, bytes):
         reader = PdfReader(BytesIO(pdf_input))
     else:
         reader = PdfReader(pdf_input)
     
-    extracted_text = ""
-    for page in reader.pages:
-        extracted_text += page.extract_text() + "\n"
-    return extracted_text
+    text_chunks = []
+    pages = reader.pages if not max_pages or max_pages <= 0 else reader.pages[:max_pages]
+    for page in pages:
+        text_chunks.append((page.extract_text() or "") + "\n")
+    return "".join(text_chunks)
 
 def extract_topics(paper_text, current_topics=None):
     """Extract topics from paper text using AWS Bedrock."""

@@ -41,3 +41,25 @@ def timed_block(event: str):
             )
         else:
             logger.info("[Perf] %s | elapsed_ms=%.2f", event, elapsed_ms)
+
+
+@contextmanager
+def memory_delta_block(event: str):
+    start_memory = rss_mb()
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        end_memory = rss_mb()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if start_memory >= 0 and end_memory >= 0:
+            logger.info(
+                "[Perf] %s | elapsed_ms=%.2f | rss_start_mb=%.2f | rss_end_mb=%.2f | rss_delta_mb=%.2f",
+                event,
+                elapsed_ms,
+                start_memory,
+                end_memory,
+                end_memory - start_memory,
+            )
+        else:
+            logger.info("[Perf] %s | elapsed_ms=%.2f | rss_delta_mb=unavailable", event, elapsed_ms)

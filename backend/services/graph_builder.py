@@ -1,12 +1,14 @@
 from models.graph import PaperGraph
 from models.paper import Paper
 from services.llm_service import TopicExtractor, OpenAILLMClient
+from services.docling_service import get_docling_service
 from services.pdf_preprocessor import extract_text_from_pdf
 import logging
 import os
+import re
 from pathlib import Path
-from typing import Callable, Optional
-from services.observability import timed_block
+from typing import Any, Callable, Iterator, Optional
+from services.observability import timed_block, log_memory
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,8 @@ _topic_synonyms_cache = {}
 MAX_TOPICS_TRACKED = int(os.getenv("MAX_TOPICS_TRACKED", "5000") or "5000")
 MAX_TOPIC_SYNONYMS_CACHE = int(os.getenv("MAX_TOPIC_SYNONYMS_CACHE", "5000") or "5000")
 MAX_PERSISTED_TEXT_CHARS = int(os.getenv("MAX_PERSISTED_TEXT_CHARS", "0") or "0")
+INGEST_EMBED_BATCH_SIZE = int(os.getenv("INGEST_EMBED_BATCH_SIZE", "8") or "8")
+SUMMARY_SOURCE_MAX_CHARS = int(os.getenv("SUMMARY_SOURCE_MAX_CHARS", "7000") or "7000")
 
 
 def _cap_set_size(items: set, max_size: int) -> None:
@@ -48,6 +52,158 @@ class GraphBuilder:
         normalized = re.sub(r'[^\w\s]', '', normalized)  # Remove punctuation
         normalized = re.sub(r'\s+', ' ', normalized).strip()  # Normalize whitespace
         return normalized
+
+    @staticmethod
+    def _prefer_heuristic_title(
+        docling_title: str | None, heuristic_title: str | None
+    ) -> str | None:
+        """Prefer heuristic title when Docling returns likely venue/container labels."""
+        if not heuristic_title:
+            return docling_title
+        if not docling_title:
+            return heuristic_title
+
+        normalized_docling = docling_title.strip()
+        normalized_heuristic = heuristic_title.strip()
+        if not normalized_docling:
+            return normalized_heuristic
+        if not normalized_heuristic:
+            return normalized_docling
+
+        container_markers = [
+            r"\bjournal\b",
+            r"\bproceedings\b",
+            r"\btransactions\b",
+            r"\bconference\b",
+            r"\bvolume\b",
+            r"\bvol\.\b",
+            r"\bissue\b",
+            r"\bissn\b",
+            r"\bpublisher\b",
+        ]
+        lower_docling = normalized_docling.lower()
+        looks_like_container = any(
+            re.search(pattern, lower_docling) for pattern in container_markers
+        )
+        very_short_docling = len(normalized_docling) < 15
+
+        if (
+            looks_like_container or very_short_docling
+        ) and len(normalized_heuristic) >= len(normalized_docling):
+            return normalized_heuristic
+        return normalized_docling
+
+    @staticmethod
+    def _is_likely_valid_title(title: str | None) -> bool:
+        if not title:
+            return False
+        candidate = title.strip()
+        if len(candidate) < 8 or len(candidate) > 300:
+            return False
+        # Titles should contain meaningful alphabetic content.
+        alpha_count = sum(1 for ch in candidate if ch.isalpha())
+        if alpha_count < 6:
+            return False
+        non_space_count = sum(1 for ch in candidate if not ch.isspace())
+        if non_space_count == 0:
+            return False
+        symbol_ratio = (
+            sum(1 for ch in candidate if not ch.isalnum() and not ch.isspace())
+            / non_space_count
+        )
+        # Reject OCR noise like "1234567890();;"
+        if symbol_ratio > 0.35:
+            return False
+        digit_ratio = sum(1 for ch in candidate if ch.isdigit()) / non_space_count
+        if digit_ratio > 0.4:
+            return False
+        if re.fullmatch(r"[\d\W_]+", candidate):
+            return False
+        lower_candidate = candidate.lower()
+        if lower_candidate.startswith("tmp") and len(lower_candidate) <= 24:
+            return False
+        if lower_candidate.endswith(".pdf") and (
+            lower_candidate.startswith("tmp")
+            or lower_candidate.startswith("nesy_upload_")
+        ):
+            return False
+        if candidate.startswith("#") or candidate.startswith("<!--"):
+            return False
+        if re.search(r"[(){};,:]{3,}", candidate):
+            return False
+        return True
+
+    @staticmethod
+    def _heuristic_title_from_text(text: str, max_lines: int = 30) -> str | None:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        lines = lines[:max_lines]
+        title_exclude_patterns = [
+            r"arxiv",
+            r"preprint",
+            r"doi",
+            r"copyright",
+            r"all rights reserved",
+            r"\bjournal\b",
+            r"\bproceedings\b",
+            r"\bvolume\b",
+            r"\bissue\b",
+        ]
+        for line in lines:
+            if len(line) < 8 or len(line) > 300:
+                continue
+            lower = line.lower()
+            if any(re.search(pattern, lower) for pattern in title_exclude_patterns):
+                continue
+            if re.fullmatch(r"\d+(\s+of\s+\d+)?", line):
+                continue
+            if not GraphBuilder._is_likely_valid_title(line):
+                continue
+            return line
+        return None
+
+    @staticmethod
+    def _resolve_title(
+        preferred_title: str | None, heuristic_title: str | None, fallback_stem: str
+    ) -> str:
+        if GraphBuilder._is_likely_valid_title(preferred_title):
+            return preferred_title.strip()
+        if GraphBuilder._is_likely_valid_title(heuristic_title):
+            return heuristic_title.strip()
+        cleaned_stem = fallback_stem.strip() if fallback_stem else "Untitled Paper"
+        return cleaned_stem or "Untitled Paper"
+
+    @staticmethod
+    def _build_metadata_extractor() -> TopicExtractor:
+        try:
+            return TopicExtractor(OpenAILLMClient())
+        except Exception as exc:
+            logger.warning(
+                "[Metadata] LLM metadata extractor unavailable, using non-LLM fallbacks: %s",
+                exc,
+            )
+            return TopicExtractor(None)
+
+    @staticmethod
+    def _merge_metadata(base: dict, llm_metadata: dict | None) -> dict:
+        if not llm_metadata:
+            return base
+        merged = {
+            "title": base.get("title"),
+            "authors": base.get("authors", []),
+            "publication_date": base.get("publication_date"),
+        }
+        llm_title = llm_metadata.get("title")
+        if GraphBuilder._is_likely_valid_title(llm_title):
+            merged["title"] = llm_title.strip()
+        llm_authors = llm_metadata.get("authors")
+        if isinstance(llm_authors, list) and llm_authors:
+            cleaned_authors = [str(author).strip() for author in llm_authors if str(author).strip()]
+            if cleaned_authors:
+                merged["authors"] = cleaned_authors
+        llm_pub_date = llm_metadata.get("publication_date")
+        if isinstance(llm_pub_date, (str, int)) and str(llm_pub_date).strip():
+            merged["publication_date"] = str(llm_pub_date).strip()
+        return merged
     
     def _is_duplicate_paper(self, paper: Paper, graph: PaperGraph) -> bool:
         """Check if paper already exists in graph by normalized title"""
@@ -77,6 +233,7 @@ class GraphBuilder:
         file_path: str = None,
         existing_graph=None,
         on_paper_processed: Optional[Callable[[dict], None]] = None,
+        total_papers: Optional[int] = None,
     ) -> PaperGraph:
         """
         Builds a graph from PDF files.
@@ -89,6 +246,7 @@ class GraphBuilder:
             existing_graph: Existing PaperGraph to update, or None to create new
         """
         global _topic_synonyms_cache
+        log_memory("graph_builder_build_graph_start")
         
         # Use existing graph or create new one
         if existing_graph:
@@ -118,8 +276,12 @@ class GraphBuilder:
         
         if files_data is not None:
             papers_to_process = self.get_papers_from_data(files_data)
+            if total_papers is None:
+                total_papers = len(files_data)
         elif file_path is not None:
             papers_to_process = self.get_papers(file_path)
+            if total_papers is None:
+                total_papers = len(papers_to_process)
         else:
             raise ValueError("Either files_data or file_path must be provided")
         
@@ -129,13 +291,101 @@ class GraphBuilder:
         
         # Use OpenAI assistant (reads assistant_id from environment)
         client = OpenAILLMClient()
+        log_memory("graph_builder_after_openai_client_init")
         extractor = TopicExtractor(client)
         from services.verification import verify_bipartite, find_optimal_topic_merge
         
-        # Process papers one at a time, adding each to graph immediately
-        total_papers = len(papers_to_process)
+        total_papers = total_papers or 0
+        embed_batch_size = max(1, INGEST_EMBED_BATCH_SIZE)
+        pending_embedding_batch: list[dict[str, Any]] = []
+        input_paper_count = 0
+
+        def finalize_paper_into_graph(
+            paper: Paper, paper_index: int, paper_total: int
+        ) -> None:
+            # Drop or truncate retained full text to reduce graph memory footprint.
+            if MAX_PERSISTED_TEXT_CHARS <= 0:
+                paper.text = None
+            elif paper.text:
+                paper.text = paper.text[:MAX_PERSISTED_TEXT_CHARS]
+
+            graph.add_paper(paper)
+            if paper.content_hash:
+                graph.paper_content_hashes.add(paper.content_hash)
+
+            with timed_block("verify_bipartite_incremental"):
+                valid_increment = verify_bipartite(
+                    graph, graph.new_nodes, graph.new_edges
+                )
+            if not valid_increment:
+                logger.error(
+                    "Bipartite verification failed after adding paper: %s. Rolling back.",
+                    paper.title,
+                )
+                if paper.title in graph.graph:
+                    paper_topics = list(graph.graph.neighbors(paper.title))
+                    graph.graph.remove_node(paper.title)
+                    for topic in paper_topics:
+                        if topic in graph.graph and graph.graph.degree(topic) == 0:
+                            graph.graph.remove_node(topic)
+                            logger.info("Removed orphaned topic: %s", topic)
+                graph.clear_incremental_tracking()
+                if paper.content_hash:
+                    graph.paper_content_hashes.discard(paper.content_hash)
+                if on_paper_processed:
+                    on_paper_processed(
+                        {
+                            "status": "skipped",
+                            "reason": "verification_failed",
+                            "paper_title": paper.title,
+                            "paper_index": paper_index,
+                            "paper_total": paper_total,
+                            "graph": graph,
+                        }
+                    )
+                return
+
+            graph.clear_incremental_tracking()
+            if on_paper_processed:
+                on_paper_processed(
+                    {
+                        "status": "processed",
+                        "paper_title": paper.title,
+                        "paper_index": paper_index,
+                        "paper_total": paper_total,
+                        "graph": graph,
+                    }
+                )
+
+        def flush_embedding_batch() -> None:
+            if not pending_embedding_batch:
+                return
+            embedding_texts = [
+                item["embedding_text"] for item in pending_embedding_batch
+            ]
+            try:
+                with timed_block("embed_batch_request"):
+                    vectors = client.generate_embeddings(embedding_texts)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to generate batched embeddings for %s papers: %s",
+                    len(pending_embedding_batch),
+                    exc,
+                )
+                vectors = [[] for _ in pending_embedding_batch]
+
+            for batch_index, item in enumerate(pending_embedding_batch):
+                paper = item["paper"]
+                paper.embedding = vectors[batch_index] if batch_index < len(vectors) else []
+                finalize_paper_into_graph(
+                    paper=paper,
+                    paper_index=item["paper_index"],
+                    paper_total=item["paper_total"],
+                )
+            pending_embedding_batch.clear()
+
         for paper_index, paper in enumerate(papers_to_process, start=1):
-            # Check for duplicate papers by normalized title
+            input_paper_count = paper_index
             if self._is_duplicate_paper(paper, graph):
                 logger.info(f"Skipping duplicate paper: {paper.title}")
                 if on_paper_processed:
@@ -164,16 +414,19 @@ class GraphBuilder:
                         }
                     )
                 continue
-            # Truncate very long texts to avoid excessive processing time
-            # Keep first 50000 characters (enough for topic extraction)
-            text_for_extraction = paper.text[:50000] if len(paper.text) > 50000 else paper.text
-            
-            # Extract topics, passing in all accumulated topics (global + from previous papers in this batch)
-            topics = extractor.extract_topics(text_for_extraction, current_topics=accumulated_topics)
-            
-            # Skip paper if topic extraction failed
+
+            text_for_extraction = (
+                paper.text[:50000] if len(paper.text) > 50000 else paper.text
+            )
+
+            with timed_block("extract_topics_per_paper"):
+                topics = extractor.extract_topics(
+                    text_for_extraction, current_topics=accumulated_topics
+                )
             if not topics:
-                logger.warning(f"Skipping paper due to failed topic extraction: {paper.title}")
+                logger.warning(
+                    "Skipping paper due to failed topic extraction: %s", paper.title
+                )
                 if on_paper_processed:
                     on_paper_processed(
                         {
@@ -186,105 +439,51 @@ class GraphBuilder:
                         }
                     )
                 continue
-            
+
             paper.topics = topics
-            
-            # Generate summary (with internal fallbacks)
-            summary = client.generate_summary(text_for_extraction)
 
-            if not summary and text_for_extraction:
+            summary_source_text = text_for_extraction[:SUMMARY_SOURCE_MAX_CHARS]
+            with timed_block("generate_summary_per_paper"):
+                summary = client.generate_summary(summary_source_text)
+            if not summary and summary_source_text:
                 logger.warning(
-                    f"[Summary] Empty summary returned for paper '{paper.title}'. "
-                    f"Using heuristic summary based on source text."
-                )
-                # As a last resort, use the start of the text as a pseudo-summary
-                summary = text_for_extraction[:1000]
-
-            paper.summary = summary
-            
-            # Generate embedding from summary (more concise than full text)
-            embedding_text = paper.summary if paper.summary else text_for_extraction[:1000]
-            try:
-                paper.embedding = client.generate_embedding(embedding_text)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to generate OpenAI embedding for '%s': %s",
+                    "[Summary] Empty summary returned for paper '%s'. Using heuristic summary based on source text.",
                     paper.title,
-                    exc,
                 )
-                paper.embedding = []
+                summary = summary_source_text[:1000]
+            paper.summary = summary
 
-            # Drop or truncate retained full text to reduce graph memory footprint.
-            if MAX_PERSISTED_TEXT_CHARS <= 0:
-                paper.text = None
-            elif paper.text:
-                paper.text = paper.text[:MAX_PERSISTED_TEXT_CHARS]
-            
-            # Update accumulated topics with new topics from this paper
             new_topics = set(topics) - accumulated_topics
             if new_topics:
                 accumulated_topics.update(new_topics)
-            
-            self.topics.update(set(topics))  # Track topics for this batch
-            
-            # Add topics to global set of all topics seen (if not already there)
+            self.topics.update(set(topics))
             global_new_topics = set(topics) - _all_topics_seen
             if global_new_topics:
                 _all_topics_seen.update(global_new_topics)
                 _cap_set_size(_all_topics_seen, MAX_TOPICS_TRACKED)
-            
-            # Add paper to graph immediately after processing
-            graph.add_paper(paper)
-            if paper.content_hash:
-                graph.paper_content_hashes.add(paper.content_hash)
-            
-            # Verify bipartiteness incrementally after adding paper
-            if not verify_bipartite(graph, graph.new_nodes, graph.new_edges):
-                logger.error(f"Bipartite verification failed after adding paper: {paper.title}. Rolling back.")
-                
-                # Remove the paper node
-                if paper.title in graph.graph:
-                    # Get topics connected to this paper before removing
-                    paper_topics = list(graph.graph.neighbors(paper.title))
-                    graph.graph.remove_node(paper.title)
-                    
-                    # Remove orphaned topics (topics with no remaining connections)
-                    for topic in paper_topics:
-                        if topic in graph.graph and graph.graph.degree(topic) == 0:
-                            graph.graph.remove_node(topic)
-                            logger.info(f"Removed orphaned topic: {topic}")
-                
-                # Clear the incremental tracking for this failed addition
-                graph.clear_incremental_tracking()
-                if paper.content_hash:
-                    graph.paper_content_hashes.discard(paper.content_hash)
-                if on_paper_processed:
-                    on_paper_processed(
-                        {
-                            "status": "skipped",
-                            "reason": "verification_failed",
-                            "paper_title": paper.title,
-                            "paper_index": paper_index,
-                            "paper_total": total_papers,
-                            "graph": graph,
-                        }
-                    )
-                continue
-            
-            # Clear tracking after successful verification
-            graph.clear_incremental_tracking()
-            if on_paper_processed:
-                on_paper_processed(
-                    {
-                        "status": "processed",
-                        "paper_title": paper.title,
-                        "paper_index": paper_index,
-                        "paper_total": total_papers,
-                        "graph": graph,
-                    }
-                )
+
+            embedding_text = (
+                paper.summary if paper.summary else text_for_extraction[:1000]
+            )
+            pending_embedding_batch.append(
+                {
+                    "paper": paper,
+                    "paper_index": paper_index,
+                    "paper_total": total_papers,
+                    "embedding_text": embedding_text,
+                }
+            )
+            if len(pending_embedding_batch) >= embed_batch_size:
+                flush_embedding_batch()
+
+        flush_embedding_batch()
+        log_memory("graph_builder_after_embedding_batches")
         
-        logger.info(f"Processed {len(papers_to_process)} papers, {len(self.topics)} unique topics in this batch")
+        logger.info(
+            "Processed %s papers, %s unique topics in this batch",
+            input_paper_count,
+            len(self.topics),
+        )
         
         # Generate synonyms for all topics in the graph
         all_topics = [node for node, data in graph.graph.nodes(data=True) if data.get('type') == 'topic']
@@ -320,40 +519,188 @@ class GraphBuilder:
         with timed_block("add_semantic_edges"):
             graph.add_semantic_edges()
         logger.info("Semantic edges added")
+        log_memory("graph_builder_build_graph_end")
         
         return graph
 
+    def ingest_semantic_paper(
+        self,
+        semantic_paper: dict[str, Any],
+        existing_graph: PaperGraph | None = None,
+        llm_client: Any | None = None,
+        topic_extractor: Any | None = None,
+    ) -> PaperGraph:
+        """
+        Ingest one Semantic Scholar-derived paper into the graph.
+        Topic extraction is intentionally driven from abstract text.
+        """
+        from services.verification import verify_bipartite, find_optimal_topic_merge
 
-    def get_papers_from_data(self, files_data: list[tuple]) -> list[Paper]:
+        graph = existing_graph or PaperGraph()
+        self._ensure_graph_metadata(graph)
+
+        if existing_graph:
+            self.papers = []
+            self.topics = set()
+            for node, data in graph.graph.nodes(data=True):
+                if data.get("type") == "paper":
+                    existing_paper = data["data"]
+                    self.papers.append(existing_paper)
+                    if getattr(existing_paper, "content_hash", None):
+                        graph.paper_content_hashes.add(existing_paper.content_hash)
+                elif data.get("type") == "topic":
+                    self.topics.add(node)
+        else:
+            self.papers = []
+            self.topics = set()
+
+        client = llm_client or OpenAILLMClient()
+        extractor = topic_extractor or TopicExtractor(client)
+
+        title = (semantic_paper.get("title") or "").strip() or "Untitled Paper"
+        source_url = (semantic_paper.get("url") or "").strip() or title
+        paper_id = (semantic_paper.get("semanticScholarPaperId") or "").strip()
+        abstract = (semantic_paper.get("abstract") or "").strip()
+        abstract = abstract[:50000] if len(abstract) > 50000 else abstract
+        publication_date = semantic_paper.get("year")
+        if publication_date is not None and str(publication_date).strip():
+            publication_date = str(publication_date).strip()
+        else:
+            publication_date = None
+
+        paper = Paper(
+            title=title,
+            file_path=source_url,
+            content_hash=f"semantic_scholar:{paper_id}" if paper_id else None,
+            text=abstract,
+            summary=abstract,
+            topics=[],
+            authors=semantic_paper.get("authors") or [],
+            publication_date=publication_date,
+        )
+
+        if self._is_duplicate_paper(paper, graph):
+            return graph
+        if self._is_duplicate_hash(paper, graph):
+            return graph
+
+        extraction_source = abstract or title
+        topics = extractor.extract_topics(extraction_source, current_topics=self.topics)
+        if not topics:
+            return graph
+        paper.topics = topics
+
+        embedding_text = paper.summary if paper.summary else extraction_source
+        vectors = client.generate_embeddings([embedding_text])
+        paper.embedding = vectors[0] if vectors else []
+
+        if MAX_PERSISTED_TEXT_CHARS <= 0:
+            paper.text = None
+        elif paper.text:
+            paper.text = paper.text[:MAX_PERSISTED_TEXT_CHARS]
+
+        graph.add_paper(paper)
+        if paper.content_hash:
+            graph.paper_content_hashes.add(paper.content_hash)
+        if not verify_bipartite(graph, graph.new_nodes, graph.new_edges):
+            if paper.title in graph.graph:
+                graph.graph.remove_node(paper.title)
+            graph.clear_incremental_tracking()
+            if paper.content_hash:
+                graph.paper_content_hashes.discard(paper.content_hash)
+            return graph
+        graph.clear_incremental_tracking()
+
+        self.topics.update(set(topics))
+        global _all_topics_seen
+        _all_topics_seen.update(topics)
+        _cap_set_size(_all_topics_seen, MAX_TOPICS_TRACKED)
+
+        all_topics = [
+            node for node, data in graph.graph.nodes(data=True) if data.get("type") == "topic"
+        ]
+        if all_topics:
+            new_topics = [topic for topic in all_topics if topic not in _topic_synonyms_cache]
+            if new_topics:
+                _topic_synonyms_cache.update(client.generate_topic_synonyms(new_topics))
+                _cap_dict_size(_topic_synonyms_cache, MAX_TOPIC_SYNONYMS_CACHE)
+            graph.topic_synonyms = {
+                topic: _topic_synonyms_cache[topic]
+                for topic in all_topics
+                if topic in _topic_synonyms_cache
+            }
+            merge_groups = find_optimal_topic_merge(all_topics, graph.topic_synonyms)
+            graph.topic_merge_groups = merge_groups
+            graph.merge_topics(merge_groups)
+
+        graph.add_semantic_edges()
+        return graph
+
+
+    def get_papers_from_data(self, files_data: list[tuple]) -> Iterator[Paper]:
         """
         Creates Paper objects from file data (filename, content bytes).
         
         Args:
             files_data: List of tuples (filename, file_content_bytes)
         """
-        # Initialize LLM client for metadata extraction
-        from .llm_service import OpenAILLMClient, TopicExtractor
-        client = OpenAILLMClient()
-        extractor = TopicExtractor(client)
+        metadata_extractor = self._build_metadata_extractor()
+        docling = get_docling_service()
+        log_memory("graph_builder_get_papers_from_data_start")
+        docling_success_count = 0
+        fallback_count = 0
+        metadata_complete_count = 0
         
-        parsed_papers = []
         for file_tuple in files_data:
-            if len(file_tuple) == 3:
+            if len(file_tuple) == 4:
+                filename, file_content, content_hash, _ = file_tuple
+            elif len(file_tuple) == 3:
                 filename, file_content, content_hash = file_tuple
             else:
                 filename, file_content = file_tuple
                 content_hash = None
-            # Extract text from PDF
-            text = extract_text_from_pdf(file_content)
+            if isinstance(file_content, (str, Path)):
+                with Path(file_content).open("rb") as handle:
+                    file_bytes = handle.read()
+            else:
+                file_bytes = file_content
+            parsed_doc = docling.parse_pdf(file_bytes)
+            metadata = {
+                "title": parsed_doc.get("title"),
+                "authors": parsed_doc.get("authors", []),
+                "publication_date": parsed_doc.get("publication_date"),
+            }
+            text = parsed_doc.get("text") or ""
+            if parsed_doc.get("ok"):
+                docling_success_count += 1
+            else:
+                fallback_count += 1
+                with timed_block("docling_fallback_extract_text_per_paper"):
+                    text = extract_text_from_pdf(
+                        file_bytes, max_pages=getattr(docling, "max_pages", None)
+                    )
+                with timed_block("metadata_fallback_heuristic_per_paper"):
+                    metadata = metadata_extractor.heuristic_metadata(text)
+            heuristic_title = self._heuristic_title_from_text(text)
+            metadata["title"] = self._prefer_heuristic_title(
+                metadata.get("title"),
+                heuristic_title,
+            )
+            if metadata_extractor.llm_client and text:
+                with timed_block("metadata_llm_extract_per_paper"):
+                    llm_metadata = metadata_extractor.extract_paper_metadata(text)
+                metadata = self._merge_metadata(metadata, llm_metadata)
+            if metadata.get("title") and metadata.get("authors") and metadata.get("publication_date"):
+                metadata_complete_count += 1
             
-            # Extract metadata using LLM (with internal heuristic fallback)
-            metadata = extractor.extract_paper_metadata(text)
-            
-            # Use extracted title if available, otherwise use filename
-            title = metadata.get('title') or Path(filename).stem
-            if not metadata.get('title'):
+            title = self._resolve_title(
+                metadata.get("title"),
+                heuristic_title,
+                Path(filename).stem,
+            )
+            if title == Path(filename).stem:
                 logger.warning(
-                    f"[Metadata] No title returned from extractor; using filename as title for {filename}"
+                    f"[Metadata] Using filename fallback title for {filename}; extracted title looked invalid."
                 )
             
             paper = Paper(
@@ -364,36 +711,73 @@ class GraphBuilder:
                 authors=metadata.get('authors', []),
                 publication_date=metadata.get('publication_date')
             )
-            parsed_papers.append(paper)
-            self.papers.append(paper)
-        
-        return parsed_papers
+            file_bytes = b""
+            yield paper
+
+        logger.info(
+            "Metadata extraction summary | papers=%s | docling_success=%s | heuristic_fallback=%s | metadata_complete=%s",
+            len(files_data),
+            docling_success_count,
+            fallback_count,
+            metadata_complete_count,
+        )
+        log_memory("graph_builder_get_papers_from_data_end")
 
     def get_papers(self, file_path: str) -> list[Paper]:
         """
         Gets all of the pdfs in the given file path and all of its sub folders.
         Legacy method for backward compatibility.
         """
-        # Initialize LLM client for metadata extraction
-        from .llm_service import OpenAILLMClient, TopicExtractor
-        client = OpenAILLMClient()
-        extractor = TopicExtractor(client)
+        metadata_extractor = self._build_metadata_extractor()
+        docling = get_docling_service()
+        docling_success_count = 0
+        fallback_count = 0
+        metadata_complete_count = 0
         
         path = Path(file_path)
         
         parsed_papers = []
         for pdf_file in path.rglob("*.pdf"):
             # Extract text from PDF
-            text = extract_text_from_pdf(str(pdf_file))
+            with pdf_file.open("rb") as handle:
+                file_content = handle.read()
+            parsed_doc = docling.parse_pdf(file_content)
+            metadata = {
+                "title": parsed_doc.get("title"),
+                "authors": parsed_doc.get("authors", []),
+                "publication_date": parsed_doc.get("publication_date"),
+            }
+            text = parsed_doc.get("text") or ""
+            if parsed_doc.get("ok"):
+                docling_success_count += 1
+            else:
+                fallback_count += 1
+                with timed_block("docling_fallback_extract_text_per_paper"):
+                    text = extract_text_from_pdf(
+                        str(pdf_file), max_pages=getattr(docling, "max_pages", None)
+                    )
+                with timed_block("metadata_fallback_heuristic_per_paper"):
+                    metadata = metadata_extractor.heuristic_metadata(text)
+            heuristic_title = self._heuristic_title_from_text(text)
+            metadata["title"] = self._prefer_heuristic_title(
+                metadata.get("title"),
+                heuristic_title,
+            )
+            if metadata_extractor.llm_client and text:
+                with timed_block("metadata_llm_extract_per_paper"):
+                    llm_metadata = metadata_extractor.extract_paper_metadata(text)
+                metadata = self._merge_metadata(metadata, llm_metadata)
+            if metadata.get("title") and metadata.get("authors") and metadata.get("publication_date"):
+                metadata_complete_count += 1
             
-            # Extract metadata using LLM (with internal heuristic fallback)
-            metadata = extractor.extract_paper_metadata(text)
-            
-            # Use extracted title if available, otherwise use filename
-            title = metadata.get('title') or pdf_file.stem
-            if not metadata.get('title'):
+            title = self._resolve_title(
+                metadata.get("title"),
+                heuristic_title,
+                pdf_file.stem,
+            )
+            if title == pdf_file.stem:
                 logger.warning(
-                    f"[Metadata] No title returned from extractor; using filename as title for {pdf_file}"
+                    f"[Metadata] Using filename fallback title for {pdf_file}; extracted title looked invalid."
                 )
             
             paper = Paper(
@@ -405,6 +789,14 @@ class GraphBuilder:
             )
             parsed_papers.append(paper)
             self.papers.append(paper)
+
+        logger.info(
+            "Metadata extraction summary | papers=%s | docling_success=%s | heuristic_fallback=%s | metadata_complete=%s",
+            len(parsed_papers),
+            docling_success_count,
+            fallback_count,
+            metadata_complete_count,
+        )
         
         return parsed_papers
 

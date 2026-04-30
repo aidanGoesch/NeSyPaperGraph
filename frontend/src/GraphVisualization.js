@@ -1,6 +1,12 @@
-import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react';
+import React, { useEffect, useMemo, useRef, useState, forwardRef, useImperativeHandle } from 'react';
 import ReactMarkdown from 'react-markdown';
 import * as d3 from 'd3';
+
+const PAPER_NODE_RADIUS = 10;
+const TOPIC_NODE_MIN_RADIUS = 18;
+const TOPIC_NODE_MAX_RADIUS = 50;
+const TOPIC_SIZE_EXPONENT = 1.35;
+const COLLISION_PADDING = 12;
 
 const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, onTopicClick, highlightPath }, ref) => {
   const svgRef = useRef();
@@ -12,9 +18,136 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
   const [showMenu, setShowMenu] = useState(false);
   const [semanticThreshold, setSemanticThreshold] = useState(0.25);
   const selectedNodeRef = useRef(null);
+  const pinnedNodeRef = useRef(null);
   const simulationRef = useRef(null);
   const nodesRef = useRef([]);
   const zoomRef = useRef(null);
+  const panelMetrics = { width: 350, maxHeight: 400, margin: 12 };
+  const paperByTitle = useMemo(
+    () => new Map((data?.papers || []).map((paper) => [paper.title, paper])),
+    [data]
+  );
+
+  const toSelectedPaper = (paper) => ({
+    title: paper?.title || "",
+    authors: paper?.authors || [],
+    year: paper?.year,
+    publication_date: paper?.publication_date,
+    abstract: paper?.abstract || "No summary available.",
+    topics: paper?.topics || [],
+  });
+
+  const normalizeLinkEndpoint = (endpoint) => {
+    if (endpoint && typeof endpoint === "object") {
+      return endpoint.id || endpoint.title || endpoint.name || "";
+    }
+    return endpoint;
+  };
+
+  const buildLinks = (papers, rawEdges) => {
+    const normalizedLinks = Array.isArray(rawEdges)
+      ? rawEdges.map((edge) => ({
+          ...edge,
+          source: normalizeLinkEndpoint(edge.source),
+          target: normalizeLinkEndpoint(edge.target),
+        }))
+      : [];
+
+    if (normalizedLinks.length > 0) {
+      return normalizedLinks;
+    }
+
+    const fallbackLinks = [];
+    (papers || []).forEach((paper) => {
+      (paper.topics || []).forEach((topic) => {
+        fallbackLinks.push({ source: paper.title, target: topic });
+      });
+    });
+    return fallbackLinks;
+  };
+
+  const buildTopicPaperCounts = (topics, links, paperTitles) => {
+    const topicToConnectedPapers = new Map(
+      (topics || []).map((topic) => [topic, new Set()])
+    );
+
+    (links || []).forEach((link) => {
+      if (link?.type === 'semantic') return;
+
+      const sourceId = normalizeLinkEndpoint(link.source);
+      const targetId = normalizeLinkEndpoint(link.target);
+      const sourceIsTopic = topicToConnectedPapers.has(sourceId);
+      const targetIsTopic = topicToConnectedPapers.has(targetId);
+
+      if (sourceIsTopic && paperTitles.has(targetId)) {
+        topicToConnectedPapers.get(sourceId).add(targetId);
+      }
+      if (targetIsTopic && paperTitles.has(sourceId)) {
+        topicToConnectedPapers.get(targetId).add(sourceId);
+      }
+    });
+
+    return new Map(
+      Array.from(topicToConnectedPapers.entries()).map(([topic, connectedPapers]) => [
+        topic,
+        connectedPapers.size,
+      ])
+    );
+  };
+
+  const getConnectedPapersForTopic = (topicName, links, papers) => {
+    const connectedTitles = new Set();
+    (links || []).forEach((link) => {
+      const sourceId = normalizeLinkEndpoint(link.source);
+      const targetId = normalizeLinkEndpoint(link.target);
+      if (sourceId === topicName && targetId) connectedTitles.add(targetId);
+      if (targetId === topicName && sourceId) connectedTitles.add(sourceId);
+    });
+    return (papers || []).filter((paper) => connectedTitles.has(paper.title));
+  };
+
+  const clampPanelToContainer = (x, y) => {
+    const container = containerRef.current;
+    if (!container) return { x, y };
+    const maxX = Math.max(
+      panelMetrics.margin,
+      container.clientWidth - panelMetrics.width - panelMetrics.margin
+    );
+    const maxY = Math.max(
+      panelMetrics.margin,
+      container.clientHeight - panelMetrics.maxHeight - panelMetrics.margin
+    );
+    return {
+      x: Math.min(Math.max(x, panelMetrics.margin), maxX),
+      y: Math.min(Math.max(y, panelMetrics.margin), maxY),
+    };
+  };
+
+  const getPanelPositionForNode = (node, transformOverride) => {
+    if (!node || !svgRef.current) return null;
+    const transform =
+      transformOverride || d3.zoomTransform(d3.select(svgRef.current).node());
+    const [x, y] = transform.apply([node.x, node.y]);
+    return clampPanelToContainer(x + 20, y - 10);
+  };
+
+  const pinNode = (node) => {
+    if (!node) return;
+    if (pinnedNodeRef.current && pinnedNodeRef.current !== node) {
+      pinnedNodeRef.current.fx = null;
+      pinnedNodeRef.current.fy = null;
+    }
+    node.fx = node.x;
+    node.fy = node.y;
+    pinnedNodeRef.current = node;
+  };
+
+  const unpinNode = () => {
+    if (!pinnedNodeRef.current) return;
+    pinnedNodeRef.current.fx = null;
+    pinnedNodeRef.current.fy = null;
+    pinnedNodeRef.current = null;
+  };
 
   useImperativeHandle(ref, () => ({
     focusOnTopic: (topicName) => {
@@ -24,6 +157,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       if (!topicNode) return;
       
       selectedNodeRef.current = topicNode;
+      pinNode(topicNode);
       
       // Navigate to topic location
       const svg = d3.select(svgRef.current);
@@ -33,35 +167,23 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       const scale = 1.5;
       const newX = -topicNode.x * scale + width / 2;
       const newY = -topicNode.y * scale + height / 2;
+      const targetTransform = d3.zoomIdentity.translate(newX, newY).scale(scale);
       
       svg.transition()
         .duration(750)
-        .call(zoomRef.current.transform, d3.zoomIdentity.translate(newX, newY).scale(scale));
+        .call(zoomRef.current.transform, targetTransform);
       
-      // Show topic panel
-      const transform = d3.zoomTransform(svg.node());
-      const [x, y] = transform.apply([topicNode.x, topicNode.y]);
-      const svgRect = svgRef.current.getBoundingClientRect();
-      
-      setPanelPosition({
-        x: svgRect.left + x + 20,
-        y: svgRect.top + y - 10,
-      });
+      // Show topic panel near node, constrained inside container.
+      const nextPanelPosition = getPanelPositionForNode(topicNode, targetTransform);
+      if (nextPanelPosition) setPanelPosition(nextPanelPosition);
       
       // Find connected papers
-      const links = data.edges || [];
-      if (links.length === 0) {
-        data.papers.forEach(paper => {
-          paper.topics.forEach(topic => {
-            links.push({ source: paper.title, target: topic });
-          });
-        });
-      }
-      
-      const connectedPapers = links
-        .filter(link => link.target.id === topicName || link.source.id === topicName)
-        .map(link => link.target.id === topicName ? link.source : link.target)
-        .filter(node => node.type === 'paper');
+      const links = buildLinks(data.papers, data.edges);
+      const connectedPapers = getConnectedPapersForTopic(
+        topicName,
+        links,
+        data.papers
+      );
       
       setSelectedPaper(null);
       setSelectedTopic({
@@ -76,6 +198,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       if (!paperNode) return;
       
       selectedNodeRef.current = paperNode;
+      pinNode(paperNode);
       
       // Navigate to paper location
       const svg = d3.select(svgRef.current);
@@ -85,33 +208,21 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       const scale = 1.5;
       const newX = -paperNode.x * scale + width / 2;
       const newY = -paperNode.y * scale + height / 2;
+      const targetTransform = d3.zoomIdentity.translate(newX, newY).scale(scale);
       
       svg.transition()
         .duration(750)
-        .call(zoomRef.current.transform, d3.zoomIdentity.translate(newX, newY).scale(scale));
+        .call(zoomRef.current.transform, targetTransform);
       
-      // Show paper panel
-      const transform = d3.zoomTransform(svg.node());
-      const [x, y] = transform.apply([paperNode.x, paperNode.y]);
-      const svgRect = svgRef.current.getBoundingClientRect();
-      
-      setPanelPosition({
-        x: svgRect.left + x + 20,
-        y: svgRect.top + y - 10,
-      });
+      // Show paper panel near node, constrained inside container.
+      const nextPanelPosition = getPanelPositionForNode(paperNode, targetTransform);
+      if (nextPanelPosition) setPanelPosition(nextPanelPosition);
       
       // Find the paper data
-      const paper = data.papers.find(p => p.title === paperTitle);
+      const paper = paperByTitle.get(paperTitle);
       if (paper) {
         setSelectedTopic(null);
-        setSelectedPaper({
-          title: paper.title,
-          authors: paper.authors || ['Dr. Jane Smith', 'Dr. John Doe', 'Dr. Alice Johnson'],
-          year: paper.year,
-          publication_date: paper.publication_date,
-          abstract: paper.abstract || 'This is a dummy abstract for the paper...',
-          topics: paper.topics || []
-        });
+        setSelectedPaper(toSelectedPaper(paper));
       }
     }
   }));
@@ -148,26 +259,80 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       return;
     }
 
+    const links = buildLinks(data.papers, data.edges);
+    const paperTitles = new Set((data.papers || []).map((paper) => paper.title));
+    const topicPaperCounts = buildTopicPaperCounts(data.topics, links, paperTitles);
+    const topicCounts = Array.from(topicPaperCounts.values());
+    const minTopicCount = topicCounts.length > 0 ? Math.min(...topicCounts) : 0;
+    const maxTopicCount = topicCounts.length > 0 ? Math.max(...topicCounts) : 0;
+
+    const getTopicNodeRadius =
+      minTopicCount === maxTopicCount
+        ? () =>
+            minTopicCount <= 1
+              ? TOPIC_NODE_MIN_RADIUS
+              : (TOPIC_NODE_MIN_RADIUS + TOPIC_NODE_MAX_RADIUS) / 2
+        : d3
+            .scalePow()
+            .exponent(TOPIC_SIZE_EXPONENT)
+            .domain([minTopicCount, maxTopicCount])
+            .range([TOPIC_NODE_MIN_RADIUS, TOPIC_NODE_MAX_RADIUS]);
+
     const nodes = [
-      ...data.papers.map(paper => ({ id: paper.title, type: 'paper', ...paper })),
-      ...data.topics.map(topic => ({ id: topic, type: 'topic' }))
+      ...data.papers.map((paper) => ({
+        id: paper.title,
+        type: 'paper',
+        title: paper.title,
+        radius: PAPER_NODE_RADIUS,
+      })),
+      ...data.topics.map((topic) => {
+        const paperCount = topicPaperCounts.get(topic) || 0;
+        return {
+          id: topic,
+          type: 'topic',
+          paperCount,
+          radius: Math.max(TOPIC_NODE_MIN_RADIUS, getTopicNodeRadius(paperCount)),
+        };
+      }),
     ];
 
-    const links = data.edges || [];
-    // Fallback: if no edges provided, create topic links
-    if (links.length === 0) {
-      data.papers.forEach(paper => {
-        paper.topics.forEach(topic => {
-          links.push({ source: paper.title, target: topic });
-        });
-      });
-    }
+    const highlightedNodeSet = new Set(
+      Array.isArray(highlightPath?.nodes) ? highlightPath.nodes : []
+    );
+    const pathNodes =
+      highlightPath?.mode === "path" && Array.isArray(highlightPath?.nodes)
+        ? highlightPath.nodes
+        : [];
+    const isEdgeInHighlightedPath = (edge) => {
+      if (pathNodes.length < 2) return false;
+      const sourceId = edge.source.id || edge.source;
+      const targetId = edge.target.id || edge.target;
+      for (let i = 0; i < pathNodes.length - 1; i++) {
+        if (
+          (pathNodes[i] === sourceId && pathNodes[i + 1] === targetId) ||
+          (pathNodes[i] === targetId && pathNodes[i + 1] === sourceId)
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
 
     const simulation = d3.forceSimulation(nodes)
-      .force("link", d3.forceLink(links).id(d => d.id).distance(120))
+      .force("link", d3.forceLink(links)
+        .id(d => d.id)
+        .distance((d) => {
+          const targetId = d?.target?.id || d?.target;
+          const degree = links.filter((l) => {
+            const sourceId = l?.source?.id || l?.source;
+            return sourceId === targetId;
+          }).length;
+          return Math.max(60, 150 - degree * 5);
+        }))
       .force("charge", d3.forceManyBody().strength(-400))
       .force("center", d3.forceCenter(width / 2, height / 2))
-      .force("collision", d3.forceCollide().radius(30));
+      .force("collision", d3.forceCollide().radius((d) => (d.radius || PAPER_NODE_RADIUS) + COLLISION_PADDING))
+      .alphaDecay(0.01);
 
     simulationRef.current = simulation;
     nodesRef.current = nodes;
@@ -193,40 +358,18 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       .data(links)
       .enter().append("line")
       .attr("stroke", d => {
-        // Highlight path edges
-        if (highlightPath && highlightPath.nodes) {
-          const sourceId = d.source.id || d.source;
-          const targetId = d.target.id || d.target;
-          const pathNodes = highlightPath.nodes;
-          
-          // Check if this edge is part of the path
-          for (let i = 0; i < pathNodes.length - 1; i++) {
-            if ((pathNodes[i] === sourceId && pathNodes[i + 1] === targetId) ||
-                (pathNodes[i] === targetId && pathNodes[i + 1] === sourceId)) {
-              return "#FFD600";
-            }
-          }
+        if (isEdgeInHighlightedPath(d)) {
+          return "#FFD600";
         }
         
         return d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000");
       })
       .attr("stroke-width", d => {
-        // Thicker stroke for path edges
-        if (highlightPath && highlightPath.nodes) {
-          const sourceId = d.source.id || d.source;
-          const targetId = d.target.id || d.target;
-          const pathNodes = highlightPath.nodes;
-          
-          // Check if this edge is part of the path
-          for (let i = 0; i < pathNodes.length - 1; i++) {
-            if ((pathNodes[i] === sourceId && pathNodes[i + 1] === targetId) ||
-                (pathNodes[i] === targetId && pathNodes[i + 1] === sourceId)) {
-              return 6;
-            }
-          }
+        if (isEdgeInHighlightedPath(d)) {
+          return 6;
         }
         
-        return d.type === 'semantic' ? ((d.weight - 0.25) * 5) : 5;
+        return d.type === 'semantic' ? ((d.weight - 0.25) * 4) : 4;
       })
       .attr("stroke-opacity", d => {
         if (d.type === 'semantic') {
@@ -246,24 +389,21 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       .selectAll("circle")
       .data(nodes)
       .enter().append("circle")
-      .attr("r", d => d.type === 'paper' ? 10 : 15)
+      .attr("r", (d) => d.radius || PAPER_NODE_RADIUS)
       .attr("fill", d => {
-        // Highlight path nodes
-        if (highlightPath && highlightPath.nodes && highlightPath.nodes.includes(d.id)) {
+        if (highlightedNodeSet.has(d.id)) {
           return d.type === 'paper' ? "#FF6B35" : "#FF1744";
         }
         return d.type === 'paper' ? "#4CAF50" : "#FF6B6B";
       })
       .attr("stroke", d => {
-        // Highlight path nodes with thicker stroke
-        if (highlightPath && highlightPath.nodes && highlightPath.nodes.includes(d.id)) {
+        if (highlightedNodeSet.has(d.id)) {
           return "#FFD600";
         }
         return "#fff";
       })
       .attr("stroke-width", d => {
-        // Thicker stroke for path nodes
-        if (highlightPath && highlightPath.nodes && highlightPath.nodes.includes(d.id)) {
+        if (highlightedNodeSet.has(d.id)) {
           return 4;
         }
         return 2;
@@ -286,35 +426,23 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
         
         selectedNodeRef.current = d; // keep live reference
 
-        const transform = d3.zoomTransform(svg.node());
-        const [x, y] = transform.apply([d.x, d.y]);
-        const svgRect = svgRef.current.getBoundingClientRect();
-
-        const offsetX = 20;
-        const offsetY = -10;
-
-        setPanelPosition({
-          x: svgRect.left + x + offsetX,
-          y: svgRect.top + y + offsetY,
-        });
+        const nextPanelPosition = getPanelPositionForNode(d);
+        if (nextPanelPosition) setPanelPosition(nextPanelPosition);
 
         if (d.type === 'paper') {
           setSelectedTopic(null);
-          setSelectedPaper({
-            title: d.title,
-            authors: d.authors || ['Dr. Jane Smith', 'Dr. John Doe', 'Dr. Alice Johnson'],
-            year: d.year,
-            publication_date: d.publication_date,
-            abstract: d.abstract || 'This is a dummy abstract for the paper...',
-            topics: d.topics || []
-          });
+          const selectedPaperData = paperByTitle.get(d.id);
+          if (selectedPaperData) {
+            setSelectedPaper(toSelectedPaper(selectedPaperData));
+          }
         } else if (d.type === 'topic') {
           setSelectedPaper(null);
           // Find connected papers
-          const connectedPapers = links
-            .filter(link => link.target.id === d.id || link.source.id === d.id)
-            .map(link => link.target.id === d.id ? link.source : link.target)
-            .filter(node => node.type === 'paper');
+          const connectedPapers = getConnectedPapersForTopic(
+            d.id,
+            links,
+            data.papers
+          );
           
           setSelectedTopic({
             name: d.id,
@@ -372,8 +500,33 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       updatePanelPosition(); // follow node as simulation moves
     });
 
+    let preDragVelocityDecay = simulation.velocityDecay();
+
     function dragstarted(event, d) {
-      if (!event.active) simulation.alphaTarget(0.3).restart();
+      const syrupAnchors = new Map();
+      nodes.forEach((node) => {
+        if (node.id !== d.id) {
+          syrupAnchors.set(node.id, { x: node.x, y: node.y });
+        }
+      });
+
+      preDragVelocityDecay = simulation.velocityDecay();
+      simulation
+        .force(
+          "syrupX",
+          d3
+            .forceX((node) => syrupAnchors.get(node.id)?.x ?? node.x)
+            .strength((node) => (node.id === d.id ? 0 : 0.12))
+        )
+        .force(
+          "syrupY",
+          d3
+            .forceY((node) => syrupAnchors.get(node.id)?.y ?? node.y)
+            .strength((node) => (node.id === d.id ? 0 : 0.12))
+        )
+        .velocityDecay(0.9)
+        .alphaTarget(0.1)
+        .restart();
       d.fx = d.x;
       d.fy = d.y;
     }
@@ -384,25 +537,19 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     }
 
     function dragended(event, d) {
-      if (!event.active) simulation.alphaTarget(0);
-      d.fx = null;
-      d.fy = null;
+      simulation
+        .force("syrupX", null)
+        .force("syrupY", null)
+        .velocityDecay(preDragVelocityDecay)
+        .alphaTarget(0);
+      d.fx = event.x;
+      d.fy = event.y;
     }
 
     function updatePanelPosition() {
       if (!selectedNodeRef.current) return;
-      const transform = d3.zoomTransform(svg.node());
-      const [x, y] = transform.apply([
-        selectedNodeRef.current.x,
-        selectedNodeRef.current.y,
-      ]);
-      const svgRect = svgRef.current.getBoundingClientRect();
-      const offsetX = 20;
-      const offsetY = -10;
-      setPanelPosition({
-        x: svgRect.left + x + offsetX,
-        y: svgRect.top + y + offsetY,
-      });
+      const nextPanelPosition = getPanelPositionForNode(selectedNodeRef.current);
+      if (nextPanelPosition) setPanelPosition(nextPanelPosition);
     }
 
     const handleResize = () => {
@@ -416,11 +563,12 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     window.addEventListener('resize', handleResize);
     return () => {
       window.removeEventListener('resize', handleResize);
+      unpinNode();
       if (simulationRef.current) {
         simulationRef.current.stop();
       }
     };
-  }, [data]);
+  }, [data, highlightPath]);
 
   // Separate effect for theme changes
   useEffect(() => {
@@ -451,14 +599,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       });
     
     // Update simulation forces only for layout
-    const links = data.edges || [];
-    if (links.length === 0) {
-      data.papers.forEach(paper => {
-        paper.topics.forEach(topic => {
-          links.push({ source: paper.title, target: topic });
-        });
-      });
-    }
+    const links = buildLinks(data.papers, data.edges);
     
     const activeLinks = showSemanticEdges ? 
       links.filter(d => d.type !== 'semantic' || d.weight >= semanticThreshold) : 
@@ -579,6 +720,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
           <button 
             onClick={() => {
               setSelectedPaper(null);
+              unpinNode();
               setPanelPosition({ x: 0, y: 0 });
             }}
             style={{
@@ -644,19 +786,12 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
                         .call(zoomRef.current.transform, d3.zoomIdentity.translate(newX, newY).scale(scale));
                       
                       // Find connected papers for topic panel
-                      const links = data.edges || [];
-                      if (links.length === 0) {
-                        data.papers.forEach(paper => {
-                          paper.topics.forEach(paperTopic => {
-                            links.push({ source: paper.title, target: paperTopic });
-                          });
-                        });
-                      }
-                      
-                      const connectedPapers = links
-                        .filter(link => link.target.id === topic || link.source.id === topic)
-                        .map(link => link.target.id === topic ? link.source : link.target)
-                        .filter(node => node.type === 'paper');
+                      const links = buildLinks(data.papers, data.edges);
+                      const connectedPapers = getConnectedPapersForTopic(
+                        topic,
+                        links,
+                        data.papers
+                      );
                       
                       setSelectedPaper(null);
                       setSelectedTopic({
@@ -697,6 +832,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
           <button 
             onClick={() => {
               setSelectedTopic(null);
+              unpinNode();
               setPanelPosition({ x: 0, y: 0 });
             }}
             style={{
@@ -752,14 +888,10 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
                 }
                 
                 setSelectedTopic(null);
-                setSelectedPaper({
-                  title: paper.title,
-                  authors: paper.authors || ['Dr. Jane Smith', 'Dr. John Doe'],
-                  year: paper.year,
-                  publication_date: paper.publication_date,
-                  abstract: paper.abstract || 'This is a dummy abstract for the paper...',
-                  topics: paper.topics || []
-                });
+                const selectedPaperData = paperByTitle.get(paper.title);
+                if (selectedPaperData) {
+                  setSelectedPaper(toSelectedPaper(selectedPaperData));
+                }
               }}>
                 <div style={{ fontWeight: 'bold', fontSize: '14px', color: '#333', marginBottom: '4px' }}>
                   {paper.title}

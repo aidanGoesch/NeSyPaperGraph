@@ -3,16 +3,25 @@ import time
 import json
 import asyncio
 import hashlib
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from services.graph_builder import create_dummy_graph, GraphBuilder, get_all_topics_seen
 from services.storage_service import load_graph, save_graph
-from services.observability import log_memory, timed_block
+from services.observability import log_memory, timed_block, memory_delta_block
+from services.llm_service import OpenAILLMClient, TopicExtractor
+from services.semantic_scholar_service import (
+    SemanticScholarError,
+    SemanticScholarRateLimitError,
+    SemanticScholarService,
+)
 import traceback
 import logging
 import os
 from typing import List, Any
+from pydantic import BaseModel
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +29,35 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 SSE_HEARTBEAT_SECONDS = 15
+INGEST_SNAPSHOT_EVERY_PAPERS = int(
+    os.getenv("INGEST_SNAPSHOT_EVERY_PAPERS", "5") or "5"
+)
+INGEST_CHECKPOINT_EVERY_PAPERS = int(
+    os.getenv("INGEST_CHECKPOINT_EVERY_PAPERS", "3") or "3"
+)
+UPLOAD_MAX_FILE_MB = int(os.getenv("UPLOAD_MAX_FILE_MB", "64") or "64")
+UPLOAD_MAX_TOTAL_MB = int(os.getenv("UPLOAD_MAX_TOTAL_MB", "256") or "256")
+UPLOAD_QUEUE_MAX_JOBS = int(os.getenv("UPLOAD_QUEUE_MAX_JOBS", "2") or "2")
+UPLOAD_QUEUE_MAX_BYTES_MB = int(os.getenv("UPLOAD_QUEUE_MAX_BYTES_MB", "512") or "512")
+SSE_SUBSCRIBER_QUEUE_MAX_EVENTS = int(
+    os.getenv("SSE_SUBSCRIBER_QUEUE_MAX_EVENTS", "50") or "50"
+)
+
+UPLOAD_MAX_FILE_BYTES = max(1, UPLOAD_MAX_FILE_MB) * 1024 * 1024
+UPLOAD_MAX_TOTAL_BYTES = max(1, UPLOAD_MAX_TOTAL_MB) * 1024 * 1024
+UPLOAD_QUEUE_MAX_BYTES = max(1, UPLOAD_QUEUE_MAX_BYTES_MB) * 1024 * 1024
+
+QueuedUploadFile = tuple[str, str, str, int]
+QueuedUploadJob = tuple[str, list[QueuedUploadFile], int]
+
+
+class IngestUrlRequest(BaseModel):
+    url: str
+    semanticScholarPaperId: str | None = None
+    title: str | None = None
+    authors: list[str] | None = None
+    year: int | None = None
+    venue: str | None = None
 
 
 def prune_jobs(jobs: dict) -> None:
@@ -44,6 +82,11 @@ def prune_jobs(jobs: dict) -> None:
         )
         for job_id, _ in sorted_jobs[: len(jobs) - max_jobs]:
             jobs.pop(job_id, None)
+
+
+def _active_processing_jobs(jobs: dict) -> int:
+    return sum(1 for job in jobs.values() if job.get("processing"))
+
 
 def graph_to_dict(graph):
     """Convert PaperGraph to dictionary format for frontend"""
@@ -95,11 +138,51 @@ def _serialize_sse_event(event_name: str, payload: Any) -> str:
     return f"event: {event_name}\ndata: {json_payload}\n\n"
 
 
+def _job_total_bytes(files_data: list[QueuedUploadFile]) -> int:
+    return sum(item[3] for item in files_data)
+
+
+def _spill_upload_to_temp(file_name: str, content: bytes) -> str:
+    suffix = Path(file_name).suffix or ".pdf"
+    with NamedTemporaryFile(prefix="nesy_upload_", suffix=suffix, delete=False) as tmp:
+        tmp.write(content)
+        tmp.flush()
+        return tmp.name
+
+
+def _cleanup_temp_uploads(files_data: list[QueuedUploadFile]) -> None:
+    for _, temp_path, _, _ in files_data:
+        if not temp_path:
+            continue
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            logger.warning("Failed to clean up temp upload file: %s", temp_path)
+
+
+def _coalesce_heavy_events(subscriber_queue: asyncio.Queue, event_name: str, payload: dict) -> None:
+    if event_name != "paper_processed" or "graph" not in payload:
+        return
+    internal_queue = getattr(subscriber_queue, "_queue", None)
+    if internal_queue is None:
+        return
+    retained = []
+    for queued_event_name, queued_payload in internal_queue:
+        if queued_event_name == "paper_processed" and isinstance(queued_payload, dict) and "graph" in queued_payload:
+            continue
+        retained.append((queued_event_name, queued_payload))
+    internal_queue.clear()
+    internal_queue.extend(retained)
+
+
 def broadcast_event(app, event_name: str, payload: dict) -> None:
     subscribers = getattr(app.state, "event_subscribers", set())
     stale_queues = []
     for subscriber_queue in list(subscribers):
         try:
+            _coalesce_heavy_events(subscriber_queue, event_name, payload)
             subscriber_queue.put_nowait((event_name, payload))
         except asyncio.QueueFull:
             stale_queues.append(subscriber_queue)
@@ -115,8 +198,8 @@ def get_dummy_graph():
     graph = create_dummy_graph()
     return graph_to_dict(graph)
 
-async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, str]]):
-    """Run one queued PDF processing job and persist updates incrementally."""
+async def process_pdf_job(app, job_id: str, files_data: list[QueuedUploadFile]):
+    """Run one queued PDF processing job and persist updates with batched snapshots."""
     jobs = app.state.jobs
     jobs[job_id]["status"] = "processing"
     jobs[job_id]["queued"] = False
@@ -135,123 +218,147 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
     try:
         if not os.getenv("OPENAI_API_KEY"):
             raise RuntimeError("OPENAI_API_KEY environment variable not set")
+        log_memory(f"job_{job_id}_before_graph_load")
 
         async with app.state.graph_lock:
             existing_graph = app.state.graph
-            if existing_graph is None:
-                with timed_block("load_graph_for_job"):
-                    existing_graph = load_graph()
+        if existing_graph is None:
+            with timed_block("load_graph_for_job"):
+                loaded_graph = load_graph()
+            async with app.state.graph_lock:
+                if app.state.graph is None:
+                    app.state.graph = loaded_graph
+                existing_graph = app.state.graph
+        log_memory(f"job_{job_id}_after_graph_load")
 
-            existing_hashes = getattr(existing_graph, "paper_content_hashes", set()) if existing_graph else set()
-            filtered_files = []
-            progress_count = 0
-            for filename, file_bytes, content_hash in files_data:
-                if content_hash and content_hash in existing_hashes:
-                    progress_count += 1
-                    jobs[job_id]["paper_index"] = progress_count
-                    jobs[job_id]["current_paper"] = filename
-                    broadcast_event(
-                        app,
-                        "paper_processed",
-                        {
-                            "job_id": job_id,
-                            "paper_title": filename,
-                            "paper_index": progress_count,
-                            "paper_total": len(files_data),
-                            "status": "skipped",
-                            "reason": "duplicate_hash",
-                        },
-                    )
-                    continue
-                filtered_files.append((filename, file_bytes, content_hash))
-
-            if not filtered_files:
-                if existing_graph:
-                    save_graph(existing_graph)
-                    app.state.graph = existing_graph
-                jobs[job_id]["status"] = "done"
-                jobs[job_id]["processing"] = False
-                jobs[job_id]["paper_index"] = len(files_data)
-                jobs[job_id]["finished_at"] = time.time()
+        existing_hashes = (
+            getattr(existing_graph, "paper_content_hashes", set()) if existing_graph else set()
+        )
+        filtered_files: list[QueuedUploadFile] = []
+        progress_count = 0
+        for filename, temp_path, content_hash, byte_count in files_data:
+            if content_hash and content_hash in existing_hashes:
+                progress_count += 1
+                jobs[job_id]["paper_index"] = progress_count
+                jobs[job_id]["current_paper"] = filename
                 broadcast_event(
                     app,
-                    "job_done",
+                    "paper_processed",
                     {
                         "job_id": job_id,
-                        "status": "done",
+                        "paper_title": filename,
+                        "paper_index": progress_count,
                         "paper_total": len(files_data),
-                        "paper_index": len(files_data),
+                        "status": "skipped",
+                        "reason": "duplicate_hash",
                     },
                 )
-                return
+                continue
+            filtered_files.append((filename, temp_path, content_hash, byte_count))
 
-            builder = GraphBuilder()
-
-            def on_paper_processed(payload: dict) -> None:
-                nonlocal progress_count
-                progress_count += 1
-                paper_title = payload.get("paper_title")
-                jobs[job_id]["paper_index"] = progress_count
-                jobs[job_id]["current_paper"] = paper_title
-
-                if payload.get("status") == "processed":
-                    graph_snapshot = payload.get("graph")
-                    if graph_snapshot is not None:
-                        save_graph(graph_snapshot)
-                        app.state.graph = graph_snapshot
-                        graph_payload = build_graph_payload(graph_snapshot)
-                    else:
-                        graph_payload = None
-                else:
-                    graph_payload = None
-
-                event_payload = {
+        if not filtered_files:
+            if existing_graph:
+                async with app.state.graph_lock:
+                    app.state.graph = existing_graph
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["processing"] = False
+            jobs[job_id]["paper_index"] = len(files_data)
+            jobs[job_id]["finished_at"] = time.time()
+            broadcast_event(
+                app,
+                "job_done",
+                {
                     "job_id": job_id,
-                    "paper_title": paper_title,
-                    "paper_index": progress_count,
+                    "status": "done",
                     "paper_total": len(files_data),
-                    "status": payload.get("status"),
-                    "reason": payload.get("reason"),
-                }
-                if graph_payload is not None:
-                    event_payload["graph"] = graph_payload
-                broadcast_event(app, "paper_processed", event_payload)
+                    "paper_index": len(files_data),
+                },
+            )
+            return
 
-            with timed_block("build_graph_job"):
-                from services.verification import verify_bipartite
+        log_memory(f"job_{job_id}_before_build_graph")
+        builder = GraphBuilder()
+        snapshot_every = max(0, INGEST_SNAPSHOT_EVERY_PAPERS)
+        checkpoint_every = max(0, INGEST_CHECKPOINT_EVERY_PAPERS)
+        processed_count = 0
 
-                if existing_graph:
-                    updated_graph = builder.build_graph(
-                        files_data=filtered_files,
-                        existing_graph=existing_graph,
-                        on_paper_processed=on_paper_processed,
-                    )
-                    logger.info(
-                        "Verifying %s new nodes and %s new edges...",
-                        len(updated_graph.new_nodes),
-                        len(updated_graph.new_edges),
-                    )
-                    verify_bipartite(updated_graph, updated_graph.new_nodes, updated_graph.new_edges)
-                    updated_graph.clear_incremental_tracking()
-                else:
-                    updated_graph = builder.build_graph(
-                        files_data=filtered_files,
-                        on_paper_processed=on_paper_processed,
-                    )
-                    logger.info("Verifying entire graph...")
-                    verify_bipartite(updated_graph)
+        def on_paper_processed(payload: dict) -> None:
+            nonlocal progress_count, processed_count
+            progress_count += 1
+            paper_title = payload.get("paper_title")
+            jobs[job_id]["paper_index"] = progress_count
+            jobs[job_id]["current_paper"] = paper_title
+            status = payload.get("status")
+            if status == "processed":
+                processed_count += 1
 
-            with timed_block("save_graph_job"):
-                save_graph(updated_graph)
+            event_payload = {
+                "job_id": job_id,
+                "paper_title": paper_title,
+                "paper_index": progress_count,
+                "paper_total": len(files_data),
+                "status": status,
+                "reason": payload.get("reason"),
+            }
+            should_include_snapshot = (
+                status == "processed"
+                and snapshot_every > 0
+                and progress_count % snapshot_every == 0
+            )
+            graph_snapshot = payload.get("graph")
+            if status == "processed" and graph_snapshot is not None:
+                if checkpoint_every > 0 and processed_count % checkpoint_every == 0:
+                    with timed_block("save_graph_checkpoint"):
+                        save_graph(graph_snapshot)
+                if should_include_snapshot:
+                    app.state.graph = graph_snapshot
+                    with timed_block("ingest_snapshot_payload_build"):
+                        event_payload["graph"] = build_graph_payload(graph_snapshot)
+            broadcast_event(app, "paper_processed", event_payload)
+
+        with timed_block("build_graph_job"), memory_delta_block("build_graph_job_memory"):
+            from services.verification import verify_bipartite
+
+            if existing_graph:
+                updated_graph = builder.build_graph(
+                    files_data=filtered_files,
+                    total_papers=len(filtered_files),
+                    existing_graph=existing_graph,
+                    on_paper_processed=on_paper_processed,
+                )
+                logger.info(
+                    "Verifying %s new nodes and %s new edges...",
+                    len(updated_graph.new_nodes),
+                    len(updated_graph.new_edges),
+                )
+                verify_bipartite(updated_graph, updated_graph.new_nodes, updated_graph.new_edges)
+                updated_graph.clear_incremental_tracking()
+            else:
+                updated_graph = builder.build_graph(
+                    files_data=filtered_files,
+                    total_papers=len(filtered_files),
+                    on_paper_processed=on_paper_processed,
+                )
+                logger.info("Verifying entire graph...")
+                verify_bipartite(updated_graph)
+        log_memory(f"job_{job_id}_after_build_graph")
+
+        with timed_block("save_graph_job"):
+            save_graph(updated_graph)
+        log_memory(f"job_{job_id}_after_save_graph")
+        async with app.state.graph_lock:
             app.state.graph = updated_graph
             app.state.agent = None
             app.state.agent_graph_identity = None
+        log_memory(f"job_{job_id}_after_graph_state_commit")
 
         jobs[job_id]["status"] = "done"
         jobs[job_id]["processing"] = False
         jobs[job_id]["finished_at"] = time.time()
         jobs[job_id]["paper_index"] = len(files_data)
         jobs[job_id]["current_paper"] = None
+        with timed_block("ingest_job_done_payload_build"):
+            final_graph_payload = build_graph_payload(updated_graph)
         broadcast_event(
             app,
             "job_done",
@@ -260,7 +367,7 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
                 "status": "done",
                 "paper_total": len(files_data),
                 "paper_index": len(files_data),
-                "graph": build_graph_payload(updated_graph),
+                "graph": final_graph_payload,
             },
         )
         log_memory(f"job_{job_id}_done")
@@ -282,6 +389,9 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
             },
         )
         log_memory(f"job_{job_id}_error")
+    finally:
+        _cleanup_temp_uploads(files_data)
+        jobs[job_id]["temp_spooled_bytes"] = 0
 
 
 async def process_upload_queue(app) -> None:
@@ -291,7 +401,8 @@ async def process_upload_queue(app) -> None:
         if queued_item is None:
             app.state.upload_queue.task_done()
             break
-        job_id, files_data = queued_item
+        job_id, files_data, queued_bytes = queued_item
+        app.state.upload_queue_bytes = max(0, app.state.upload_queue_bytes - queued_bytes)
         try:
             await process_pdf_job(app, job_id, files_data)
         finally:
@@ -299,10 +410,15 @@ async def process_upload_queue(app) -> None:
 
 
 def start_queue_worker(app) -> None:
-    if getattr(app.state, "queue_worker_task", None) is not None:
+    worker_task = getattr(app.state, "queue_worker_task", None)
+    if worker_task is not None and not worker_task.done():
         return
-    app.state.upload_queue = asyncio.Queue()
-    app.state.event_subscribers = set()
+    if getattr(app.state, "upload_queue", None) is None:
+        app.state.upload_queue = asyncio.Queue(maxsize=max(1, UPLOAD_QUEUE_MAX_JOBS))
+    if getattr(app.state, "upload_queue_bytes", None) is None:
+        app.state.upload_queue_bytes = 0
+    if getattr(app.state, "event_subscribers", None) is None:
+        app.state.event_subscribers = set()
     app.state.queue_worker_task = asyncio.create_task(process_upload_queue(app))
 
 
@@ -322,7 +438,7 @@ async def upload_papers(
 ):
     """
     Upload PDF files, process them with OpenAI, and return graph data.
-    Files are processed in memory and not stored on disk.
+    Files are validated and spooled to temp files before entering the queue.
     
     Args:
         files: List of PDF files to upload and process
@@ -333,29 +449,68 @@ async def upload_papers(
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
     
-    # Read all files into memory (don't save to disk)
-    files_data = []
+    # Read uploads once, validate limits, and spool to temp files to keep queue payloads lightweight.
+    log_memory("upload_endpoint_before_file_read")
+    files_data: list[QueuedUploadFile] = []
     filenames = []
-    for file in files:
-        # Skip hidden files and non-PDF files
-        if (
-            not file.filename
-            or file.filename.startswith(".")
-            or not file.filename.lower().endswith(".pdf")
-        ):
-            continue
-        contents = await file.read()
-        file_hash = hashlib.sha256(contents).hexdigest()
-        files_data.append((file.filename, contents, file_hash))
-        filenames.append(file.filename)
+    total_upload_bytes = 0
+    try:
+        with memory_delta_block("upload_spool_memory"):
+            for file in files:
+            # Skip hidden files and non-PDF files
+                if (
+                    not file.filename
+                    or file.filename.startswith(".")
+                    or not file.filename.lower().endswith(".pdf")
+                ):
+                    continue
+                contents = await file.read()
+                file_size = len(contents)
+                if file_size > UPLOAD_MAX_FILE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File '{file.filename}' is too large. "
+                            f"Max size is {UPLOAD_MAX_FILE_MB} MB."
+                        ),
+                    )
+                total_upload_bytes += file_size
+                if total_upload_bytes > UPLOAD_MAX_TOTAL_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Upload batch exceeds limit of {UPLOAD_MAX_TOTAL_MB} MB."
+                        ),
+                    )
+                file_hash = hashlib.sha256(contents).hexdigest()
+                temp_path = _spill_upload_to_temp(file.filename, contents)
+                files_data.append((file.filename, temp_path, file_hash, file_size))
+                filenames.append(file.filename)
+                contents = b""
+    except Exception:
+        _cleanup_temp_uploads(files_data)
+        raise
+    log_memory("upload_endpoint_after_file_read")
 
     if not files_data:
         raise HTTPException(status_code=400, detail="No valid PDF files found")
 
     jobs = request.app.state.jobs
     prune_jobs(jobs)
+    queue = request.app.state.upload_queue
+    queue_bytes = getattr(request.app.state, "upload_queue_bytes", 0)
+    queued_bytes = _job_total_bytes(files_data)
+    if queue.full() or (queue_bytes + queued_bytes) > UPLOAD_QUEUE_MAX_BYTES:
+        _cleanup_temp_uploads(files_data)
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Upload queue is currently full. Please wait for active jobs to finish."
+            ),
+        )
     job_id = str(uuid4())
-    queue_position = request.app.state.upload_queue.qsize() + 1
+    processing_jobs = _active_processing_jobs(jobs)
+    queue_position = queue.qsize() + processing_jobs + 1
     jobs[job_id] = {
         "status": "pending",
         "queued": True,
@@ -366,10 +521,13 @@ async def upload_papers(
         "paper_index": 0,
         "current_paper": None,
         "queue_position": queue_position,
+        "queued_bytes": queued_bytes,
+        "temp_spooled_bytes": queued_bytes,
         "error": None,
     }
 
-    request.app.state.upload_queue.put_nowait((job_id, files_data))
+    request.app.state.upload_queue_bytes = queue_bytes + queued_bytes
+    queue.put_nowait((job_id, files_data, queued_bytes))
     broadcast_event(
         request.app,
         "job_queued",
@@ -377,16 +535,25 @@ async def upload_papers(
             "job_id": job_id,
             "status": "pending",
             "queue_position": queue_position,
+            "jobs_ahead": max(0, queue_position - 1),
             "paper_total": len(files_data),
             "filenames": filenames,
         },
     )
-    return {"job_id": job_id, "status": "pending", "queue_position": queue_position}
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "queue_position": queue_position,
+        "jobs_ahead": max(0, queue_position - 1),
+        "paper_total": len(files_data),
+    }
 
 
 @router.get("/graph/stream")
 async def graph_stream(request: Request):
-    subscriber_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    subscriber_queue: asyncio.Queue = asyncio.Queue(
+        maxsize=max(10, SSE_SUBSCRIBER_QUEUE_MAX_EVENTS)
+    )
     request.app.state.event_subscribers.add(subscriber_queue)
 
     async def event_generator():
@@ -427,6 +594,7 @@ async def graph_stream(request: Request):
 async def load_saved_graph(request: Request):
     """Load previously saved graph data"""
     try:
+        log_memory("graph_load_endpoint_start")
         async with request.app.state.graph_lock:
             graph = request.app.state.graph
             if graph is None:
@@ -434,6 +602,7 @@ async def load_saved_graph(request: Request):
                     logger.info("Loading graph from S3...")
                     graph = load_graph()
                 request.app.state.graph = graph
+        log_memory("graph_load_endpoint_after_graph_lock")
 
         if graph is None:
             raise HTTPException(status_code=404, detail="No saved graph found")
@@ -449,3 +618,84 @@ async def load_saved_graph(request: Request):
     except Exception as e:
         logger.error(f"Error loading saved graph: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error loading graph: {str(e)}")
+
+
+@router.post("/graph/ingest-url")
+async def ingest_url_paper(request: Request, payload: IngestUrlRequest):
+    try:
+        if not os.getenv("OPENAI_API_KEY"):
+            raise HTTPException(
+                status_code=500,
+                detail="OPENAI_API_KEY environment variable not set",
+            )
+
+        try:
+            semantic_payload = SemanticScholarService().hydrate_paper(
+                url=payload.url.strip(),
+                paper_id=payload.semanticScholarPaperId,
+            )
+        except SemanticScholarRateLimitError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except SemanticScholarError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        if not semantic_payload:
+            raise HTTPException(
+                status_code=404,
+                detail="Unable to resolve paper abstract from Semantic Scholar.",
+            )
+
+        async with request.app.state.graph_lock:
+            graph = request.app.state.graph
+            if graph is None:
+                graph = load_graph()
+                request.app.state.graph = graph
+
+            before_titles = {
+                node
+                for node, data in graph.graph.nodes(data=True)
+                if data.get("type") == "paper"
+            }
+
+            builder = GraphBuilder()
+            llm_client = OpenAILLMClient()
+            topic_extractor = TopicExtractor(llm_client)
+            updated_graph = builder.ingest_semantic_paper(
+                semantic_payload,
+                existing_graph=graph,
+                llm_client=llm_client,
+                topic_extractor=topic_extractor,
+            )
+
+            after_titles = {
+                node
+                for node, data in updated_graph.graph.nodes(data=True)
+                if data.get("type") == "paper"
+            }
+            new_titles = sorted(after_titles - before_titles)
+
+            request.app.state.graph = updated_graph
+            request.app.state.agent = None
+            request.app.state.agent_graph_identity = None
+
+        if new_titles:
+            save_graph(updated_graph)
+            return {
+                "status": "processed",
+                "paper_title": new_titles[0],
+                "graph": build_graph_payload(updated_graph),
+            }
+
+        return {
+            "status": "skipped",
+            "reason": "duplicate_title",
+            "paper_title": semantic_payload.get("title"),
+            "graph": build_graph_payload(updated_graph),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to ingest URL-based paper: {exc}",
+        ) from exc

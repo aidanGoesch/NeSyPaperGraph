@@ -1,0 +1,238 @@
+import os
+import gc
+from typing import Any
+from tempfile import NamedTemporaryFile
+import resource
+import logging
+import threading
+from io import BytesIO
+
+from pypdf import PdfReader, PdfWriter
+
+from services.observability import timed_block, log_memory
+
+logger = logging.getLogger(__name__)
+
+
+class DoclingService:
+    def __init__(self) -> None:
+        self.enabled = os.getenv("DOCLING_ENABLED", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }
+        self.max_pages = int(os.getenv("DOCLING_MAX_PAGES", "2") or "2")
+        self.max_text_chars = int(os.getenv("DOCLING_MAX_TEXT_CHARS", "8000") or "8000")
+        self._converter = None
+        self._converter_lock = threading.Lock()
+
+    def warmup(self) -> None:
+        """Preload Docling converter once at app startup."""
+        if not self.enabled:
+            return
+        self._get_converter()
+
+    def parse_pdf(self, pdf_bytes: bytes) -> dict[str, Any]:
+        log_memory("docling_parse_pdf_start")
+        if not self.enabled:
+            return self._empty_result("disabled")
+        if not pdf_bytes:
+            return self._empty_result("empty_input")
+
+        try:
+            limited_pdf_bytes = self._limit_pdf_pages(pdf_bytes)
+            with timed_block("docling_parse_per_paper"):
+                parsed = self._run_docling(limited_pdf_bytes)
+            parsed["source"] = "docling"
+            parsed["ok"] = bool(parsed.get("text"))
+            log_memory("docling_parse_pdf_end")
+            return parsed
+        except Exception:
+            log_memory("docling_parse_pdf_error")
+            return self._empty_result("docling_error")
+
+    def _run_docling(self, pdf_bytes: bytes) -> dict[str, Any]:
+        converter = self._get_converter()
+
+        def mem_mb() -> float:
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+        tmp_path: str | None = None
+        conversion_result: Any = None
+        document: Any = None
+        try:
+            with NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(pdf_bytes)
+                tmp.flush()
+                tmp_path = tmp.name
+
+            log_memory("docling_before_convert_call")
+            conversion_result = converter.convert(tmp_path)
+            log_memory("docling_after_convert_call")
+            document = getattr(conversion_result, "document", None)
+            logger.info("After parse: %.0f MB", mem_mb())
+
+            text = self._extract_text(document)
+            if self.max_text_chars > 0:
+                text = text[: self.max_text_chars]
+
+            metadata = self._extract_metadata(document)
+            parsed = {
+                "text": text,
+                "title": metadata.get("title"),
+                "authors": metadata.get("authors", []),
+                "publication_date": metadata.get("publication_date"),
+            }
+
+            conversion_result = None
+            document = None
+            log_memory("docling_after_result_extraction")
+            return parsed
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    logger.exception("Failed to delete temporary Docling PDF file: %s", tmp_path)
+            gc.collect()
+            log_memory("docling_after_gc_collect")
+
+    def _limit_pdf_pages(self, pdf_bytes: bytes) -> bytes:
+        """Return a PDF byte payload constrained to max_pages when possible."""
+        if self.max_pages <= 0:
+            return pdf_bytes
+        try:
+            reader = PdfReader(BytesIO(pdf_bytes))
+            if len(reader.pages) <= self.max_pages:
+                return pdf_bytes
+            writer = PdfWriter()
+            for page in reader.pages[: self.max_pages]:
+                writer.add_page(page)
+            output = BytesIO()
+            writer.write(output)
+            return output.getvalue()
+        except Exception as exc:
+            logger.warning("Failed to enforce Docling page limit, using original PDF: %s", exc)
+            return pdf_bytes
+
+    def _get_converter(self):
+        if self._converter is not None:
+            return self._converter
+        with self._converter_lock:
+            if self._converter is None:
+                log_memory("docling_before_import_document_converter")
+                from docling.document_converter import DocumentConverter
+                log_memory("docling_after_import_document_converter")
+
+                def mem_mb() -> float:
+                    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+                logger.info("Before Docling init: %.0f MB", mem_mb())
+                log_memory("docling_before_converter_init")
+                self._converter = DocumentConverter()
+                logger.info("After Docling init: %.0f MB", mem_mb())
+                log_memory("docling_after_converter_init")
+        return self._converter
+
+    def _extract_text(self, document: Any) -> str:
+        if document is None:
+            return ""
+
+        # Prefer markdown export if available (structured text).
+        export_markdown = getattr(document, "export_to_markdown", None)
+        if callable(export_markdown):
+            rendered = export_markdown()
+            if isinstance(rendered, str) and rendered.strip():
+                return rendered.strip()
+
+        # Fallback to plain text export.
+        export_text = getattr(document, "export_to_text", None)
+        if callable(export_text):
+            rendered = export_text()
+            if isinstance(rendered, str) and rendered.strip():
+                return rendered.strip()
+
+        # Final fallback: best-effort string conversion.
+        rendered = str(document)
+        return rendered.strip() if rendered else ""
+
+    def _extract_metadata(self, document: Any) -> dict[str, Any]:
+        title = None
+        authors: list[str] = []
+        publication_date = None
+
+        if document is None:
+            return {
+                "title": title,
+                "authors": authors,
+                "publication_date": publication_date,
+            }
+
+        for attr in ("title", "doc_title"):
+            value = getattr(document, attr, None)
+            if isinstance(value, str) and value.strip():
+                candidate = value.strip()
+                lower_candidate = candidate.lower()
+                # Reject converter temp filenames accidentally exposed as title metadata.
+                if lower_candidate.endswith(".pdf") and (
+                    lower_candidate.startswith("tmp")
+                    or lower_candidate.startswith("nesy_upload_")
+                ):
+                    continue
+                if lower_candidate.startswith("tmp") and len(lower_candidate) <= 24:
+                    continue
+                title = candidate
+                break
+
+        for attr in ("authors", "author_list"):
+            value = getattr(document, attr, None)
+            if isinstance(value, list):
+                normalized = []
+                for item in value:
+                    if isinstance(item, str) and item.strip():
+                        normalized.append(item.strip())
+                    elif hasattr(item, "name") and isinstance(item.name, str):
+                        if item.name.strip():
+                            normalized.append(item.name.strip())
+                if normalized:
+                    authors = normalized
+                    break
+
+        for attr in ("publication_date", "date", "year"):
+            value = getattr(document, attr, None)
+            if value is None:
+                continue
+            if isinstance(value, str) and value.strip():
+                publication_date = value.strip()
+                break
+            if isinstance(value, int):
+                publication_date = str(value)
+                break
+
+        return {
+            "title": title,
+            "authors": authors,
+            "publication_date": publication_date,
+        }
+
+    @staticmethod
+    def _empty_result(source: str) -> dict[str, Any]:
+        return {
+            "text": "",
+            "title": None,
+            "authors": [],
+            "publication_date": None,
+            "source": source,
+            "ok": False,
+        }
+
+
+_DOCLING_SERVICE_SINGLETON: DoclingService | None = None
+
+
+def get_docling_service() -> DoclingService:
+    global _DOCLING_SERVICE_SINGLETON
+    if _DOCLING_SERVICE_SINGLETON is None:
+        _DOCLING_SERVICE_SINGLETON = DoclingService()
+    return _DOCLING_SERVICE_SINGLETON

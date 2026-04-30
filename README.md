@@ -89,6 +89,66 @@ npm start
 
 Frontend runs on `http://localhost:3000`
 
+### Desktop (macOS Electron + local FastAPI)
+
+This repository now includes an Electron desktop shell that starts the FastAPI backend as a local sidecar process and points the React renderer to that local API.
+
+Prerequisites:
+- Python 3.10+ (for development sidecar and sidecar build)
+- Node.js 18+
+- OpenAI API key
+
+Development:
+```bash
+npm install
+cd backend && pip install -r requirements.txt && cd ..
+npm run desktop:dev
+```
+
+Production packaging (macOS):
+```bash
+cd backend && pip install pyinstaller && cd ..
+npm run desktop:build:mac
+```
+
+Desktop runtime notes:
+- Local backend health: `http://127.0.0.1:<dynamic-port>/health`
+- Runtime diagnostics: `GET /api/runtime/diagnostics`
+- Runtime memory probe: `GET /api/runtime/memory`
+- Local graph/workspace persistence defaults to:
+  `~/Library/Application Support/NeSyPaperGraph/data`
+- Desktop secrets (`OPENAI_API_KEY`, optional `APP_ACCESS_KEY`) are stored in macOS Keychain.
+- Memory stress harness: `npm run desktop:memory:stress`
+
+### Desktop Release and Notarization
+
+Use `.github/workflows/desktop-macos-release.yml` for signed release builds.
+
+Required repository secrets:
+- `CSC_LINK`
+- `CSC_KEY_PASSWORD`
+- `APPLE_ID`
+- `APPLE_APP_SPECIFIC_PASSWORD`
+- `APPLE_TEAM_ID`
+
+The workflow:
+1. Installs frontend/backend/root dependencies.
+2. Builds frontend static assets.
+3. Builds a sidecar binary with PyInstaller.
+4. Packages/signs/notarizes the app via `electron-builder`.
+5. Uploads macOS artifacts from `dist/`.
+
+### Desktop QA Matrix
+
+Run before promoting a desktop build:
+- Apple Silicon and Intel install/run.
+- First launch with no configured keys shows setup gate.
+- Entering `OPENAI_API_KEY` in desktop setup unblocks PDF ingestion.
+- Upload long PDF batch and verify status progress + job completion.
+- Sleep/resume machine while SSE stream is active; verify reconnection behavior.
+- Corrupt local JSON state and verify startup error handling/recovery path.
+- Cold start with no network still launches UI and surfaces backend/LLM dependency errors clearly.
+
 ### Docker Compose (Local Cloud-Parity)
 ```bash
 docker compose up --build
@@ -156,6 +216,14 @@ MAX_TOPIC_SYNONYMS_CACHE=5000
 MAX_PERSISTED_TEXT_CHARS=0
 SEMANTIC_SIMILARITY_THRESHOLD=0.5
 SEMANTIC_MAX_NEIGHBORS_PER_PAPER=20
+SEMANTIC_MAX_PAIRWISE_CHECKS=250000
+UPLOAD_MAX_FILE_MB=64
+UPLOAD_MAX_TOTAL_MB=256
+UPLOAD_QUEUE_MAX_JOBS=2
+UPLOAD_QUEUE_MAX_BYTES_MB=512
+INGEST_SNAPSHOT_EVERY_PAPERS=0
+SSE_SUBSCRIBER_QUEUE_MAX_EVENTS=50
+STORAGE_COMPRESS_JSON=true
 MAX_GAP_ANALYSIS_TOPICS=200
 MAX_GAP_ANALYSIS_PAIRS=4000
 ```

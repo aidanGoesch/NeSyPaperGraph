@@ -16,6 +16,7 @@ LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3") or "3")
 LLM_BACKOFF_BASE_SECONDS = float(os.getenv("LLM_BACKOFF_BASE_SECONDS", "1.0") or "1.0")
 LLM_SLEEP_BETWEEN_CALLS_MS = int(os.getenv("LLM_SLEEP_BETWEEN_CALLS_MS", "0") or "0")
 USE_KEYBERT_FALLBACK = os.getenv("USE_KEYBERT_FALLBACK", "0").lower() in {"1", "true", "yes", "y"}
+TOPIC_CONTEXT_MAX_ITEMS = int(os.getenv("TOPIC_CONTEXT_MAX_ITEMS", "200") or "200")
 
 _LLM_MAX_CONCURRENT = int(os.getenv("LLM_MAX_CONCURRENT", "0") or "0")
 _llm_semaphore = threading.Semaphore(_LLM_MAX_CONCURRENT) if _LLM_MAX_CONCURRENT > 0 else None
@@ -118,15 +119,46 @@ class OpenAILLMClient:
 
     def generate_embedding(self, text: str) -> list[float]:
         """Generate embedding vector for text using OpenAI embeddings API."""
-        embedding_input = (text or "").strip()
-        if not embedding_input:
+        embeddings = self.generate_embeddings([text])
+        return embeddings[0] if embeddings else []
+
+    def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
+        """Generate embedding vectors for a batch of texts."""
+        if not texts:
             return []
+
+        cleaned_inputs = []
+        index_map = []
+        output_vectors: list[list[float]] = [[] for _ in texts]
+        for index, text in enumerate(texts):
+            normalized = (text or "").strip()
+            if not normalized:
+                continue
+            cleaned_inputs.append(normalized)
+            index_map.append(index)
+
+        if not cleaned_inputs:
+            return output_vectors
+
+        with_embedding_context = f"embed_batch_size_{len(cleaned_inputs)}"
+        if DEBUG_LLM:
+            logger.info(
+                "[LLM] Embedding batch request | model=%s | batch_size=%s",
+                self.embedding_model_name,
+                len(cleaned_inputs),
+            )
 
         response = self.client.embeddings.create(
             model=self.embedding_model_name,
-            input=embedding_input,
+            input=cleaned_inputs,
         )
-        return response.data[0].embedding
+        for result_index, item in enumerate(response.data):
+            original_index = index_map[result_index]
+            output_vectors[original_index] = item.embedding
+
+        if DEBUG_LLM:
+            logger.info("[LLM] Embedding batch complete | context=%s", with_embedding_context)
+        return output_vectors
 
     def generate(self, prompt, system_prompt=None, context: str | None = None):
         """
@@ -255,18 +287,18 @@ class OpenAILLMClient:
     def generate_summary(self, text: str) -> str:
         """Generate a summary of the paper text"""
         # Keep summary input tighter so output tokens are available.
-        max_chars = int(os.getenv("SUMMARY_MAX_INPUT_CHARS", "12000") or "12000")
+        max_chars = int(os.getenv("SUMMARY_MAX_INPUT_CHARS", "4500") or "4500")
         original_len = len(text)
         truncated = False
         if original_len > max_chars:
             text = text[:max_chars] + "..."
             truncated = True
         
-        prompt = f"""Summarize this research paper in 4-6 concise sentences.
+        prompt = f"""Summarize this research paper in 3-4 concise sentences.
 Requirements:
 - Start immediately with content (no heading/title/preamble)
 - Cover objective, method, key results, and implications
-- Keep total length under 180 words
+- Keep total length under 120 words
 
 Paper text:
 {text}"""
@@ -281,7 +313,7 @@ Paper text:
             summary = self._generate_with_api(
                 prompt=prompt,
                 context="summary_primary",
-                max_tokens=900,
+                max_tokens=450,
             ).strip()
             if summary:
                 return summary
@@ -292,8 +324,8 @@ Paper text:
         # All retries failed - attempt alternate simple prompt
         logger.error("Failed to generate summary after primary attempts, trying alternate prompt")
         reduced_text = text[: min(len(text), max_chars // 2)]
-        alt_prompt = f"""Write a short abstract-style summary in 3-5 sentences.
-Keep it under 120 words and include method + core finding.
+        alt_prompt = f"""Write a short abstract-style summary in 2-3 sentences.
+Keep it under 80 words and include method + core finding.
 
 Paper text:
 {reduced_text}"""
@@ -301,7 +333,7 @@ Paper text:
             summary = self._generate_with_api(
                 prompt=alt_prompt,
                 context="summary_alternate",
-                max_tokens=500,
+                max_tokens=250,
             ).strip()
             if summary:
                 logger.warning(
@@ -505,6 +537,10 @@ Extract the title, authors, and publication date in JSON format."""
         logger.error("Failed to extract valid metadata via LLM after all attempts; using heuristic parser")
         return self._heuristic_metadata(text)
 
+    def heuristic_metadata(self, text: str) -> dict:
+        """Public wrapper for heuristic metadata extraction."""
+        return self._heuristic_metadata(text)
+
     def extract_topics(self, text, current_topics=None, max_chars=8000):
         """
         Extract exactly 8 topics from text.
@@ -578,7 +614,10 @@ Extract the title, authors, and publication date in JSON format."""
         existing_topics_str = ""
         if current_topics:
             # Convert to list if it's a set
-            topics_list = list(current_topics) if isinstance(current_topics, set) else current_topics
+            topics_list = list(current_topics) if isinstance(current_topics, set) else list(current_topics)
+            topics_list = sorted({str(topic).strip() for topic in topics_list if str(topic).strip()})
+            if TOPIC_CONTEXT_MAX_ITEMS > 0 and len(topics_list) > TOPIC_CONTEXT_MAX_ITEMS:
+                topics_list = topics_list[:TOPIC_CONTEXT_MAX_ITEMS]
             existing_topics_str = f"\n\nExisting Topics Database:\n{json.dumps(topics_list, indent=2)}\n\nPlease prioritize reusing these topics when relevant."
         
         prompt = f"""{existing_topics_str}

@@ -1,8 +1,58 @@
 {
   "name": "nesypapergraph",
+  "main": "desktop/main.js",
   "scripts": {
     "start": "cd frontend && npm install && npm start",
     "install-deps": "cd backend && pip install -r requirements.txt && cd ../frontend && npm install",
-    "dev": "concurrently \"cd backend && uvicorn main:app --reload\" \"cd frontend && npm start\""
+    "dev": "concurrently \"cd backend && uvicorn main:app --reload\" \"cd frontend && npm start\"",
+    "frontend:dev": "cd frontend && BROWSER=none npm start",
+    "frontend:build": "cd frontend && npm run build",
+    "desktop:dev": "concurrently \"npm run frontend:dev\" \"wait-on tcp:3000 && cross-env ELECTRON_RENDERER_URL=http://localhost:3000 electron .\"",
+    "desktop:build:frontend": "npm run frontend:build",
+    "desktop:build:sidecar": "node desktop/scripts/build-sidecar.js",
+    "desktop:build:mac": "npm run desktop:build:frontend && npm run desktop:build:sidecar && electron-builder --mac",
+    "desktop:smoke": "node desktop/scripts/smoke.js",
+    "desktop:memory:stress": "node desktop/scripts/memory-stress.js"
+  },
+  "build": {
+    "appId": "com.nesypapergraph.desktop",
+    "productName": "NeSyPaperGraph",
+    "afterSign": "desktop/notarize.js",
+    "files": [
+      "desktop/**/*",
+      "frontend/build/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "desktop/sidecar",
+        "to": "sidecar"
+      },
+      {
+        "from": "backend",
+        "to": "backend"
+      }
+    ],
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.productivity",
+      "hardenedRuntime": true,
+      "entitlements": "desktop/entitlements.mac.plist",
+      "entitlementsInherit": "desktop/entitlements.mac.plist"
+    }
+  },
+  "devDependencies": {
+    "@electron/notarize": "^3.1.0",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^37.2.4",
+    "electron-builder": "^26.0.12",
+    "wait-on": "^9.0.1"
+  },
+  "dependencies": {
+    "keytar": "^7.9.0"
   }
 }
