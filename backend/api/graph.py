@@ -11,10 +11,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from services.graph_builder import create_dummy_graph, GraphBuilder, get_all_topics_seen
 from services.storage_service import load_graph, save_graph
 from services.observability import log_memory, timed_block, memory_delta_block
+from services.llm_service import OpenAILLMClient, TopicExtractor
+from services.semantic_scholar_service import (
+    SemanticScholarError,
+    SemanticScholarRateLimitError,
+    SemanticScholarService,
+)
 import traceback
 import logging
 import os
 from typing import List, Any
+from pydantic import BaseModel
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +49,15 @@ UPLOAD_QUEUE_MAX_BYTES = max(1, UPLOAD_QUEUE_MAX_BYTES_MB) * 1024 * 1024
 
 QueuedUploadFile = tuple[str, str, str, int]
 QueuedUploadJob = tuple[str, list[QueuedUploadFile], int]
+
+
+class IngestUrlRequest(BaseModel):
+    url: str
+    semanticScholarPaperId: str | None = None
+    title: str | None = None
+    authors: list[str] | None = None
+    year: int | None = None
+    venue: str | None = None
 
 
 def prune_jobs(jobs: dict) -> None:
@@ -602,3 +618,84 @@ async def load_saved_graph(request: Request):
     except Exception as e:
         logger.error(f"Error loading saved graph: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error loading graph: {str(e)}")
+
+
+@router.post("/graph/ingest-url")
+async def ingest_url_paper(request: Request, payload: IngestUrlRequest):
+    try:
+        if not os.getenv("OPENAI_API_KEY"):
+            raise HTTPException(
+                status_code=500,
+                detail="OPENAI_API_KEY environment variable not set",
+            )
+
+        try:
+            semantic_payload = SemanticScholarService().hydrate_paper(
+                url=payload.url.strip(),
+                paper_id=payload.semanticScholarPaperId,
+            )
+        except SemanticScholarRateLimitError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except SemanticScholarError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        if not semantic_payload:
+            raise HTTPException(
+                status_code=404,
+                detail="Unable to resolve paper abstract from Semantic Scholar.",
+            )
+
+        async with request.app.state.graph_lock:
+            graph = request.app.state.graph
+            if graph is None:
+                graph = load_graph()
+                request.app.state.graph = graph
+
+            before_titles = {
+                node
+                for node, data in graph.graph.nodes(data=True)
+                if data.get("type") == "paper"
+            }
+
+            builder = GraphBuilder()
+            llm_client = OpenAILLMClient()
+            topic_extractor = TopicExtractor(llm_client)
+            updated_graph = builder.ingest_semantic_paper(
+                semantic_payload,
+                existing_graph=graph,
+                llm_client=llm_client,
+                topic_extractor=topic_extractor,
+            )
+
+            after_titles = {
+                node
+                for node, data in updated_graph.graph.nodes(data=True)
+                if data.get("type") == "paper"
+            }
+            new_titles = sorted(after_titles - before_titles)
+
+            request.app.state.graph = updated_graph
+            request.app.state.agent = None
+            request.app.state.agent_graph_identity = None
+
+        if new_titles:
+            save_graph(updated_graph)
+            return {
+                "status": "processed",
+                "paper_title": new_titles[0],
+                "graph": build_graph_payload(updated_graph),
+            }
+
+        return {
+            "status": "skipped",
+            "reason": "duplicate_title",
+            "paper_title": semantic_payload.get("title"),
+            "graph": build_graph_payload(updated_graph),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to ingest URL-based paper: {exc}",
+        ) from exc

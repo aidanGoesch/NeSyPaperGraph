@@ -19,6 +19,7 @@ class _FakeDoclingService:
 class _FakeTopicExtractor:
     def __init__(self, _client):
         self._client = _client
+        self.llm_client = _client
 
     def extract_topics(self, _text, current_topics=None):
         _ = current_topics
@@ -26,6 +27,13 @@ class _FakeTopicExtractor:
 
     def heuristic_metadata(self, _text):
         return {"title": "Fallback", "authors": ["F. Author"], "publication_date": "2019"}
+
+    def extract_paper_metadata(self, _text):
+        return {
+            "title": "Attention Paper",
+            "authors": ["A. Author"],
+            "publication_date": "2020",
+        }
 
 
 class _FakeClient:
@@ -78,7 +86,7 @@ def test_ingest_semantic_paper_uses_abstract_for_topics(monkeypatch):
 
     class _FakeTopicExtractor:
         def __init__(self, _client):
-            pass
+            self.llm_client = _client
 
         def extract_topics(self, text, current_topics=None, max_chars=8000):
             assert "abstract source text" in text
@@ -124,7 +132,7 @@ def test_ingest_semantic_paper_skips_duplicate_title(monkeypatch):
 
     class _FakeTopicExtractor:
         def __init__(self, _client):
-            pass
+            self.llm_client = _client
 
         def extract_topics(self, text, current_topics=None, max_chars=8000):
             _ = text

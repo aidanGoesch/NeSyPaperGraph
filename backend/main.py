@@ -18,8 +18,10 @@ from services.observability import log_memory, timed_block, rss_mb
 from services.docling_service import get_docling_service
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from backend/.env explicitly so it works
+# regardless of the process working directory.
+BACKEND_DIR = Path(__file__).resolve().parent
+load_dotenv(BACKEND_DIR / ".env")
 log_memory("module_loaded_after_imports")
 
 UPLOAD_QUEUE_MAX_JOBS = int(os.getenv("UPLOAD_QUEUE_MAX_JOBS", "2") or "2")
@@ -232,6 +234,7 @@ def runtime_diagnostics():
         "status": "ok",
         "desktop_mode": os.environ.get("DESKTOP_APP_MODE", "").lower() == "true",
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "semantic_scholar_configured": bool(os.getenv("SEMANTIC_SCHOLAR_API_KEY")),
         "app_access_key_configured": bool(os.getenv("APP_ACCESS_KEY")),
         "local_data_dir": resolved_local_data_dir,
         "frontend_url": os.environ.get("FRONTEND_URL", ""),

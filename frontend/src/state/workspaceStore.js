@@ -200,6 +200,7 @@ function trimWorkspaceState(state) {
         ? safeState.readingItems.slice(0, MAX_READING_ITEMS).map((item) => ({
               ...item,
               quickNote: clampText(item.quickNote, MAX_QUICK_NOTE_CHARS),
+              authors: Array.isArray(item.authors) ? item.authors : [],
           }))
         : [];
     const themeNotes = Array.isArray(safeState.themeNotes)
@@ -349,6 +350,13 @@ export function useWorkspaceStore(options = {}) {
                         linkedThemeId: item.linkedThemeId || null,
                         title: item.title || "",
                         url: item.url || "",
+                        semanticScholarPaperId: item.semanticScholarPaperId || null,
+                        authors: Array.isArray(item.authors) ? item.authors : [],
+                        year:
+                            typeof item.year === "number" && Number.isFinite(item.year)
+                                ? item.year
+                                : null,
+                        venue: item.venue || null,
                         quickNote: item.quickNote || "",
                         createdAt: new Date().toISOString(),
                         updatedAt: new Date().toISOString(),

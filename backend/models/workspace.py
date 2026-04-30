@@ -18,6 +18,10 @@ class ReadingItem(BaseModel):
     linkedThemeId: str | None = None
     title: str | None = None
     url: str | None = None
+    semanticScholarPaperId: str | None = None
+    authors: List[str] = Field(default_factory=list)
+    year: int | None = None
+    venue: str | None = None
     quickNote: str | None = None
     createdAt: str
     updatedAt: str

@@ -789,6 +789,13 @@ function App() {
     }, [API_BASE, accessKey]);
 
     useEffect(() => {
+        // Topic workspace uses "selection" highlights; clear them whenever graph view is active.
+        if (activeView === "graph" && highlightPath?.mode === "selection") {
+            setHighlightPath(null);
+        }
+    }, [activeView, highlightPath]);
+
+    useEffect(() => {
         if (activeView !== "graph" || !pendingFocus || !graphRef.current) return;
         if (pendingFocus.type === "paper" && graphRef.current.focusOnPaper) {
             graphRef.current.focusOnPaper(pendingFocus.value);
@@ -818,6 +825,72 @@ function App() {
             console.error("Error fetching architecture:", error);
         }
     };
+
+    const resolveReadingUrlMetadata = useCallback(
+        async (url) => {
+            if (!accessKey || !API_BASE) {
+                throw new Error("Backend connection is not ready.");
+            }
+            const response = await apiFetch(
+                `${API_BASE}/api/workspace/resolve-paper-url`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ url }),
+                }
+            );
+            if (!response.ok) {
+                let detail = "Failed to resolve paper metadata.";
+                try {
+                    const payload = await response.json();
+                    if (payload?.detail) {
+                        detail = payload.detail;
+                    }
+                } catch {
+                    // Keep default detail fallback.
+                }
+                throw new Error(detail);
+            }
+            return response.json();
+        },
+        [API_BASE, accessKey, apiFetch]
+    );
+
+    const ingestReadingItemToGraph = useCallback(
+        async (item) => {
+            if (!accessKey || !API_BASE) {
+                throw new Error("Backend connection is not ready.");
+            }
+            const response = await apiFetch(`${API_BASE}/api/graph/ingest-url`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    url: item.url,
+                    semanticScholarPaperId: item.semanticScholarPaperId || null,
+                    title: item.title || null,
+                    authors: item.authors || [],
+                    year: item.year ?? null,
+                    venue: item.venue || null,
+                }),
+            });
+            let payload = null;
+            try {
+                payload = await response.json();
+            } catch {
+                payload = null;
+            }
+            if (!response.ok) {
+                throw new Error(payload?.detail || "Failed to ingest paper into graph.");
+            }
+            if (payload?.graph) {
+                setGraphData(payload.graph);
+            } else {
+                await fetchGraph();
+            }
+            return payload;
+        },
+        [API_BASE, accessKey, apiFetch, fetchGraph]
+    );
 
     const handleAccessKeySubmit = async (event) => {
         event.preventDefault();
@@ -1322,7 +1395,11 @@ function App() {
                     <button
                         type="button"
                         className={activeView === "graph" ? "active" : ""}
-                        onClick={() => setActiveView("graph")}
+                        onClick={() => {
+                            // Clear workspace selection highlight when returning to graph view.
+                            setHighlightPath(null);
+                            setActiveView("graph");
+                        }}
                     >
                         Graph View
                     </button>
@@ -1351,6 +1428,8 @@ function App() {
                     <TopicWorkspace
                         graphData={visibleGraphData}
                         workspaceStore={workspaceStore}
+                        onResolveReadingUrl={resolveReadingUrlMetadata}
+                        onIngestReadingItem={ingestReadingItemToGraph}
                         onFocusPaper={(paperTitle) => {
                             setHighlightPath(null);
                             setActiveView("graph");

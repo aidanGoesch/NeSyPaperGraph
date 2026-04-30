@@ -1,10 +1,20 @@
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from pydantic import ValidationError
 
 from models.workspace import WorkspaceState, default_workspace_state, utc_now_iso
+from services.semantic_scholar_service import (
+    SemanticScholarError,
+    SemanticScholarRateLimitError,
+    SemanticScholarService,
+)
 from services.storage_service import load_workspace_state, save_workspace_state
 
 router = APIRouter()
+
+
+class ResolvePaperUrlRequest(BaseModel):
+    url: str
 
 
 def _timestamps_equal(left: dict, right: dict) -> bool:
@@ -119,4 +129,30 @@ def put_workspace_state(state: WorkspaceState):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to save workspace state: {exc}",
+        ) from exc
+
+
+@router.post("/workspace/resolve-paper-url")
+def resolve_paper_url(request: ResolvePaperUrlRequest):
+    try:
+        metadata = SemanticScholarService().resolve_url_metadata(request.url.strip())
+        if not metadata:
+            raise HTTPException(
+                status_code=404,
+                detail="Unable to resolve paper metadata from the provided URL.",
+            )
+        return metadata
+    except HTTPException:
+        raise
+    except SemanticScholarRateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except SemanticScholarError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        detail = str(exc)
+        if "rate limit" in detail.lower():
+            raise HTTPException(status_code=429, detail=detail) from exc
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to resolve URL metadata: {exc}",
         ) from exc

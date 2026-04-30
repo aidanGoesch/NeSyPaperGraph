@@ -2,6 +2,8 @@ function createPairKey(a, b) {
     return a < b ? `${a}__${b}` : `${b}__${a}`;
 }
 
+const HIERARCHICAL_MAX_TOPICS = 90;
+
 function averagePairwiseSimilarity(topicsA, topicsB, similarityMap) {
     let total = 0;
     let pairs = 0;
@@ -60,7 +62,23 @@ export function buildTopicClusters(graphData) {
         };
     }
 
-    const { similarityMap, topicToPaperSet } = computeTopicSimilarityMap(graphData);
+    const papers = graphData?.papers || [];
+    const topicToPaperSet = new Map();
+    topics.forEach((topic) => topicToPaperSet.set(topic, new Set()));
+    papers.forEach((paper) => {
+        (paper.topics || []).forEach((topic) => {
+            if (!topicToPaperSet.has(topic)) {
+                topicToPaperSet.set(topic, new Set());
+            }
+            topicToPaperSet.get(topic).add(paper.title);
+        });
+    });
+
+    if (topics.length > HIERARCHICAL_MAX_TOPICS) {
+        return buildFastClusters(topics, topicToPaperSet);
+    }
+
+    const { similarityMap } = computeTopicSimilarityMap(graphData);
 
     let currentNodes = topics.map((topic) => ({
         id: `topic-${topic}`,
@@ -163,4 +181,78 @@ export function buildTopicClusters(graphData) {
         clusters,
         topicToCluster,
     };
+}
+
+function jaccardSimilarity(setA, setB) {
+    if (!setA || !setB || setA.size === 0 || setB.size === 0) return 0;
+    let intersection = 0;
+    for (const value of setA) {
+        if (setB.has(value)) intersection += 1;
+    }
+    const union = setA.size + setB.size - intersection;
+    return union === 0 ? 0 : intersection / union;
+}
+
+function buildFastClusters(topics, topicToPaperSet) {
+    const sortedTopics = [...topics].sort((left, right) => {
+        const leftCount = (topicToPaperSet.get(left) || new Set()).size;
+        const rightCount = (topicToPaperSet.get(right) || new Set()).size;
+        return rightCount - leftCount;
+    });
+    const seedCount = Math.max(3, Math.min(14, Math.ceil(Math.sqrt(sortedTopics.length))));
+    const seedTopics = sortedTopics.slice(0, seedCount);
+    const seedToMembers = new Map(seedTopics.map((seed) => [seed, [seed]]));
+
+    for (const topic of sortedTopics.slice(seedCount)) {
+        let bestSeed = seedTopics[0];
+        let bestScore = -1;
+        const topicSet = topicToPaperSet.get(topic) || new Set();
+        for (const seed of seedTopics) {
+            const seedSet = topicToPaperSet.get(seed) || new Set();
+            const score = jaccardSimilarity(topicSet, seedSet);
+            if (score > bestScore) {
+                bestScore = score;
+                bestSeed = seed;
+            }
+        }
+        seedToMembers.get(bestSeed).push(topic);
+    }
+
+    const clusters = Array.from(seedToMembers.entries())
+        .map(([seed, members], index) => {
+            const leafChildren = members.map((topic) => ({
+                id: `topic-${topic}`,
+                name: topic,
+                topics: [topic],
+                score: 1,
+                children: [],
+            }));
+            const paperCount = new Set(
+                members.flatMap((topic) => Array.from(topicToPaperSet.get(topic) || []))
+            ).size;
+            return {
+                id: `cluster-fast-${index}`,
+                label: members.length === 1 ? members[0] : `${seed} + ${members.length - 1} more`,
+                score: 0.5,
+                topics: members,
+                paperCount,
+                tree: {
+                    id: `cluster-fast-tree-${index}`,
+                    name: seed,
+                    topics: members,
+                    score: 0.5,
+                    children: leafChildren,
+                },
+            };
+        })
+        .sort((a, b) => b.paperCount - a.paperCount);
+
+    const topicToCluster = {};
+    clusters.forEach((cluster) => {
+        cluster.topics.forEach((topic) => {
+            topicToCluster[topic] = cluster.id;
+        });
+    });
+
+    return { clusters, topicToCluster };
 }

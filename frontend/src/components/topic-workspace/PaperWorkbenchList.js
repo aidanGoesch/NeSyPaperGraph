@@ -8,6 +8,9 @@ function normalizeAuthor(authors) {
 
 export default function PaperWorkbenchList({
     papers,
+    totalPaperCount,
+    hasMorePapers,
+    onLoadMorePapers,
     selectedTopic,
     selectedTopicLabel,
     hasActiveFilter,
@@ -51,7 +54,9 @@ export default function PaperWorkbenchList({
                           : "(cluster scope)"}
                 </h3>
                 <div className="paper-header-actions">
-                    <span>{papers.length} items</span>
+                    <span>
+                        {papers.length} / {totalPaperCount || papers.length} items
+                    </span>
                     {hasActiveFilter && (
                         <button
                             type="button"
@@ -79,6 +84,15 @@ export default function PaperWorkbenchList({
                             <span>{(paper.topics || []).slice(0, 3).join(" • ")}</span>
                         </button>
                     ))}
+                    {hasMorePapers && (
+                        <button
+                            type="button"
+                            className="paper-load-more-button"
+                            onClick={onLoadMorePapers}
+                        >
+                            Load more papers
+                        </button>
+                    )}
                 </div>
                 <div className="paper-details">
                     {selectedPaper ? (

@@ -523,6 +523,119 @@ class GraphBuilder:
         
         return graph
 
+    def ingest_semantic_paper(
+        self,
+        semantic_paper: dict[str, Any],
+        existing_graph: PaperGraph | None = None,
+        llm_client: Any | None = None,
+        topic_extractor: Any | None = None,
+    ) -> PaperGraph:
+        """
+        Ingest one Semantic Scholar-derived paper into the graph.
+        Topic extraction is intentionally driven from abstract text.
+        """
+        from services.verification import verify_bipartite, find_optimal_topic_merge
+
+        graph = existing_graph or PaperGraph()
+        self._ensure_graph_metadata(graph)
+
+        if existing_graph:
+            self.papers = []
+            self.topics = set()
+            for node, data in graph.graph.nodes(data=True):
+                if data.get("type") == "paper":
+                    existing_paper = data["data"]
+                    self.papers.append(existing_paper)
+                    if getattr(existing_paper, "content_hash", None):
+                        graph.paper_content_hashes.add(existing_paper.content_hash)
+                elif data.get("type") == "topic":
+                    self.topics.add(node)
+        else:
+            self.papers = []
+            self.topics = set()
+
+        client = llm_client or OpenAILLMClient()
+        extractor = topic_extractor or TopicExtractor(client)
+
+        title = (semantic_paper.get("title") or "").strip() or "Untitled Paper"
+        source_url = (semantic_paper.get("url") or "").strip() or title
+        paper_id = (semantic_paper.get("semanticScholarPaperId") or "").strip()
+        abstract = (semantic_paper.get("abstract") or "").strip()
+        abstract = abstract[:50000] if len(abstract) > 50000 else abstract
+        publication_date = semantic_paper.get("year")
+        if publication_date is not None and str(publication_date).strip():
+            publication_date = str(publication_date).strip()
+        else:
+            publication_date = None
+
+        paper = Paper(
+            title=title,
+            file_path=source_url,
+            content_hash=f"semantic_scholar:{paper_id}" if paper_id else None,
+            text=abstract,
+            summary=abstract,
+            topics=[],
+            authors=semantic_paper.get("authors") or [],
+            publication_date=publication_date,
+        )
+
+        if self._is_duplicate_paper(paper, graph):
+            return graph
+        if self._is_duplicate_hash(paper, graph):
+            return graph
+
+        extraction_source = abstract or title
+        topics = extractor.extract_topics(extraction_source, current_topics=self.topics)
+        if not topics:
+            return graph
+        paper.topics = topics
+
+        embedding_text = paper.summary if paper.summary else extraction_source
+        vectors = client.generate_embeddings([embedding_text])
+        paper.embedding = vectors[0] if vectors else []
+
+        if MAX_PERSISTED_TEXT_CHARS <= 0:
+            paper.text = None
+        elif paper.text:
+            paper.text = paper.text[:MAX_PERSISTED_TEXT_CHARS]
+
+        graph.add_paper(paper)
+        if paper.content_hash:
+            graph.paper_content_hashes.add(paper.content_hash)
+        if not verify_bipartite(graph, graph.new_nodes, graph.new_edges):
+            if paper.title in graph.graph:
+                graph.graph.remove_node(paper.title)
+            graph.clear_incremental_tracking()
+            if paper.content_hash:
+                graph.paper_content_hashes.discard(paper.content_hash)
+            return graph
+        graph.clear_incremental_tracking()
+
+        self.topics.update(set(topics))
+        global _all_topics_seen
+        _all_topics_seen.update(topics)
+        _cap_set_size(_all_topics_seen, MAX_TOPICS_TRACKED)
+
+        all_topics = [
+            node for node, data in graph.graph.nodes(data=True) if data.get("type") == "topic"
+        ]
+        if all_topics:
+            new_topics = [topic for topic in all_topics if topic not in _topic_synonyms_cache]
+            if new_topics:
+                _topic_synonyms_cache.update(client.generate_topic_synonyms(new_topics))
+                _cap_dict_size(_topic_synonyms_cache, MAX_TOPIC_SYNONYMS_CACHE)
+            graph.topic_synonyms = {
+                topic: _topic_synonyms_cache[topic]
+                for topic in all_topics
+                if topic in _topic_synonyms_cache
+            }
+            merge_groups = find_optimal_topic_merge(all_topics, graph.topic_synonyms)
+            graph.topic_merge_groups = merge_groups
+            graph.merge_topics(merge_groups)
+
+        graph.add_semantic_edges()
+        return graph
+
 
     def get_papers_from_data(self, files_data: list[tuple]) -> Iterator[Paper]:
         """
