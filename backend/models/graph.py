@@ -32,16 +32,25 @@ class PaperGraph:
         """Add edges between semantically similar papers"""
         threshold = float(os.getenv("SEMANTIC_SIMILARITY_THRESHOLD", "0.5") or "0.5")
         max_neighbors = int(os.getenv("SEMANTIC_MAX_NEIGHBORS_PER_PAPER", "20") or "20")
+        max_pairwise_checks = int(
+            os.getenv("SEMANTIC_MAX_PAIRWISE_CHECKS", "250000") or "250000"
+        )
         paper_nodes = [n for n, attr in self.graph.nodes(data=True) if attr['type'] == 'paper']
+        pairwise_checks = 0
         for i, paper1 in enumerate(paper_nodes):
             top_candidates = []
             for paper2 in paper_nodes[i+1:]:
+                pairwise_checks += 1
+                if max_pairwise_checks > 0 and pairwise_checks > max_pairwise_checks:
+                    break
                 paper1_data = self.graph.nodes[paper1]['data']
                 paper2_data = self.graph.nodes[paper2]['data']
                 if paper1_data.embedding and paper2_data.embedding:
                     similarity = cosine_similarity(paper1_data.embedding, paper2_data.embedding)
                     if similarity > threshold:
                         top_candidates.append((similarity, paper2))
+            if max_pairwise_checks > 0 and pairwise_checks > max_pairwise_checks:
+                break
 
             if max_neighbors > 0:
                 top_candidates.sort(key=lambda item: item[0], reverse=True)

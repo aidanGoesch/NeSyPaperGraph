@@ -8,6 +8,7 @@ __pycache__/
 
 # Virtual environment
 nesy/
+backend/.venv/
 
 # Node.js
 node_modules/
@@ -46,3 +47,8 @@ backend/storage/saved_graph.pkl
 
 # React build output
 frontend/build/
+
+# Desktop build artifacts
+desktop/sidecar/
+dist/
+*.spec

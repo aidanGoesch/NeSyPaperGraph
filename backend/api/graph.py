@@ -3,12 +3,14 @@ import time
 import json
 import asyncio
 import hashlib
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from services.graph_builder import create_dummy_graph, GraphBuilder, get_all_topics_seen
 from services.storage_service import load_graph, save_graph
-from services.observability import log_memory, timed_block
+from services.observability import log_memory, timed_block, memory_delta_block
 import traceback
 import logging
 import os
@@ -21,11 +23,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 SSE_HEARTBEAT_SECONDS = 15
 INGEST_SNAPSHOT_EVERY_PAPERS = int(
-    os.getenv("INGEST_SNAPSHOT_EVERY_PAPERS", "5") or "5"
+    os.getenv("INGEST_SNAPSHOT_EVERY_PAPERS", "0") or "0"
 )
 INGEST_CHECKPOINT_EVERY_PAPERS = int(
     os.getenv("INGEST_CHECKPOINT_EVERY_PAPERS", "3") or "3"
 )
+UPLOAD_MAX_FILE_MB = int(os.getenv("UPLOAD_MAX_FILE_MB", "64") or "64")
+UPLOAD_MAX_TOTAL_MB = int(os.getenv("UPLOAD_MAX_TOTAL_MB", "256") or "256")
+UPLOAD_QUEUE_MAX_JOBS = int(os.getenv("UPLOAD_QUEUE_MAX_JOBS", "2") or "2")
+UPLOAD_QUEUE_MAX_BYTES_MB = int(os.getenv("UPLOAD_QUEUE_MAX_BYTES_MB", "512") or "512")
+SSE_SUBSCRIBER_QUEUE_MAX_EVENTS = int(
+    os.getenv("SSE_SUBSCRIBER_QUEUE_MAX_EVENTS", "50") or "50"
+)
+
+UPLOAD_MAX_FILE_BYTES = max(1, UPLOAD_MAX_FILE_MB) * 1024 * 1024
+UPLOAD_MAX_TOTAL_BYTES = max(1, UPLOAD_MAX_TOTAL_MB) * 1024 * 1024
+UPLOAD_QUEUE_MAX_BYTES = max(1, UPLOAD_QUEUE_MAX_BYTES_MB) * 1024 * 1024
+
+QueuedUploadFile = tuple[str, str, str, int]
+QueuedUploadJob = tuple[str, list[QueuedUploadFile], int]
 
 
 def prune_jobs(jobs: dict) -> None:
@@ -101,11 +117,51 @@ def _serialize_sse_event(event_name: str, payload: Any) -> str:
     return f"event: {event_name}\ndata: {json_payload}\n\n"
 
 
+def _job_total_bytes(files_data: list[QueuedUploadFile]) -> int:
+    return sum(item[3] for item in files_data)
+
+
+def _spill_upload_to_temp(file_name: str, content: bytes) -> str:
+    suffix = Path(file_name).suffix or ".pdf"
+    with NamedTemporaryFile(prefix="nesy_upload_", suffix=suffix, delete=False) as tmp:
+        tmp.write(content)
+        tmp.flush()
+        return tmp.name
+
+
+def _cleanup_temp_uploads(files_data: list[QueuedUploadFile]) -> None:
+    for _, temp_path, _, _ in files_data:
+        if not temp_path:
+            continue
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            logger.warning("Failed to clean up temp upload file: %s", temp_path)
+
+
+def _coalesce_heavy_events(subscriber_queue: asyncio.Queue, event_name: str, payload: dict) -> None:
+    if event_name != "paper_processed" or "graph" not in payload:
+        return
+    internal_queue = getattr(subscriber_queue, "_queue", None)
+    if internal_queue is None:
+        return
+    retained = []
+    for queued_event_name, queued_payload in internal_queue:
+        if queued_event_name == "paper_processed" and isinstance(queued_payload, dict) and "graph" in queued_payload:
+            continue
+        retained.append((queued_event_name, queued_payload))
+    internal_queue.clear()
+    internal_queue.extend(retained)
+
+
 def broadcast_event(app, event_name: str, payload: dict) -> None:
     subscribers = getattr(app.state, "event_subscribers", set())
     stale_queues = []
     for subscriber_queue in list(subscribers):
         try:
+            _coalesce_heavy_events(subscriber_queue, event_name, payload)
             subscriber_queue.put_nowait((event_name, payload))
         except asyncio.QueueFull:
             stale_queues.append(subscriber_queue)
@@ -121,7 +177,7 @@ def get_dummy_graph():
     graph = create_dummy_graph()
     return graph_to_dict(graph)
 
-async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, str]]):
+async def process_pdf_job(app, job_id: str, files_data: list[QueuedUploadFile]):
     """Run one queued PDF processing job and persist updates with batched snapshots."""
     jobs = app.state.jobs
     jobs[job_id]["status"] = "processing"
@@ -157,9 +213,9 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
         existing_hashes = (
             getattr(existing_graph, "paper_content_hashes", set()) if existing_graph else set()
         )
-        filtered_files = []
+        filtered_files: list[QueuedUploadFile] = []
         progress_count = 0
-        for filename, file_bytes, content_hash in files_data:
+        for filename, temp_path, content_hash, byte_count in files_data:
             if content_hash and content_hash in existing_hashes:
                 progress_count += 1
                 jobs[job_id]["paper_index"] = progress_count
@@ -177,7 +233,7 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
                     },
                 )
                 continue
-            filtered_files.append((filename, file_bytes, content_hash))
+            filtered_files.append((filename, temp_path, content_hash, byte_count))
 
         if not filtered_files:
             if existing_graph:
@@ -239,12 +295,13 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
                         event_payload["graph"] = build_graph_payload(graph_snapshot)
             broadcast_event(app, "paper_processed", event_payload)
 
-        with timed_block("build_graph_job"):
+        with timed_block("build_graph_job"), memory_delta_block("build_graph_job_memory"):
             from services.verification import verify_bipartite
 
             if existing_graph:
                 updated_graph = builder.build_graph(
                     files_data=filtered_files,
+                    total_papers=len(filtered_files),
                     existing_graph=existing_graph,
                     on_paper_processed=on_paper_processed,
                 )
@@ -258,6 +315,7 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
             else:
                 updated_graph = builder.build_graph(
                     files_data=filtered_files,
+                    total_papers=len(filtered_files),
                     on_paper_processed=on_paper_processed,
                 )
                 logger.info("Verifying entire graph...")
@@ -310,6 +368,9 @@ async def process_pdf_job(app, job_id: str, files_data: list[tuple[str, bytes, s
             },
         )
         log_memory(f"job_{job_id}_error")
+    finally:
+        _cleanup_temp_uploads(files_data)
+        jobs[job_id]["temp_spooled_bytes"] = 0
 
 
 async def process_upload_queue(app) -> None:
@@ -319,7 +380,8 @@ async def process_upload_queue(app) -> None:
         if queued_item is None:
             app.state.upload_queue.task_done()
             break
-        job_id, files_data = queued_item
+        job_id, files_data, queued_bytes = queued_item
+        app.state.upload_queue_bytes = max(0, app.state.upload_queue_bytes - queued_bytes)
         try:
             await process_pdf_job(app, job_id, files_data)
         finally:
@@ -331,7 +393,9 @@ def start_queue_worker(app) -> None:
     if worker_task is not None and not worker_task.done():
         return
     if getattr(app.state, "upload_queue", None) is None:
-        app.state.upload_queue = asyncio.Queue()
+        app.state.upload_queue = asyncio.Queue(maxsize=max(1, UPLOAD_QUEUE_MAX_JOBS))
+    if getattr(app.state, "upload_queue_bytes", None) is None:
+        app.state.upload_queue_bytes = 0
     if getattr(app.state, "event_subscribers", None) is None:
         app.state.event_subscribers = set()
     app.state.queue_worker_task = asyncio.create_task(process_upload_queue(app))
@@ -353,7 +417,7 @@ async def upload_papers(
 ):
     """
     Upload PDF files, process them with OpenAI, and return graph data.
-    Files are processed in memory and not stored on disk.
+    Files are validated and spooled to temp files before entering the queue.
     
     Args:
         files: List of PDF files to upload and process
@@ -364,22 +428,47 @@ async def upload_papers(
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
     
-    # Read all files into memory (don't save to disk)
+    # Read uploads once, validate limits, and spool to temp files to keep queue payloads lightweight.
     log_memory("upload_endpoint_before_file_read")
-    files_data = []
+    files_data: list[QueuedUploadFile] = []
     filenames = []
-    for file in files:
-        # Skip hidden files and non-PDF files
-        if (
-            not file.filename
-            or file.filename.startswith(".")
-            or not file.filename.lower().endswith(".pdf")
-        ):
-            continue
-        contents = await file.read()
-        file_hash = hashlib.sha256(contents).hexdigest()
-        files_data.append((file.filename, contents, file_hash))
-        filenames.append(file.filename)
+    total_upload_bytes = 0
+    try:
+        with memory_delta_block("upload_spool_memory"):
+            for file in files:
+            # Skip hidden files and non-PDF files
+                if (
+                    not file.filename
+                    or file.filename.startswith(".")
+                    or not file.filename.lower().endswith(".pdf")
+                ):
+                    continue
+                contents = await file.read()
+                file_size = len(contents)
+                if file_size > UPLOAD_MAX_FILE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File '{file.filename}' is too large. "
+                            f"Max size is {UPLOAD_MAX_FILE_MB} MB."
+                        ),
+                    )
+                total_upload_bytes += file_size
+                if total_upload_bytes > UPLOAD_MAX_TOTAL_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Upload batch exceeds limit of {UPLOAD_MAX_TOTAL_MB} MB."
+                        ),
+                    )
+                file_hash = hashlib.sha256(contents).hexdigest()
+                temp_path = _spill_upload_to_temp(file.filename, contents)
+                files_data.append((file.filename, temp_path, file_hash, file_size))
+                filenames.append(file.filename)
+                contents = b""
+    except Exception:
+        _cleanup_temp_uploads(files_data)
+        raise
     log_memory("upload_endpoint_after_file_read")
 
     if not files_data:
@@ -387,8 +476,19 @@ async def upload_papers(
 
     jobs = request.app.state.jobs
     prune_jobs(jobs)
+    queue = request.app.state.upload_queue
+    queue_bytes = getattr(request.app.state, "upload_queue_bytes", 0)
+    queued_bytes = _job_total_bytes(files_data)
+    if queue.full() or (queue_bytes + queued_bytes) > UPLOAD_QUEUE_MAX_BYTES:
+        _cleanup_temp_uploads(files_data)
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Upload queue is currently full. Please wait for active jobs to finish."
+            ),
+        )
     job_id = str(uuid4())
-    queue_position = request.app.state.upload_queue.qsize() + 1
+    queue_position = queue.qsize() + 1
     jobs[job_id] = {
         "status": "pending",
         "queued": True,
@@ -399,10 +499,13 @@ async def upload_papers(
         "paper_index": 0,
         "current_paper": None,
         "queue_position": queue_position,
+        "queued_bytes": queued_bytes,
+        "temp_spooled_bytes": queued_bytes,
         "error": None,
     }
 
-    request.app.state.upload_queue.put_nowait((job_id, files_data))
+    request.app.state.upload_queue_bytes = queue_bytes + queued_bytes
+    queue.put_nowait((job_id, files_data, queued_bytes))
     broadcast_event(
         request.app,
         "job_queued",
@@ -419,7 +522,9 @@ async def upload_papers(
 
 @router.get("/graph/stream")
 async def graph_stream(request: Request):
-    subscriber_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    subscriber_queue: asyncio.Queue = asyncio.Queue(
+        maxsize=max(10, SSE_SUBSCRIBER_QUEUE_MAX_EVENTS)
+    )
     request.app.state.event_subscribers.add(subscriber_queue)
 
     async def event_generator():

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react';
+import React, { useEffect, useMemo, useRef, useState, forwardRef, useImperativeHandle } from 'react';
 import ReactMarkdown from 'react-markdown';
 import * as d3 from 'd3';
 
@@ -17,6 +17,19 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
   const nodesRef = useRef([]);
   const zoomRef = useRef(null);
   const panelMetrics = { width: 350, maxHeight: 400, margin: 12 };
+  const paperByTitle = useMemo(
+    () => new Map((data?.papers || []).map((paper) => [paper.title, paper])),
+    [data]
+  );
+
+  const toSelectedPaper = (paper) => ({
+    title: paper?.title || "",
+    authors: paper?.authors || [],
+    year: paper?.year,
+    publication_date: paper?.publication_date,
+    abstract: paper?.abstract || "No summary available.",
+    topics: paper?.topics || [],
+  });
 
   const normalizeLinkEndpoint = (endpoint) => {
     if (endpoint && typeof endpoint === "object") {
@@ -171,17 +184,10 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       if (nextPanelPosition) setPanelPosition(nextPanelPosition);
       
       // Find the paper data
-      const paper = data.papers.find(p => p.title === paperTitle);
+      const paper = paperByTitle.get(paperTitle);
       if (paper) {
         setSelectedTopic(null);
-        setSelectedPaper({
-          title: paper.title,
-          authors: paper.authors || ['Dr. Jane Smith', 'Dr. John Doe', 'Dr. Alice Johnson'],
-          year: paper.year,
-          publication_date: paper.publication_date,
-          abstract: paper.abstract || 'This is a dummy abstract for the paper...',
-          topics: paper.topics || []
-        });
+        setSelectedPaper(toSelectedPaper(paper));
       }
     }
   }));
@@ -219,8 +225,12 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     }
 
     const nodes = [
-      ...data.papers.map(paper => ({ id: paper.title, type: 'paper', ...paper })),
-      ...data.topics.map(topic => ({ id: topic, type: 'topic' }))
+      ...data.papers.map((paper) => ({
+        id: paper.title,
+        type: 'paper',
+        title: paper.title,
+      })),
+      ...data.topics.map((topic) => ({ id: topic, type: 'topic' }))
     ];
 
     const links = buildLinks(data.papers, data.edges);
@@ -350,14 +360,10 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
 
         if (d.type === 'paper') {
           setSelectedTopic(null);
-          setSelectedPaper({
-            title: d.title,
-            authors: d.authors || ['Dr. Jane Smith', 'Dr. John Doe', 'Dr. Alice Johnson'],
-            year: d.year,
-            publication_date: d.publication_date,
-            abstract: d.abstract || 'This is a dummy abstract for the paper...',
-            topics: d.topics || []
-          });
+          const selectedPaperData = paperByTitle.get(d.id);
+          if (selectedPaperData) {
+            setSelectedPaper(toSelectedPaper(selectedPaperData));
+          }
         } else if (d.type === 'topic') {
           setSelectedPaper(null);
           // Find connected papers
@@ -782,14 +788,10 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
                 }
                 
                 setSelectedTopic(null);
-                setSelectedPaper({
-                  title: paper.title,
-                  authors: paper.authors || ['Dr. Jane Smith', 'Dr. John Doe'],
-                  year: paper.year,
-                  publication_date: paper.publication_date,
-                  abstract: paper.abstract || 'This is a dummy abstract for the paper...',
-                  topics: paper.topics || []
-                });
+                const selectedPaperData = paperByTitle.get(paper.title);
+                if (selectedPaperData) {
+                  setSelectedPaper(toSelectedPaper(selectedPaperData));
+                }
               }}>
                 <div style={{ fontWeight: 'bold', fontSize: '14px', color: '#333', marginBottom: '4px' }}>
                   {paper.title}

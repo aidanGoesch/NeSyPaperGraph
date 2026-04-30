@@ -5,6 +5,7 @@ import asyncio
 import secrets
 from urllib.parse import urlsplit
 import os
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,12 +14,15 @@ from pydantic import BaseModel
 from api.graph import router as graph_router, start_queue_worker, stop_queue_worker
 from api.workspace import router as workspace_router
 from services.storage_service import load_graph
-from services.observability import log_memory, timed_block
+from services.observability import log_memory, timed_block, rss_mb
+from services.docling_service import get_docling_service
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 log_memory("module_loaded_after_imports")
+
+UPLOAD_QUEUE_MAX_JOBS = int(os.getenv("UPLOAD_QUEUE_MAX_JOBS", "2") or "2")
 
 def signal_handler(sig, frame):
     print('\nShutting down gracefully...')
@@ -85,11 +89,13 @@ async def lifespan(app: FastAPI):
     app.state.jobs = {}
     app.state.graph = None
     app.state.graph_lock = asyncio.Lock()
-    app.state.upload_queue = asyncio.Queue()
+    app.state.upload_queue = asyncio.Queue(maxsize=max(1, UPLOAD_QUEUE_MAX_JOBS))
+    app.state.upload_queue_bytes = 0
     app.state.queue_worker_task = None
     app.state.event_subscribers = set()
     app.state.agent = None
     app.state.agent_graph_identity = None
+    app.state.docling_warmup_task = asyncio.create_task(_warmup_docling_once())
     start_queue_worker(app)
     log_memory("startup_initialized_state")
 
@@ -97,7 +103,20 @@ async def lifespan(app: FastAPI):
 
     log_memory("lifespan_before_shutdown")
     await stop_queue_worker(app)
+    warmup_task = getattr(app.state, "docling_warmup_task", None)
+    if warmup_task and not warmup_task.done():
+        warmup_task.cancel()
     log_memory("lifespan_after_shutdown")
+
+
+async def _warmup_docling_once():
+    try:
+        with timed_block("docling_startup_warmup"):
+            await asyncio.to_thread(get_docling_service().warmup)
+        log_memory("startup_docling_warmed")
+    except Exception as exc:
+        # Keep service booting even if warmup fails; upload path will fallback.
+        print(f"Docling warmup skipped due to error: {exc}")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -139,7 +158,12 @@ async def enforce_access_key(request: Request, call_next):
 
 configured_origins = [
     origin.strip()
-    for origin in os.environ.get("FRONTEND_URL", "http://localhost:3000").split(",")
+    for origin in os.environ.get(
+        "FRONTEND_URL",
+        "http://localhost:3000,null"
+        if os.environ.get("DESKTOP_APP_MODE", "").lower() == "true"
+        else "http://localhost:3000",
+    ).split(",")
     if origin.strip()
 ]
 
@@ -195,6 +219,26 @@ def get_job_status(job_id: str):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/api/runtime/diagnostics")
+def runtime_diagnostics():
+    local_data_dir = os.environ.get("LOCAL_DATA_DIR", "").strip()
+    resolved_local_data_dir = (
+        str(Path(local_data_dir).expanduser().resolve()) if local_data_dir else ""
+    )
+    return {
+        "status": "ok",
+        "desktop_mode": os.environ.get("DESKTOP_APP_MODE", "").lower() == "true",
+        "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "app_access_key_configured": bool(os.getenv("APP_ACCESS_KEY")),
+        "local_data_dir": resolved_local_data_dir,
+        "frontend_url": os.environ.get("FRONTEND_URL", ""),
+    }
+
+
+@app.get("/api/runtime/memory")
+def runtime_memory():
+    return {"status": "ok", "rss_mb": rss_mb()}
 
 @app.get("/")
 def root():

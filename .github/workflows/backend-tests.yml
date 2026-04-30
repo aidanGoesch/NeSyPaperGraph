@@ -1,0 +1,52 @@
+name: backend-tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: test-openai-key
+      APP_ACCESS_KEY: test-access-key
+      MEMORY_TEST_PEAK_RSS_MB: "2048"
+      DESKTOP_APP_MODE: "false"
+      STORAGE_COMPRESS_JSON: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run full backend test suite
+        working-directory: backend
+        run: |
+          pytest -q --junitxml=test-results.xml | tee backend-test-output.log
+
+      - name: Run memory-focused suite
+        working-directory: backend
+        run: |
+          pytest -q -k "memory" --junitxml=memory-results.xml | tee memory-metrics.log
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-artifacts
+          path: |
+            backend/test-results.xml
+            backend/memory-results.xml
+            backend/backend-test-output.log
+            backend/memory-metrics.log

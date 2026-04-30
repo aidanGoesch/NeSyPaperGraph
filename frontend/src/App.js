@@ -8,8 +8,52 @@ import mermaid from "mermaid";
 import "./App.css";
 import "./components/topic-workspace/topicWorkspace.css";
 
+const MAX_CHAT_HISTORY = 30;
+const MAX_SEARCH_RESULTS_PER_ENTRY = 8;
+const MAX_RESULT_SUMMARY_CHARS = 800;
+const MAX_ANSWER_CHARS = 12000;
+
+function capChatHistory(entries) {
+    return entries.length > MAX_CHAT_HISTORY
+        ? entries.slice(entries.length - MAX_CHAT_HISTORY)
+        : entries;
+}
+
+function trimSearchResult(result) {
+    if (!result || typeof result !== "object") return result;
+    if (result.type === "semantic_pair" && Array.isArray(result.papers)) {
+        return {
+            type: result.type,
+            similarity: result.similarity,
+            papers: result.papers.slice(0, 2).map((paper) => ({
+                title: paper.title,
+                abstract: (paper.abstract || "").slice(0, MAX_RESULT_SUMMARY_CHARS),
+            })),
+        };
+    }
+    return {
+        type: result.type || "keyword",
+        title: result.title,
+        author: result.author,
+        similarity: result.similarity,
+        topics: Array.isArray(result.topics) ? result.topics.slice(0, 12) : [],
+        summary: (result.summary || "").slice(0, MAX_RESULT_SUMMARY_CHARS),
+    };
+}
+
 function App() {
-    const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000";
+    const isDesktopRuntime =
+        typeof window !== "undefined" && Boolean(window.desktopBridge);
+    const [desktopConfig, setDesktopConfig] = useState(() => ({
+        isDesktop: isDesktopRuntime,
+        apiBaseUrl: isDesktopRuntime
+            ? ""
+            : process.env.REACT_APP_API_URL || "http://localhost:8000",
+    }));
+    const [runtimeConfigLoaded, setRuntimeConfigLoaded] = useState(
+        !isDesktopRuntime
+    );
+    const API_BASE = desktopConfig.apiBaseUrl;
     const FORCE_DUMMY_DATA = process.env.REACT_APP_USE_DUMMY_DATA === "true";
     const ACCESS_KEY_STORAGE_KEY = "nesy_access_key";
     const [accessKey, setAccessKey] = useState(
@@ -20,7 +64,6 @@ function App() {
     const [isBootingBackend, setIsBootingBackend] = useState(false);
     const [backendBootMessage, setBackendBootMessage] = useState("");
     const [graphData, setGraphData] = useState(null);
-    const [lastGraphData, setLastGraphData] = useState(null);
     const [isDarkMode, setIsDarkMode] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
     const [isSearchExpanded, setIsSearchExpanded] = useState(false);
@@ -35,10 +78,18 @@ function App() {
     const [followUpQuestion, setFollowUpQuestion] = useState("");
     const [highlightPath, setHighlightPath] = useState(null);
     const [uploadStatus, setUploadStatus] = useState(null);
+    const [uploadStatusDetail, setUploadStatusDetail] = useState("");
+    const [uploadProgressCurrent, setUploadProgressCurrent] = useState(0);
+    const [uploadProgressTotal, setUploadProgressTotal] = useState(0);
     const [recentlyCompletedPapers, setRecentlyCompletedPapers] = useState([]);
     const [activeView, setActiveView] = useState("graph");
     const [pendingFocus, setPendingFocus] = useState(null);
-    const visibleGraphData = graphData || lastGraphData;
+    const [runtimeDiagnostics, setRuntimeDiagnostics] = useState(null);
+    const [desktopSecretError, setDesktopSecretError] = useState("");
+    const [openAiKeyInput, setOpenAiKeyInput] = useState("");
+    const [appAccessKeyInput, setAppAccessKeyInput] = useState("");
+    const [isSavingDesktopSecrets, setIsSavingDesktopSecrets] = useState(false);
+    const visibleGraphData = graphData;
 
     // Function to handle paper citation clicks
     const handlePaperCitationClick = (paperTitle) => {
@@ -98,6 +149,32 @@ function App() {
     const graphLoadPromiseRef = useRef(null);
     const architectureLoadedRef = useRef(false);
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const setUploadProgress = (current, total) => {
+        const safeTotal = Math.max(0, Number(total) || 0);
+        const safeCurrent = Math.max(0, Number(current) || 0);
+        setUploadProgressTotal(safeTotal);
+        setUploadProgressCurrent(safeCurrent);
+    };
+    const uploadProgressPercent =
+        uploadProgressTotal > 0
+            ? Math.min(
+                  100,
+                  Math.max(
+                      0,
+                      Math.round((uploadProgressCurrent / uploadProgressTotal) * 100)
+                  )
+              )
+            : 0;
+    const formatElapsed = (startedAtSeconds) => {
+        if (!startedAtSeconds) return "";
+        const elapsedSeconds = Math.max(
+            0,
+            Math.floor(Date.now() / 1000 - startedAtSeconds)
+        );
+        const minutes = Math.floor(elapsedSeconds / 60);
+        const seconds = elapsedSeconds % 60;
+        return `${minutes}:${String(seconds).padStart(2, "0")}`;
+    };
 
     const apiFetch = useCallback(
         async (url, options = {}) => {
@@ -118,8 +195,22 @@ function App() {
     const workspaceStore = useWorkspaceStore({
         apiBase: API_BASE,
         apiFetch,
-        isEnabled: Boolean(accessKey),
+        isEnabled: Boolean(accessKey && API_BASE),
     });
+
+    const requiresDesktopSetup =
+        desktopConfig.isDesktop && runtimeDiagnostics && !runtimeDiagnostics.openai_configured;
+
+    const fetchRuntimeDiagnostics = useCallback(async () => {
+        try {
+            const response = await apiFetch(`${API_BASE}/api/runtime/diagnostics`);
+            if (!response.ok) return;
+            const payload = await response.json();
+            setRuntimeDiagnostics(payload);
+        } catch (error) {
+            console.warn("Runtime diagnostics unavailable:", error);
+        }
+    }, [API_BASE, apiFetch]);
 
     const probeBackendReachable = async () => {
         try {
@@ -145,7 +236,6 @@ function App() {
             if (!fallbackResponse.ok) return false;
             const fallbackData = await fallbackResponse.json();
             setGraphData(fallbackData);
-            setLastGraphData(fallbackData);
             return true;
         };
 
@@ -181,7 +271,6 @@ function App() {
                 if (response.ok) {
                     const data = await response.json();
                     setGraphData(data);
-                    setLastGraphData(data);
                     setIsBootingBackend(false);
                     return;
                 }
@@ -232,12 +321,26 @@ function App() {
                     const data = await response.json();
                     if (activeUploadJobsRef.current.has(jobId)) {
                         if (data.status === "processing") {
-                            const index = data.paper_index || 0;
+                            const completed = data.paper_index || 0;
                             const total = data.paper_total || 0;
-                            setUploadStatus(`processing (${index}/${total})`);
+                            const activePaper = total > 0 ? Math.min(completed + 1, total) : completed;
+                            setUploadStatus(`processing paper ${activePaper} / ${total}`);
+                            setUploadProgress(activePaper, total);
+                            const elapsed = formatElapsed(data.started_at);
+                            const currentPaper = data.current_paper
+                                ? `Current: ${data.current_paper}`
+                                : "Current: extracting and analyzing paper content";
+                            setUploadStatusDetail(
+                                elapsed
+                                    ? `${currentPaper} · elapsed ${elapsed}`
+                                    : currentPaper
+                            );
                         } else if (data.status === "pending") {
-                            setUploadStatus(
-                                `queued (#${data.queue_position || 1})`
+                            const total = data.paper_total || 0;
+                            setUploadStatus(`paper 0 / ${total}`);
+                            setUploadProgress(0, total);
+                            setUploadStatusDetail(
+                                "Waiting in upload queue..."
                             );
                         }
                     }
@@ -247,6 +350,11 @@ function App() {
                         if (activeUploadJobsRef.current.size === 0) {
                             setIsUploading(false);
                             setUploadStatus("done");
+                            setUploadStatusDetail("");
+                            setUploadProgress(
+                                data.paper_total || uploadProgressTotal,
+                                data.paper_total || uploadProgressTotal
+                            );
                         }
                         return;
                     }
@@ -256,6 +364,7 @@ function App() {
                         if (activeUploadJobsRef.current.size === 0) {
                             setIsUploading(false);
                             setUploadStatus("error");
+                            setUploadStatusDetail("");
                         }
                         return;
                     }
@@ -267,6 +376,36 @@ function App() {
             await sleep(Math.min(1000 * 2 ** Math.floor(attempt / 10), 5000));
         }
     };
+
+    // Keyboard shortcut for Cmd+G to focus search
+    useEffect(() => {
+        const loadDesktopConfig = async () => {
+            const bridge = window.desktopBridge;
+            if (!bridge?.getConfig) {
+                setRuntimeConfigLoaded(true);
+                return;
+            }
+            try {
+                const config = await bridge.getConfig();
+                if (config?.apiBaseUrl) {
+                    setDesktopConfig({
+                        isDesktop: Boolean(config.isDesktop),
+                        apiBaseUrl: config.apiBaseUrl,
+                    });
+                }
+                const storedAccessKey = await bridge.getSecret("APP_ACCESS_KEY");
+                if (storedAccessKey) {
+                    setAccessKey(storedAccessKey);
+                    localStorage.setItem(ACCESS_KEY_STORAGE_KEY, storedAccessKey);
+                }
+            } catch (error) {
+                console.warn("Failed to load desktop runtime config:", error);
+            } finally {
+                setRuntimeConfigLoaded(true);
+            }
+        };
+        loadDesktopConfig();
+    }, []);
 
     // Keyboard shortcut for Cmd+G to focus search
     useEffect(() => {
@@ -380,13 +519,18 @@ function App() {
 
     // Load graph when access key is available
     useEffect(() => {
-        if (accessKey) {
+        if (accessKey && API_BASE) {
             fetchGraph();
         }
-    }, [accessKey]);
+    }, [accessKey, API_BASE]);
 
     useEffect(() => {
-        if (!accessKey) {
+        if (!accessKey) return;
+        fetchRuntimeDiagnostics();
+    }, [accessKey, fetchRuntimeDiagnostics]);
+
+    useEffect(() => {
+        if (!accessKey || !API_BASE) {
             if (eventSourceRef.current) {
                 eventSourceRef.current.close();
                 eventSourceRef.current = null;
@@ -411,7 +555,6 @@ function App() {
             const payload = parsePayload(event);
             if (payload?.graph) {
                 setGraphData(payload.graph);
-                setLastGraphData(payload.graph);
             }
         });
 
@@ -420,7 +563,9 @@ function App() {
             if (!payload) return;
             if (activeUploadJobsRef.current.has(payload.job_id)) {
                 setIsUploading(true);
-                setUploadStatus(`queued (#${payload.queue_position || 1})`);
+                setUploadStatus(`paper 0 / ${payload.paper_total || 0}`);
+                setUploadProgress(0, payload.paper_total || 0);
+                setUploadStatusDetail("Waiting in upload queue...");
             }
         });
 
@@ -429,7 +574,11 @@ function App() {
             if (!payload) return;
             if (activeUploadJobsRef.current.has(payload.job_id)) {
                 setIsUploading(true);
-                setUploadStatus(`processing (0/${payload.paper_total || 0})`);
+                setUploadStatus(
+                    `processing paper 0 / ${payload.paper_total || 0}`
+                );
+                setUploadProgress(0, payload.paper_total || 0);
+                setUploadStatusDetail("Current: preparing upload batch");
             }
         });
 
@@ -438,7 +587,6 @@ function App() {
             if (!payload) return;
             if (payload.graph) {
                 setGraphData(payload.graph);
-                setLastGraphData(payload.graph);
             }
             if (activeUploadJobsRef.current.has(payload.job_id)) {
                 const statusLabel =
@@ -446,7 +594,16 @@ function App() {
                         ? "processed"
                         : `skipped:${payload.reason || "unknown"}`;
                 setUploadStatus(
-                    `${statusLabel} (${payload.paper_index || 0}/${payload.paper_total || 0})`
+                    `${statusLabel} paper ${payload.paper_index || 0} / ${payload.paper_total || 0}`
+                );
+                setUploadProgress(
+                    payload.paper_index || 0,
+                    payload.paper_total || 0
+                );
+                setUploadStatusDetail(
+                    payload.paper_title
+                        ? `Latest: ${payload.paper_title}`
+                        : "Latest: paper update received"
                 );
                 if (payload.status === "processed" && payload.paper_title) {
                     setRecentlyCompletedPapers((prev) => {
@@ -463,13 +620,17 @@ function App() {
             if (!payload) return;
             if (payload.graph) {
                 setGraphData(payload.graph);
-                setLastGraphData(payload.graph);
             }
             if (activeUploadJobsRef.current.has(payload.job_id)) {
                 activeUploadJobsRef.current.delete(payload.job_id);
                 if (activeUploadJobsRef.current.size === 0) {
                     setIsUploading(false);
                     setUploadStatus("done");
+                    setUploadStatusDetail("");
+                    setUploadProgress(
+                        payload.paper_total || uploadProgressTotal,
+                        payload.paper_total || uploadProgressTotal
+                    );
                 }
             }
             // Ensure graph is refreshed from backend even if stream payload is stale.
@@ -485,6 +646,7 @@ function App() {
                 if (activeUploadJobsRef.current.size === 0) {
                     setIsUploading(false);
                     setUploadStatus("error");
+                    setUploadStatusDetail("");
                 }
             }
         });
@@ -547,7 +709,42 @@ function App() {
         setAuthError(null);
         setAccessKey(enteredKey);
         localStorage.setItem(ACCESS_KEY_STORAGE_KEY, enteredKey);
+        if (desktopConfig.isDesktop && window.desktopBridge?.setSecret) {
+            await window.desktopBridge.setSecret("APP_ACCESS_KEY", enteredKey);
+            setAppAccessKeyInput(enteredKey);
+        }
         setAccessKeyInput("");
+    };
+
+    const handleDesktopSecretsSave = async (event) => {
+        event.preventDefault();
+        const bridge = window.desktopBridge;
+        if (!bridge?.setSecret) return;
+        setDesktopSecretError("");
+        setIsSavingDesktopSecrets(true);
+        try {
+            const trimmedOpenAi = openAiKeyInput.trim();
+            if (!trimmedOpenAi) {
+                setDesktopSecretError("OpenAI key is required to process PDFs.");
+                return;
+            }
+            await bridge.setSecret("OPENAI_API_KEY", trimmedOpenAi);
+            const maybeAccessKey = appAccessKeyInput.trim();
+            if (maybeAccessKey) {
+                await bridge.setSecret("APP_ACCESS_KEY", maybeAccessKey);
+                setAccessKey(maybeAccessKey);
+                localStorage.setItem(ACCESS_KEY_STORAGE_KEY, maybeAccessKey);
+            }
+            setOpenAiKeyInput("");
+            await sleep(1200);
+            await fetchRuntimeDiagnostics();
+        } catch (error) {
+            setDesktopSecretError(
+                error?.message || "Failed to store desktop secrets."
+            );
+        } finally {
+            setIsSavingDesktopSecrets(false);
+        }
     };
 
     const handleSearch = async (query) => {
@@ -605,7 +802,7 @@ function App() {
             answer: null, // null indicates loading
             timestamp: new Date().toLocaleTimeString(),
         };
-        setChatHistory((prev) => [...prev, questionEntry]);
+        setChatHistory((prev) => capChatHistory([...prev, questionEntry]));
 
         // Auto-scroll to bottom after adding question
         setTimeout(() => {
@@ -652,10 +849,19 @@ function App() {
                     answer:
                         data.status === "search_results"
                             ? "SEARCH_RESULTS"
-                            : data.answer || data.error || "No response",
-                    search_results: data.search_results || null,
+                            : (data.answer || data.error || "No response").slice(
+                                  0,
+                                  MAX_ANSWER_CHARS
+                              ),
+                    search_results: Array.isArray(data.search_results)
+                        ? data.search_results
+                              .slice(0, MAX_SEARCH_RESULTS_PER_ENTRY)
+                              .map(trimSearchResult)
+                        : null,
                     mermaid: data.mermaid || null,
-                    sources_used: data.sources_used || null,
+                    sources_used: Array.isArray(data.sources_used)
+                        ? data.sources_used.slice(0, 20)
+                        : null,
                 };
 
                 // Auto-scroll after updating chat history
@@ -672,7 +878,7 @@ function App() {
                     }
                 }, 50);
 
-                return updated;
+                return capChatHistory(updated);
             });
         } catch (error) {
             console.error("Search error:", error);
@@ -683,7 +889,7 @@ function App() {
                     ...updated[updated.length - 1],
                     answer: "Error: Could not connect to server",
                 };
-                return updated;
+                return capChatHistory(updated);
             });
         } finally {
             setIsSearching(false);
@@ -695,7 +901,9 @@ function App() {
         if (files.length > 0) {
             setIsUploading(true);
             setUploadError(null);
-            setUploadStatus("queued");
+            setUploadStatus(`paper 0 / ${files.length}`);
+            setUploadProgress(0, files.length);
+            setUploadStatusDetail("Uploading files to local backend...");
 
             try {
                 // Create FormData to send files
@@ -725,9 +933,9 @@ function App() {
                     throw new Error("Upload did not return a job_id");
                 }
                 activeUploadJobsRef.current.add(data.job_id);
-                setUploadStatus(
-                    `queued (#${data.queue_position || activeUploadJobsRef.current.size})`
-                );
+                setUploadStatus(`paper 0 / 0`);
+                setUploadProgress(0, 0);
+                setUploadStatusDetail("Upload accepted. Waiting for processing worker...");
                 setUploadError(null);
                 monitorUploadJob(data.job_id);
             } catch (error) {
@@ -736,6 +944,7 @@ function App() {
                     error.message || "Failed to upload and process files"
                 );
                 setUploadStatus("error");
+                setUploadProgress(0, 0);
                 // Keep graph data as null on error
             } finally {
                 // Reset file input
@@ -746,7 +955,15 @@ function App() {
 
     return (
         <div className={`app ${isDarkMode ? "dark" : "light"}`}>
-            {!accessKey && (
+            {!runtimeConfigLoaded && (
+                <div className="auth-overlay">
+                    <div className="auth-card">
+                        <h2>Starting desktop runtime...</h2>
+                        <p>Connecting to local backend.</p>
+                    </div>
+                </div>
+            )}
+            {runtimeConfigLoaded && !accessKey && (
                 <div className="auth-overlay">
                     <form className="auth-card" onSubmit={handleAccessKeySubmit}>
                         <h2>Private Access</h2>
@@ -760,6 +977,36 @@ function App() {
                         />
                         {authError && <div className="auth-error">{authError}</div>}
                         <button type="submit">Unlock</button>
+                    </form>
+                </div>
+            )}
+            {runtimeConfigLoaded && requiresDesktopSetup && (
+                <div className="auth-overlay">
+                    <form className="auth-card" onSubmit={handleDesktopSecretsSave}>
+                        <h2>Desktop Setup Required</h2>
+                        <p>
+                            Add your OpenAI API key to continue. Keys are stored in
+                            macOS Keychain.
+                        </p>
+                        <input
+                            type="password"
+                            value={openAiKeyInput}
+                            onChange={(e) => setOpenAiKeyInput(e.target.value)}
+                            placeholder="OpenAI API key"
+                            autoFocus
+                        />
+                        <input
+                            type="password"
+                            value={appAccessKeyInput}
+                            onChange={(e) => setAppAccessKeyInput(e.target.value)}
+                            placeholder="App access key (optional)"
+                        />
+                        {desktopSecretError && (
+                            <div className="auth-error">{desktopSecretError}</div>
+                        )}
+                        <button type="submit" disabled={isSavingDesktopSecrets}>
+                            {isSavingDesktopSecrets ? "Saving..." : "Save and Restart Backend"}
+                        </button>
                     </form>
                 </div>
             )}
@@ -828,7 +1075,6 @@ function App() {
                     />
                 ) : visibleGraphData ? (
                     <GraphVisualization
-                        key={visibleGraphData.papers?.length || 0}
                         ref={graphRef}
                         data={visibleGraphData}
                         isDarkMode={isDarkMode}
@@ -868,8 +1114,44 @@ function App() {
                     >
                         <div style={{ fontWeight: 600 }}>
                             Processing papers
-                            {uploadStatus ? ` - ${uploadStatus}` : ""}
                         </div>
+                        {(uploadStatusDetail || uploadStatus) && (
+                            <div
+                                style={{
+                                    marginTop: "6px",
+                                    fontSize: "12px",
+                                    opacity: 0.9,
+                                }}
+                            >
+                                {uploadStatusDetail || uploadStatus}
+                                {uploadStatusDetail &&
+                                    uploadStatus &&
+                                    uploadStatus !== "done" &&
+                                    uploadStatus !== "error" &&
+                                    ` · ${uploadStatus}`}
+                            </div>
+                        )}
+                        {(uploadProgressTotal > 0 || isUploading) && (
+                            <div
+                                style={{
+                                    marginTop: "8px",
+                                    height: "8px",
+                                    width: "100%",
+                                    background: isDarkMode ? "#3a3a3a" : "#ececec",
+                                    borderRadius: "999px",
+                                    overflow: "hidden",
+                                }}
+                            >
+                                <div
+                                    style={{
+                                        height: "100%",
+                                        width: `${uploadProgressPercent}%`,
+                                        background: "#4CAF50",
+                                        transition: "width 240ms ease",
+                                    }}
+                                />
+                            </div>
+                        )}
                         {recentlyCompletedPapers.length > 0 && (
                             <div
                                 style={{

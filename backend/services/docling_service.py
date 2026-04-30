@@ -4,6 +4,10 @@ from typing import Any
 from tempfile import NamedTemporaryFile
 import resource
 import logging
+import threading
+from io import BytesIO
+
+from pypdf import PdfReader, PdfWriter
 
 from services.observability import timed_block, log_memory
 
@@ -21,6 +25,13 @@ class DoclingService:
         self.max_pages = int(os.getenv("DOCLING_MAX_PAGES", "2") or "2")
         self.max_text_chars = int(os.getenv("DOCLING_MAX_TEXT_CHARS", "8000") or "8000")
         self._converter = None
+        self._converter_lock = threading.Lock()
+
+    def warmup(self) -> None:
+        """Preload Docling converter once at app startup."""
+        if not self.enabled:
+            return
+        self._get_converter()
 
     def parse_pdf(self, pdf_bytes: bytes) -> dict[str, Any]:
         log_memory("docling_parse_pdf_start")
@@ -30,8 +41,9 @@ class DoclingService:
             return self._empty_result("empty_input")
 
         try:
+            limited_pdf_bytes = self._limit_pdf_pages(pdf_bytes)
             with timed_block("docling_parse_per_paper"):
-                parsed = self._run_docling(pdf_bytes)
+                parsed = self._run_docling(limited_pdf_bytes)
             parsed["source"] = "docling"
             parsed["ok"] = bool(parsed.get("text"))
             log_memory("docling_parse_pdf_end")
@@ -41,19 +53,11 @@ class DoclingService:
             return self._empty_result("docling_error")
 
     def _run_docling(self, pdf_bytes: bytes) -> dict[str, Any]:
-        log_memory("docling_before_import_document_converter")
-        from docling.document_converter import DocumentConverter
-        log_memory("docling_after_import_document_converter")
+        converter = self._get_converter()
 
         def mem_mb() -> float:
             return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
-        if self._converter is None:
-            logger.info("Before Docling init: %.0f MB", mem_mb())
-            log_memory("docling_before_converter_init")
-            self._converter = DocumentConverter()
-            logger.info("After Docling init: %.0f MB", mem_mb())
-            log_memory("docling_after_converter_init")
         tmp_path: str | None = None
         conversion_result: Any = None
         document: Any = None
@@ -64,7 +68,7 @@ class DoclingService:
                 tmp_path = tmp.name
 
             log_memory("docling_before_convert_call")
-            conversion_result = self._converter.convert(tmp_path)
+            conversion_result = converter.convert(tmp_path)
             log_memory("docling_after_convert_call")
             document = getattr(conversion_result, "document", None)
             logger.info("After parse: %.0f MB", mem_mb())
@@ -93,6 +97,43 @@ class DoclingService:
                     logger.exception("Failed to delete temporary Docling PDF file: %s", tmp_path)
             gc.collect()
             log_memory("docling_after_gc_collect")
+
+    def _limit_pdf_pages(self, pdf_bytes: bytes) -> bytes:
+        """Return a PDF byte payload constrained to max_pages when possible."""
+        if self.max_pages <= 0:
+            return pdf_bytes
+        try:
+            reader = PdfReader(BytesIO(pdf_bytes))
+            if len(reader.pages) <= self.max_pages:
+                return pdf_bytes
+            writer = PdfWriter()
+            for page in reader.pages[: self.max_pages]:
+                writer.add_page(page)
+            output = BytesIO()
+            writer.write(output)
+            return output.getvalue()
+        except Exception as exc:
+            logger.warning("Failed to enforce Docling page limit, using original PDF: %s", exc)
+            return pdf_bytes
+
+    def _get_converter(self):
+        if self._converter is not None:
+            return self._converter
+        with self._converter_lock:
+            if self._converter is None:
+                log_memory("docling_before_import_document_converter")
+                from docling.document_converter import DocumentConverter
+                log_memory("docling_after_import_document_converter")
+
+                def mem_mb() -> float:
+                    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+                logger.info("Before Docling init: %.0f MB", mem_mb())
+                log_memory("docling_before_converter_init")
+                self._converter = DocumentConverter()
+                logger.info("After Docling init: %.0f MB", mem_mb())
+                log_memory("docling_after_converter_init")
+        return self._converter
 
     def _extract_text(self, document: Any) -> str:
         if document is None:
@@ -128,10 +169,20 @@ class DoclingService:
                 "publication_date": publication_date,
             }
 
-        for attr in ("title", "doc_title", "name"):
+        for attr in ("title", "doc_title"):
             value = getattr(document, attr, None)
             if isinstance(value, str) and value.strip():
-                title = value.strip()
+                candidate = value.strip()
+                lower_candidate = candidate.lower()
+                # Reject converter temp filenames accidentally exposed as title metadata.
+                if lower_candidate.endswith(".pdf") and (
+                    lower_candidate.startswith("tmp")
+                    or lower_candidate.startswith("nesy_upload_")
+                ):
+                    continue
+                if lower_candidate.startswith("tmp") and len(lower_candidate) <= 24:
+                    continue
+                title = candidate
                 break
 
         for attr in ("authors", "author_list"):
@@ -175,3 +226,13 @@ class DoclingService:
             "source": source,
             "ok": False,
         }
+
+
+_DOCLING_SERVICE_SINGLETON: DoclingService | None = None
+
+
+def get_docling_service() -> DoclingService:
+    global _DOCLING_SERVICE_SINGLETON
+    if _DOCLING_SERVICE_SINGLETON is None:
+        _DOCLING_SERVICE_SINGLETON = DoclingService()
+    return _DOCLING_SERVICE_SINGLETON

@@ -1,5 +1,6 @@
 import json
 import os
+import gzip
 from pathlib import Path
 
 import boto3
@@ -11,6 +12,12 @@ GRAPH_KEY = "saved_graph.json"
 WORKSPACE_STATE_KEY = "workspace_state.json"
 LOCAL_GRAPH_FILE = "saved_graph.json"
 LOCAL_WORKSPACE_FILE = "workspace_state.json"
+STORAGE_COMPRESS_JSON = os.environ.get("STORAGE_COMPRESS_JSON", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
 
 
 def _s3_client():
@@ -30,8 +37,20 @@ def _s3_is_configured() -> bool:
 
 
 def _local_data_dir() -> Path:
-    base_dir = Path(__file__).resolve().parents[1]
-    data_dir = Path(os.environ.get("LOCAL_DATA_DIR", str(base_dir / "data")))
+    explicit_data_dir = os.environ.get("LOCAL_DATA_DIR", "").strip()
+    if explicit_data_dir:
+        data_dir = Path(explicit_data_dir).expanduser()
+    elif os.environ.get("DESKTOP_APP_MODE", "").lower() == "true":
+        data_dir = (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "NeSyPaperGraph"
+            / "data"
+        )
+    else:
+        base_dir = Path(__file__).resolve().parents[1]
+        data_dir = base_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir
 
@@ -41,15 +60,35 @@ def _read_local_json(filename: str):
     if not path.exists():
         return None
     with timed_block(f"local_json_read_{filename}"):
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
+        with path.open("rb") as handle:
+            blob = handle.read()
+        return _decode_json_blob(blob)
 
 
 def _write_local_json(filename: str, payload: dict) -> None:
     path = _local_data_dir() / filename
     with timed_block(f"local_json_write_{filename}"):
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
+        with path.open("wb") as handle:
+            handle.write(_encode_json_blob(payload))
+
+
+def _encode_json_blob(payload: dict) -> bytes:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if STORAGE_COMPRESS_JSON:
+        return gzip.compress(raw)
+    return raw
+
+
+def _decode_json_blob(blob: bytes, content_encoding: str = "") -> dict:
+    if not blob:
+        return {}
+    should_try_gzip = STORAGE_COMPRESS_JSON or "gzip" in (content_encoding or "").lower()
+    if should_try_gzip:
+        try:
+            blob = gzip.decompress(blob)
+        except (OSError, EOFError):
+            pass
+    return json.loads(blob.decode("utf-8"))
 
 
 def load_graph():
@@ -60,7 +99,9 @@ def load_graph():
         try:
             with timed_block("s3_get_object_load_graph"):
                 response = client.get_object(Bucket=bucket_name, Key=GRAPH_KEY)
-                payload = json.loads(response["Body"].read().decode("utf-8"))
+                payload = _decode_json_blob(
+                    response["Body"].read(), response.get("ContentEncoding", "")
+                )
                 graph = deserialize_graph(payload)
             log_memory("s3_graph_loaded")
             return graph
@@ -84,12 +125,16 @@ def save_graph(graph):
         bucket_name = os.environ["S3_BUCKET_NAME"]
         client = _s3_client()
         with timed_block("s3_put_object_save_graph"):
-            client.put_object(
-                Bucket=bucket_name,
-                Key=GRAPH_KEY,
-                Body=json.dumps(payload).encode("utf-8"),
-                ContentType="application/json",
-            )
+            encoded_payload = _encode_json_blob(payload)
+            put_kwargs = {
+                "Bucket": bucket_name,
+                "Key": GRAPH_KEY,
+                "Body": encoded_payload,
+                "ContentType": "application/json",
+            }
+            if STORAGE_COMPRESS_JSON:
+                put_kwargs["ContentEncoding"] = "gzip"
+            client.put_object(**put_kwargs)
         log_memory("s3_graph_saved")
         return
     _write_local_json(LOCAL_GRAPH_FILE, payload)
@@ -104,7 +149,9 @@ def load_workspace_state():
         try:
             with timed_block("s3_get_object_load_workspace"):
                 response = client.get_object(Bucket=bucket_name, Key=WORKSPACE_STATE_KEY)
-                return json.loads(response["Body"].read().decode("utf-8"))
+                return _decode_json_blob(
+                    response["Body"].read(), response.get("ContentEncoding", "")
+                )
         except ClientError as exc:
             error_code = exc.response.get("Error", {}).get("Code")
             if error_code not in {"NoSuchKey", "404"}:
@@ -121,11 +168,15 @@ def save_workspace_state(state):
         bucket_name = os.environ["S3_BUCKET_NAME"]
         client = _s3_client()
         with timed_block("s3_put_object_save_workspace"):
-            client.put_object(
-                Bucket=bucket_name,
-                Key=WORKSPACE_STATE_KEY,
-                Body=json.dumps(state).encode("utf-8"),
-                ContentType="application/json",
-            )
+            encoded_state = _encode_json_blob(state)
+            put_kwargs = {
+                "Bucket": bucket_name,
+                "Key": WORKSPACE_STATE_KEY,
+                "Body": encoded_state,
+                "ContentType": "application/json",
+            }
+            if STORAGE_COMPRESS_JSON:
+                put_kwargs["ContentEncoding"] = "gzip"
+            client.put_object(**put_kwargs)
         return
     _write_local_json(LOCAL_WORKSPACE_FILE, state)

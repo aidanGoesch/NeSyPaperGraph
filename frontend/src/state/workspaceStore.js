@@ -3,6 +3,11 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 const STORAGE_KEY = "nesy_topic_workspace_state_v1";
 const WORKSPACE_STATE_PATH = "/api/workspace/state";
 const PERSIST_DEBOUNCE_MS = 800;
+const MAX_READING_ITEMS = 200;
+const MAX_THEME_NOTES = 150;
+const MAX_ANNOTATIONS = 400;
+const MAX_NOTE_CHARS = 12000;
+const MAX_QUICK_NOTE_CHARS = 2000;
 
 const initialState = {
     readingItems: [],
@@ -184,9 +189,54 @@ function parseLocalState() {
     }
 }
 
+function clampText(value, maxChars) {
+    const normalized = typeof value === "string" ? value : "";
+    return normalized.slice(0, maxChars);
+}
+
+function trimWorkspaceState(state) {
+    const safeState = state || {};
+    const readingItems = Array.isArray(safeState.readingItems)
+        ? safeState.readingItems.slice(0, MAX_READING_ITEMS).map((item) => ({
+              ...item,
+              quickNote: clampText(item.quickNote, MAX_QUICK_NOTE_CHARS),
+          }))
+        : [];
+    const themeNotes = Array.isArray(safeState.themeNotes)
+        ? safeState.themeNotes.slice(0, MAX_THEME_NOTES).map((note) => ({
+              ...note,
+              sections: {
+                  notes: clampText(note?.sections?.notes, MAX_NOTE_CHARS),
+                  toRead: clampText(note?.sections?.toRead, MAX_NOTE_CHARS),
+              },
+          }))
+        : [];
+    const annotationEntries = Object.entries(safeState.paperAnnotations || {}).slice(
+        0,
+        MAX_ANNOTATIONS
+    );
+    const paperAnnotations = Object.fromEntries(
+        annotationEntries.map(([title, annotation]) => [
+            title,
+            {
+                ...annotation,
+                notesMarkdown: clampText(
+                    annotation?.notesMarkdown,
+                    MAX_NOTE_CHARS
+                ),
+            },
+        ])
+    );
+    return {
+        readingItems,
+        themeNotes,
+        paperAnnotations,
+    };
+}
+
 function persistLocalState(state) {
     try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(trimWorkspaceState(state)));
     } catch (error) {
         console.error("Failed to persist topic workspace state:", error);
     }
@@ -204,7 +254,7 @@ export function useWorkspaceStore(options = {}) {
         let isCancelled = false;
         const parsed = parseLocalState();
         if (parsed) {
-            dispatch({ type: "HYDRATE", payload: parsed });
+            dispatch({ type: "HYDRATE", payload: trimWorkspaceState(parsed) });
         }
 
         const canUseApi = Boolean(apiBase && apiFetch && isEnabled);
@@ -226,8 +276,9 @@ export function useWorkspaceStore(options = {}) {
                 }
                 const payload = await response.json();
                 if (isCancelled) return;
-                dispatch({ type: "HYDRATE", payload });
-                persistLocalState(payload);
+                const normalizedPayload = trimWorkspaceState(payload);
+                dispatch({ type: "HYDRATE", payload: normalizedPayload });
+                persistLocalState(normalizedPayload);
                 setSyncMode("remote");
                 setSyncWarning("");
             } catch (error) {
@@ -266,7 +317,7 @@ export function useWorkspaceStore(options = {}) {
                     headers: {
                         "Content-Type": "application/json",
                     },
-                    body: JSON.stringify(state),
+                    body: JSON.stringify(trimWorkspaceState(state)),
                 });
                 if (!response.ok) {
                     throw new Error(`Workspace state save failed: ${response.status}`);

@@ -1,12 +1,13 @@
 from models.graph import PaperGraph
 from models.paper import Paper
 from services.llm_service import TopicExtractor, OpenAILLMClient
-from services.docling_service import DoclingService
+from services.docling_service import get_docling_service
 from services.pdf_preprocessor import extract_text_from_pdf
 import logging
 import os
+import re
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 from services.observability import timed_block, log_memory
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,158 @@ class GraphBuilder:
         normalized = re.sub(r'[^\w\s]', '', normalized)  # Remove punctuation
         normalized = re.sub(r'\s+', ' ', normalized).strip()  # Normalize whitespace
         return normalized
+
+    @staticmethod
+    def _prefer_heuristic_title(
+        docling_title: str | None, heuristic_title: str | None
+    ) -> str | None:
+        """Prefer heuristic title when Docling returns likely venue/container labels."""
+        if not heuristic_title:
+            return docling_title
+        if not docling_title:
+            return heuristic_title
+
+        normalized_docling = docling_title.strip()
+        normalized_heuristic = heuristic_title.strip()
+        if not normalized_docling:
+            return normalized_heuristic
+        if not normalized_heuristic:
+            return normalized_docling
+
+        container_markers = [
+            r"\bjournal\b",
+            r"\bproceedings\b",
+            r"\btransactions\b",
+            r"\bconference\b",
+            r"\bvolume\b",
+            r"\bvol\.\b",
+            r"\bissue\b",
+            r"\bissn\b",
+            r"\bpublisher\b",
+        ]
+        lower_docling = normalized_docling.lower()
+        looks_like_container = any(
+            re.search(pattern, lower_docling) for pattern in container_markers
+        )
+        very_short_docling = len(normalized_docling) < 15
+
+        if (
+            looks_like_container or very_short_docling
+        ) and len(normalized_heuristic) >= len(normalized_docling):
+            return normalized_heuristic
+        return normalized_docling
+
+    @staticmethod
+    def _is_likely_valid_title(title: str | None) -> bool:
+        if not title:
+            return False
+        candidate = title.strip()
+        if len(candidate) < 8 or len(candidate) > 300:
+            return False
+        # Titles should contain meaningful alphabetic content.
+        alpha_count = sum(1 for ch in candidate if ch.isalpha())
+        if alpha_count < 6:
+            return False
+        non_space_count = sum(1 for ch in candidate if not ch.isspace())
+        if non_space_count == 0:
+            return False
+        symbol_ratio = (
+            sum(1 for ch in candidate if not ch.isalnum() and not ch.isspace())
+            / non_space_count
+        )
+        # Reject OCR noise like "1234567890();;"
+        if symbol_ratio > 0.35:
+            return False
+        digit_ratio = sum(1 for ch in candidate if ch.isdigit()) / non_space_count
+        if digit_ratio > 0.4:
+            return False
+        if re.fullmatch(r"[\d\W_]+", candidate):
+            return False
+        lower_candidate = candidate.lower()
+        if lower_candidate.startswith("tmp") and len(lower_candidate) <= 24:
+            return False
+        if lower_candidate.endswith(".pdf") and (
+            lower_candidate.startswith("tmp")
+            or lower_candidate.startswith("nesy_upload_")
+        ):
+            return False
+        if candidate.startswith("#") or candidate.startswith("<!--"):
+            return False
+        if re.search(r"[(){};,:]{3,}", candidate):
+            return False
+        return True
+
+    @staticmethod
+    def _heuristic_title_from_text(text: str, max_lines: int = 30) -> str | None:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        lines = lines[:max_lines]
+        title_exclude_patterns = [
+            r"arxiv",
+            r"preprint",
+            r"doi",
+            r"copyright",
+            r"all rights reserved",
+            r"\bjournal\b",
+            r"\bproceedings\b",
+            r"\bvolume\b",
+            r"\bissue\b",
+        ]
+        for line in lines:
+            if len(line) < 8 or len(line) > 300:
+                continue
+            lower = line.lower()
+            if any(re.search(pattern, lower) for pattern in title_exclude_patterns):
+                continue
+            if re.fullmatch(r"\d+(\s+of\s+\d+)?", line):
+                continue
+            if not GraphBuilder._is_likely_valid_title(line):
+                continue
+            return line
+        return None
+
+    @staticmethod
+    def _resolve_title(
+        preferred_title: str | None, heuristic_title: str | None, fallback_stem: str
+    ) -> str:
+        if GraphBuilder._is_likely_valid_title(preferred_title):
+            return preferred_title.strip()
+        if GraphBuilder._is_likely_valid_title(heuristic_title):
+            return heuristic_title.strip()
+        cleaned_stem = fallback_stem.strip() if fallback_stem else "Untitled Paper"
+        return cleaned_stem or "Untitled Paper"
+
+    @staticmethod
+    def _build_metadata_extractor() -> TopicExtractor:
+        try:
+            return TopicExtractor(OpenAILLMClient())
+        except Exception as exc:
+            logger.warning(
+                "[Metadata] LLM metadata extractor unavailable, using non-LLM fallbacks: %s",
+                exc,
+            )
+            return TopicExtractor(None)
+
+    @staticmethod
+    def _merge_metadata(base: dict, llm_metadata: dict | None) -> dict:
+        if not llm_metadata:
+            return base
+        merged = {
+            "title": base.get("title"),
+            "authors": base.get("authors", []),
+            "publication_date": base.get("publication_date"),
+        }
+        llm_title = llm_metadata.get("title")
+        if GraphBuilder._is_likely_valid_title(llm_title):
+            merged["title"] = llm_title.strip()
+        llm_authors = llm_metadata.get("authors")
+        if isinstance(llm_authors, list) and llm_authors:
+            cleaned_authors = [str(author).strip() for author in llm_authors if str(author).strip()]
+            if cleaned_authors:
+                merged["authors"] = cleaned_authors
+        llm_pub_date = llm_metadata.get("publication_date")
+        if isinstance(llm_pub_date, (str, int)) and str(llm_pub_date).strip():
+            merged["publication_date"] = str(llm_pub_date).strip()
+        return merged
     
     def _is_duplicate_paper(self, paper: Paper, graph: PaperGraph) -> bool:
         """Check if paper already exists in graph by normalized title"""
@@ -80,6 +233,7 @@ class GraphBuilder:
         file_path: str = None,
         existing_graph=None,
         on_paper_processed: Optional[Callable[[dict], None]] = None,
+        total_papers: Optional[int] = None,
     ) -> PaperGraph:
         """
         Builds a graph from PDF files.
@@ -122,8 +276,12 @@ class GraphBuilder:
         
         if files_data is not None:
             papers_to_process = self.get_papers_from_data(files_data)
+            if total_papers is None:
+                total_papers = len(files_data)
         elif file_path is not None:
             papers_to_process = self.get_papers(file_path)
+            if total_papers is None:
+                total_papers = len(papers_to_process)
         else:
             raise ValueError("Either files_data or file_path must be provided")
         
@@ -137,9 +295,10 @@ class GraphBuilder:
         extractor = TopicExtractor(client)
         from services.verification import verify_bipartite, find_optimal_topic_merge
         
-        total_papers = len(papers_to_process)
+        total_papers = total_papers or 0
         embed_batch_size = max(1, INGEST_EMBED_BATCH_SIZE)
         pending_embedding_batch: list[dict[str, Any]] = []
+        input_paper_count = 0
 
         def finalize_paper_into_graph(
             paper: Paper, paper_index: int, paper_total: int
@@ -226,6 +385,7 @@ class GraphBuilder:
             pending_embedding_batch.clear()
 
         for paper_index, paper in enumerate(papers_to_process, start=1):
+            input_paper_count = paper_index
             if self._is_duplicate_paper(paper, graph):
                 logger.info(f"Skipping duplicate paper: {paper.title}")
                 if on_paper_processed:
@@ -319,7 +479,11 @@ class GraphBuilder:
         flush_embedding_batch()
         log_memory("graph_builder_after_embedding_batches")
         
-        logger.info(f"Processed {len(papers_to_process)} papers, {len(self.topics)} unique topics in this batch")
+        logger.info(
+            "Processed %s papers, %s unique topics in this batch",
+            input_paper_count,
+            len(self.topics),
+        )
         
         # Generate synonyms for all topics in the graph
         all_topics = [node for node, data in graph.graph.nodes(data=True) if data.get('type') == 'topic']
@@ -360,28 +524,34 @@ class GraphBuilder:
         return graph
 
 
-    def get_papers_from_data(self, files_data: list[tuple]) -> list[Paper]:
+    def get_papers_from_data(self, files_data: list[tuple]) -> Iterator[Paper]:
         """
         Creates Paper objects from file data (filename, content bytes).
         
         Args:
             files_data: List of tuples (filename, file_content_bytes)
         """
-        metadata_extractor = TopicExtractor(None)
-        docling = DoclingService()
+        metadata_extractor = self._build_metadata_extractor()
+        docling = get_docling_service()
         log_memory("graph_builder_get_papers_from_data_start")
         docling_success_count = 0
         fallback_count = 0
         metadata_complete_count = 0
         
-        parsed_papers = []
         for file_tuple in files_data:
-            if len(file_tuple) == 3:
+            if len(file_tuple) == 4:
+                filename, file_content, content_hash, _ = file_tuple
+            elif len(file_tuple) == 3:
                 filename, file_content, content_hash = file_tuple
             else:
                 filename, file_content = file_tuple
                 content_hash = None
-            parsed_doc = docling.parse_pdf(file_content)
+            if isinstance(file_content, (str, Path)):
+                with Path(file_content).open("rb") as handle:
+                    file_bytes = handle.read()
+            else:
+                file_bytes = file_content
+            parsed_doc = docling.parse_pdf(file_bytes)
             metadata = {
                 "title": parsed_doc.get("title"),
                 "authors": parsed_doc.get("authors", []),
@@ -393,17 +563,31 @@ class GraphBuilder:
             else:
                 fallback_count += 1
                 with timed_block("docling_fallback_extract_text_per_paper"):
-                    text = extract_text_from_pdf(file_content)
+                    text = extract_text_from_pdf(
+                        file_bytes, max_pages=getattr(docling, "max_pages", None)
+                    )
                 with timed_block("metadata_fallback_heuristic_per_paper"):
                     metadata = metadata_extractor.heuristic_metadata(text)
+            heuristic_title = self._heuristic_title_from_text(text)
+            metadata["title"] = self._prefer_heuristic_title(
+                metadata.get("title"),
+                heuristic_title,
+            )
+            if metadata_extractor.llm_client and text:
+                with timed_block("metadata_llm_extract_per_paper"):
+                    llm_metadata = metadata_extractor.extract_paper_metadata(text)
+                metadata = self._merge_metadata(metadata, llm_metadata)
             if metadata.get("title") and metadata.get("authors") and metadata.get("publication_date"):
                 metadata_complete_count += 1
             
-            # Use extracted title if available, otherwise use filename
-            title = metadata.get('title') or Path(filename).stem
-            if not metadata.get('title'):
+            title = self._resolve_title(
+                metadata.get("title"),
+                heuristic_title,
+                Path(filename).stem,
+            )
+            if title == Path(filename).stem:
                 logger.warning(
-                    f"[Metadata] No title returned from extractor; using filename as title for {filename}"
+                    f"[Metadata] Using filename fallback title for {filename}; extracted title looked invalid."
                 )
             
             paper = Paper(
@@ -414,27 +598,25 @@ class GraphBuilder:
                 authors=metadata.get('authors', []),
                 publication_date=metadata.get('publication_date')
             )
-            parsed_papers.append(paper)
-            self.papers.append(paper)
+            file_bytes = b""
+            yield paper
 
         logger.info(
             "Metadata extraction summary | papers=%s | docling_success=%s | heuristic_fallback=%s | metadata_complete=%s",
-            len(parsed_papers),
+            len(files_data),
             docling_success_count,
             fallback_count,
             metadata_complete_count,
         )
         log_memory("graph_builder_get_papers_from_data_end")
-        
-        return parsed_papers
 
     def get_papers(self, file_path: str) -> list[Paper]:
         """
         Gets all of the pdfs in the given file path and all of its sub folders.
         Legacy method for backward compatibility.
         """
-        metadata_extractor = TopicExtractor(None)
-        docling = DoclingService()
+        metadata_extractor = self._build_metadata_extractor()
+        docling = get_docling_service()
         docling_success_count = 0
         fallback_count = 0
         metadata_complete_count = 0
@@ -458,17 +640,31 @@ class GraphBuilder:
             else:
                 fallback_count += 1
                 with timed_block("docling_fallback_extract_text_per_paper"):
-                    text = extract_text_from_pdf(str(pdf_file))
+                    text = extract_text_from_pdf(
+                        str(pdf_file), max_pages=getattr(docling, "max_pages", None)
+                    )
                 with timed_block("metadata_fallback_heuristic_per_paper"):
                     metadata = metadata_extractor.heuristic_metadata(text)
+            heuristic_title = self._heuristic_title_from_text(text)
+            metadata["title"] = self._prefer_heuristic_title(
+                metadata.get("title"),
+                heuristic_title,
+            )
+            if metadata_extractor.llm_client and text:
+                with timed_block("metadata_llm_extract_per_paper"):
+                    llm_metadata = metadata_extractor.extract_paper_metadata(text)
+                metadata = self._merge_metadata(metadata, llm_metadata)
             if metadata.get("title") and metadata.get("authors") and metadata.get("publication_date"):
                 metadata_complete_count += 1
             
-            # Use extracted title if available, otherwise use filename
-            title = metadata.get('title') or pdf_file.stem
-            if not metadata.get('title'):
+            title = self._resolve_title(
+                metadata.get("title"),
+                heuristic_title,
+                pdf_file.stem,
+            )
+            if title == pdf_file.stem:
                 logger.warning(
-                    f"[Metadata] No title returned from extractor; using filename as title for {pdf_file}"
+                    f"[Metadata] Using filename fallback title for {pdf_file}; extracted title looked invalid."
                 )
             
             paper = Paper(
