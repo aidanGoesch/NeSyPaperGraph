@@ -1451,6 +1451,31 @@ function App() {
                         isDarkMode={isDarkMode}
                         onShowArchitecture={showAgentArchitecture}
                         highlightPath={highlightPath}
+                        apiBase={API_BASE}
+                        apiFetch={apiFetch}
+                        onAddRecommendationToReadingList={(paper) => {
+                            if (!paper?.title) return;
+                            workspaceStore.actions.addReadingItem({
+                                sourceType: paper.url ? "url" : "semantic_scholar",
+                                status: "inbox",
+                                title: paper.title,
+                                url: paper.url || "",
+                                semanticScholarPaperId: paper.paperId || null,
+                                authors: Array.isArray(paper.authors)
+                                    ? paper.authors
+                                    : [],
+                                year:
+                                    typeof paper.year === "number" &&
+                                    Number.isFinite(paper.year)
+                                        ? paper.year
+                                        : null,
+                                venue: paper.venue || null,
+                                quickNote:
+                                    paper.source === "graph"
+                                        ? "Added from graph recommendation."
+                                        : "Added from Semantic Scholar recommendation.",
+                            });
+                        }}
                     />
                 ) : (
                     <div className="loading">

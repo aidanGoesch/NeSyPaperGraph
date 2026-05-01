@@ -21,6 +21,13 @@ const MIN_CENTER_PANEL_PX = 320;
 const MIN_RIGHT_PANEL_PX = 280;
 const MIN_TO_READ_HEIGHT_PX = 150;
 const DEFAULT_TO_READ_HEIGHT_PX = 220;
+const DEFAULT_LEFT_PANEL_RATIO = 0.9;
+const DEFAULT_CENTER_PANEL_RATIO = 1.5;
+const DEFAULT_RIGHT_PANEL_RATIO = 1.2;
+const DEFAULT_PANEL_RATIO_TOTAL =
+    DEFAULT_LEFT_PANEL_RATIO +
+    DEFAULT_CENTER_PANEL_RATIO +
+    DEFAULT_RIGHT_PANEL_RATIO;
 
 function filterPapers(graphData, selectedCluster, selectedTreeNode) {
     const papers = graphData?.papers || [];
@@ -41,6 +48,106 @@ function formatAuthorsCompact(authors) {
     if (!Array.isArray(authors) || authors.length === 0) return "Unknown authors";
     if (authors.length <= 2) return authors.join(", ");
     return `${authors.slice(0, 2).join(", ")} + ${authors.length - 2} more`;
+}
+
+function normalizeToken(value) {
+    return String(value || "").trim().toLowerCase();
+}
+
+function scoreLocalSimilarity(seedPaper, candidatePaper) {
+    if (!seedPaper || !candidatePaper) return 0;
+    const seedTopics = new Set((seedPaper.topics || []).map(normalizeToken).filter(Boolean));
+    const candidateTopics = new Set(
+        (candidatePaper.topics || []).map(normalizeToken).filter(Boolean)
+    );
+    let topicOverlap = 0;
+    seedTopics.forEach((topic) => {
+        if (candidateTopics.has(topic)) topicOverlap += 1;
+    });
+
+    const seedAuthors = new Set((seedPaper.authors || []).map(normalizeToken).filter(Boolean));
+    const candidateAuthors = new Set(
+        (candidatePaper.authors || []).map(normalizeToken).filter(Boolean)
+    );
+    let authorOverlap = 0;
+    seedAuthors.forEach((author) => {
+        if (candidateAuthors.has(author)) authorOverlap += 1;
+    });
+
+    const seedYear =
+        Number(seedPaper.year || seedPaper.publication_date || 0) || null;
+    const candidateYear =
+        Number(candidatePaper.year || candidatePaper.publication_date || 0) || null;
+    const yearScore =
+        seedYear && candidateYear ? Math.max(0, 1 - Math.min(Math.abs(seedYear - candidateYear), 8) / 8) : 0;
+
+    return topicOverlap * 3 + authorOverlap * 2 + yearScore;
+}
+
+function buildLocalGraphRecommendations(seedPaper, graphPapers, limit = 8) {
+    if (!seedPaper || !Array.isArray(graphPapers)) return [];
+    const seedTitle = normalizeToken(seedPaper.title);
+    const scored = graphPapers
+        .filter((paper) => normalizeToken(paper.title) && normalizeToken(paper.title) !== seedTitle)
+        .map((paper) => ({
+            ...paper,
+            _localScore: scoreLocalSimilarity(seedPaper, paper),
+        }))
+        .filter((paper) => paper._localScore > 0)
+        .sort((left, right) => right._localScore - left._localScore)
+        .slice(0, Math.max(1, limit))
+        .map((paper) => ({
+            paperId: paper.paperId || null,
+            title: paper.title,
+            authors: paper.authors || [],
+            year: paper.year || paper.publication_date || null,
+            venue: paper.venue || null,
+            abstract: paper.abstract || "",
+            source: "graph",
+            reason: "Similar to selected paper in your graph",
+        }));
+    return scored;
+}
+
+function interleaveRecommendations(localItems, externalItems, limit = 8) {
+    const merged = [];
+    const seenTitles = new Set();
+    const locals = Array.isArray(localItems) ? localItems : [];
+    const externals = Array.isArray(externalItems) ? externalItems : [];
+    let localIdx = 0;
+    let externalIdx = 0;
+
+    while (merged.length < limit && (localIdx < locals.length || externalIdx < externals.length)) {
+        if (localIdx < locals.length) {
+            const nextLocal = locals[localIdx++];
+            const key = normalizeToken(nextLocal?.title);
+            if (key && !seenTitles.has(key)) {
+                seenTitles.add(key);
+                merged.push(nextLocal);
+                if (merged.length >= limit) break;
+            }
+        }
+        if (externalIdx < externals.length) {
+            const nextExternal = externals[externalIdx++];
+            const key = normalizeToken(nextExternal?.title);
+            if (key && !seenTitles.has(key)) {
+                seenTitles.add(key);
+                merged.push({ ...nextExternal, source: nextExternal?.source || "semanticScholar" });
+            }
+        }
+    }
+    return merged.slice(0, limit);
+}
+
+function recommendationBrowserUrl(paper) {
+    if (paper?.url) return paper.url;
+    if (paper?.semanticScholarPaperId) {
+        return `https://www.semanticscholar.org/paper/${paper.semanticScholarPaperId}`;
+    }
+    if (paper?.paperId) {
+        return `https://www.semanticscholar.org/paper/${paper.paperId}`;
+    }
+    return "";
 }
 
 async function parseResponseError(response) {
@@ -91,7 +198,12 @@ export default function TopicWorkspace({
     const [topicSearchResults, setTopicSearchResults] = useState([]);
     const [topicSearchState, setTopicSearchState] = useState("idle");
     const [topicSearchError, setTopicSearchError] = useState("");
+    const [topicRecommendations, setTopicRecommendations] = useState([]);
+    const [topicRecommendationState, setTopicRecommendationState] = useState("idle");
+    const [topicRecommendationError, setTopicRecommendationError] = useState("");
+    const [topicActionMode, setTopicActionMode] = useState("search");
     const [isResultOverlayOpen, setIsResultOverlayOpen] = useState(false);
+    const [selectedSearchResult, setSelectedSearchResult] = useState(null);
     const workspaceRef = useRef(null);
     const topGridRef = useRef(null);
     const lastTopGridWidthRef = useRef(0);
@@ -127,6 +239,7 @@ export default function TopicWorkspace({
         setTopicSearchState("idle");
         setTopicSearchError("");
         setIsResultOverlayOpen(false);
+        setSelectedSearchResult(null);
     }, [selectedClusterId, selectedTreeNode?.id]);
 
     useEffect(() => {
@@ -179,9 +292,9 @@ export default function TopicWorkspace({
             setPanelWidthsPx((previous) => {
                 if (!previous) {
                     const initial = [
-                        currentWidth * (1 / 3.6),
-                        currentWidth * (1.4 / 3.6),
-                        currentWidth * (1.2 / 3.6),
+                        currentWidth * (DEFAULT_LEFT_PANEL_RATIO / DEFAULT_PANEL_RATIO_TOTAL),
+                        currentWidth * (DEFAULT_CENTER_PANEL_RATIO / DEFAULT_PANEL_RATIO_TOTAL),
+                        currentWidth * (DEFAULT_RIGHT_PANEL_RATIO / DEFAULT_PANEL_RATIO_TOTAL),
                     ];
                     lastTopGridWidthRef.current = currentWidth;
                     return initial;
@@ -214,9 +327,12 @@ export default function TopicWorkspace({
             panelWidthsPx && panelWidthsPx.length === 3
                 ? panelWidthsPx
                 : [
-                      totalWidth * (1 / 3.6),
-                      totalWidth * (1.4 / 3.6),
-                      totalWidth * (1.2 / 3.6),
+                      totalWidth *
+                          (DEFAULT_LEFT_PANEL_RATIO / DEFAULT_PANEL_RATIO_TOTAL),
+                      totalWidth *
+                          (DEFAULT_CENTER_PANEL_RATIO / DEFAULT_PANEL_RATIO_TOTAL),
+                      totalWidth *
+                          (DEFAULT_RIGHT_PANEL_RATIO / DEFAULT_PANEL_RATIO_TOTAL),
                   ];
         const [startLeft, startCenter, startRight] = baselineWidths;
         const startX = event.clientX;
@@ -286,7 +402,7 @@ export default function TopicWorkspace({
 
     const topGridTemplateColumns = panelWidthsPx
         ? `${panelWidthsPx[0]}px ${SPLITTER_SIZE_PX}px ${panelWidthsPx[1]}px ${SPLITTER_SIZE_PX}px ${panelWidthsPx[2]}px`
-        : "minmax(220px, 1fr) 8px minmax(360px, 1.4fr) 8px minmax(320px, 1.2fr)";
+        : "minmax(220px, 0.9fr) 8px minmax(360px, 1.5fr) 8px minmax(320px, 1.2fr)";
 
     const runTopicSearch = () => {
         const query = topicSearchQuery.trim();
@@ -330,6 +446,161 @@ export default function TopicWorkspace({
             });
     };
 
+    const requestPaperRecommendations = async (paper) => {
+        if (!apiBase || !apiFetch) {
+            throw new Error("API unavailable");
+        }
+        const matchedReadingItem = state.readingItems.find(
+            (item) =>
+                item.title === paper?.title || item.linkedPaperTitle === paper?.title
+        );
+        const paperId =
+            paper?.semanticScholarPaperId || matchedReadingItem?.semanticScholarPaperId;
+        const requestBody = JSON.stringify({
+            semanticScholarPaperId: paperId || null,
+            title: paper?.title || matchedReadingItem?.title || null,
+            url: paper?.url || matchedReadingItem?.url || null,
+            authors: paper?.authors || matchedReadingItem?.authors || [],
+            year:
+                paper?.year ||
+                (paper?.publication_date ? Number(paper.publication_date) : null) ||
+                matchedReadingItem?.year ||
+                null,
+            abstract: paper?.abstract || null,
+            limit: 8,
+        });
+        let response = await apiFetch(`${apiBase}/api/recommendations/paper`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: requestBody,
+        });
+        if (response.status === 404) {
+            response = await apiFetch(`${apiBase}/api/workspace/recommendations/paper`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: requestBody,
+            });
+        }
+        if (!response.ok) {
+            throw new Error(await parseResponseError(response));
+        }
+        const payload = await response.json();
+        const external = Array.isArray(payload?.results) ? payload.results : [];
+        const local = buildLocalGraphRecommendations(paper, graphData?.papers || [], 8);
+        return interleaveRecommendations(local, external, 8);
+    };
+
+    const addRecommendationToReadingList = (paper) => {
+        if (!paper || !paper.title) return;
+        actions.addReadingItem({
+            sourceType: paper.url ? "url" : "semantic_scholar",
+            status: "inbox",
+            title: paper.title,
+            url: paper.url || "",
+            semanticScholarPaperId: paper.paperId || null,
+            authors: Array.isArray(paper.authors) ? paper.authors : [],
+            year:
+                typeof paper.year === "number" && Number.isFinite(paper.year)
+                    ? paper.year
+                    : null,
+            venue: paper.venue || null,
+            quickNote:
+                paper.source === "graph"
+                    ? "Added from graph recommendation."
+                    : "Added from Semantic Scholar recommendation.",
+        });
+    };
+
+    const requestThemeRecommendations = async (themeId) => {
+        if (!apiBase || !apiFetch) {
+            throw new Error("API unavailable");
+        }
+        const requestBody = JSON.stringify({
+            themeId,
+            limit: 8,
+            candidatePoolSize: 40,
+            workspaceState: state,
+        });
+        let response = await apiFetch(`${apiBase}/api/recommendations/theme`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: requestBody,
+        });
+        if (response.status === 404) {
+            response = await apiFetch(`${apiBase}/api/workspace/recommendations/theme`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: requestBody,
+            });
+        }
+        if (!response.ok) {
+            throw new Error(await parseResponseError(response));
+        }
+        const payload = await response.json();
+        return Array.isArray(payload?.results) ? payload.results : [];
+    };
+
+    const addThemeRecommendationToReadingList = (paper, themeId = null) => {
+        if (!paper || !paper.title) return;
+        actions.addReadingItem({
+            sourceType: paper.url ? "url" : "semantic_scholar",
+            status: "inbox",
+            linkedThemeId: themeId || null,
+            title: paper.title,
+            url: paper.url || "",
+            semanticScholarPaperId: paper.paperId || null,
+            authors: Array.isArray(paper.authors) ? paper.authors : [],
+            year:
+                typeof paper.year === "number" && Number.isFinite(paper.year)
+                    ? paper.year
+                    : null,
+            venue: paper.venue || null,
+            quickNote: "Added from theme recommendation.",
+        });
+    };
+
+    const runTopicRecommendations = async () => {
+        if (!apiBase || !apiFetch) return;
+        const query = topicSearchQuery.trim();
+        if (!query) {
+            setTopicRecommendationState("error");
+            setTopicRecommendationError(
+                "Enter a broad topic to get recommendations (for example: causal reasoning)."
+            );
+            setTopicRecommendations([]);
+            return;
+        }
+        setTopicRecommendationState("loading");
+        setTopicRecommendationError("");
+        setTopicRecommendations([]);
+        setIsResultOverlayOpen(false);
+        setSelectedSearchResult(null);
+        try {
+            const response = await apiFetch(`${apiBase}/api/recommendations/topic`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    query,
+                    limit: 10,
+                    candidatePoolSize: 40,
+                }),
+            });
+            if (!response.ok) {
+                throw new Error(await parseResponseError(response));
+            }
+            const payload = await response.json();
+            setTopicRecommendations(
+                Array.isArray(payload?.results) ? payload.results : []
+            );
+            setTopicRecommendationState("success");
+        } catch (error) {
+            setTopicRecommendationError(
+                `Topic recommendations failed: ${error?.message || "Unknown error"}`
+            );
+            setTopicRecommendationState("error");
+        }
+    };
+
     const scheduleTopicSearch = () => {
         if (!topicSearchQuery.trim() || !apiBase || !apiFetch) return;
         setTopicSearchState("loading");
@@ -342,6 +613,58 @@ export default function TopicWorkspace({
         topicSearchTimerRef.current = setTimeout(runTopicSearch, 300);
     };
 
+    const runActiveTopicAction = () => {
+        if (topicActionMode === "recommend") {
+            runTopicRecommendations();
+            return;
+        }
+        scheduleTopicSearch();
+    };
+
+    const openSearchResultInPaperTab = (result) => {
+        if (!result?.title) return;
+        const existsInGraph = (graphData?.papers || []).some(
+            (paper) => paper?.title === result.title
+        );
+        if (!existsInGraph) {
+            const browserUrl = recommendationBrowserUrl(result);
+            if (browserUrl) {
+                window.open(browserUrl, "_blank", "noopener,noreferrer");
+            }
+            return;
+        }
+        setSelectedClusterId(null);
+        setSelectedTreeNode(null);
+        setRequestedPaperTitle(result.title);
+        setIsResultOverlayOpen(false);
+        setSelectedSearchResult(null);
+    };
+
+    const addSearchResultToReadingList = (result) => {
+        if (!result?.title) return;
+        const publicationYear = Number(result.publication_date || result.year || 0);
+        actions.addReadingItem({
+            sourceType: result.url ? "url" : "semantic_scholar",
+            status: "inbox",
+            title: result.title,
+            url: result.url || "",
+            semanticScholarPaperId:
+                result.semanticScholarPaperId || result.paperId || null,
+            authors: Array.isArray(result.authors) ? result.authors : [],
+            year:
+                Number.isFinite(publicationYear) && publicationYear > 0
+                    ? publicationYear
+                    : null,
+            venue: result.venue || null,
+            quickNote: "Added from topic search result.",
+        });
+    };
+
+    const isRecommendationOverlayOpen =
+        topicRecommendationState === "loading" ||
+        topicRecommendationState === "error" ||
+        (topicRecommendationState === "success" && topicRecommendations.length > 0);
+
     return (
         <div
             className="topic-workspace"
@@ -351,33 +674,131 @@ export default function TopicWorkspace({
             }}
         >
             <div className="topic-workspace-main">
-                <section className="workspace-panel topic-search-panel">
-                    <div className="workspace-panel-header">
-                        <h3>Search</h3>
-                        <span>Author, title, topic, semantic intent</span>
-                    </div>
+                <section className="topic-search-panel">
                     <div className="topic-search-controls">
                         <input
                             type="text"
                             value={topicSearchQuery}
-                            placeholder="Search papers, authors, or topics"
+                            placeholder={
+                                topicActionMode === "recommend"
+                                    ? "Recommendation topic (e.g., causal reasoning)"
+                                    : "Search papers, authors, or topics"
+                            }
                             onChange={(event) => setTopicSearchQuery(event.target.value)}
                             onKeyDown={(event) => {
                                 if (event.key === "Enter") {
                                     event.preventDefault();
-                                    scheduleTopicSearch();
+                                    runActiveTopicAction();
                                 }
                             }}
                         />
                         <button
                             type="button"
-                            className="topic-search-submit-button"
-                            onClick={scheduleTopicSearch}
-                            disabled={!topicSearchQuery.trim() || !apiBase || !apiFetch}
+                            className={`topic-search-submit-button topic-mode-toggle ${
+                                topicActionMode === "recommend"
+                                    ? "is-recommend"
+                                    : "is-search"
+                            }`}
+                            onClick={() =>
+                                setTopicActionMode((previous) =>
+                                    previous === "search" ? "recommend" : "search"
+                                )
+                            }
+                            aria-label="Toggle topic action mode"
                         >
-                            Search
+                            <span className="topic-mode-toggle-spacer" aria-hidden="true">
+                                Recommend
+                            </span>
+                            <span className="topic-mode-toggle-label topic-mode-toggle-search">
+                                Search
+                            </span>
+                            <span className="topic-mode-toggle-label topic-mode-toggle-recommend">
+                                Recommend
+                            </span>
                         </button>
                     </div>
+                    {isRecommendationOverlayOpen && (
+                        <div
+                            className="topic-search-overlay topic-recommendation-overlay"
+                            role="region"
+                            aria-label="Recommendation results"
+                        >
+                            <div className="topic-search-overlay-header">
+                                <strong>
+                                    {topicRecommendationState === "success"
+                                        ? `${topicRecommendations.length} recommendations`
+                                        : "Recommendation status"}
+                                </strong>
+                                <button
+                                    type="button"
+                                    className="topic-search-close-button"
+                                    onClick={() => {
+                                        setTopicRecommendationState("idle");
+                                        setTopicRecommendationError("");
+                                        setTopicRecommendations([]);
+                                    }}
+                                >
+                                    Close
+                                </button>
+                            </div>
+                            {topicRecommendationState === "loading" && (
+                                <p className="topic-search-status">Finding recommendations...</p>
+                            )}
+                            {topicRecommendationState === "error" && (
+                                <p className="topic-search-status topic-search-error">
+                                    {topicRecommendationError}
+                                </p>
+                            )}
+                            {topicRecommendationState === "success" &&
+                                topicRecommendations.length > 0 && (
+                                    <div className="topic-search-results">
+                                        {topicRecommendations.map((result, index) => (
+                                            <article
+                                                key={result.paperId || `${result.title}-${index}`}
+                                                className="topic-search-result-card topic-search-result-clickable"
+                                                onClick={() => setSelectedSearchResult(result)}
+                                                role="button"
+                                                tabIndex={0}
+                                                onKeyDown={(event) => {
+                                                    if (
+                                                        event.key === "Enter" ||
+                                                        event.key === " "
+                                                    ) {
+                                                        event.preventDefault();
+                                                        setSelectedSearchResult(result);
+                                                    }
+                                                }}
+                                            >
+                                                <strong>{result.title || "Untitled paper"}</strong>
+                                                <small>
+                                                    {formatAuthorsCompact(result.authors)} |{" "}
+                                                    {result.year || "Unknown year"}
+                                                </small>
+                                                {(result.topics || []).length > 0 && (
+                                                    <span>
+                                                        {(result.topics || [])
+                                                            .slice(0, 3)
+                                                            .join(" • ")}
+                                                    </span>
+                                                )}
+                                                <div className="topic-search-result-actions">
+                                                    <button
+                                                        type="button"
+                                                        className="topic-search-open-button"
+                                                        onClick={(event) => {
+                                                            event.stopPropagation();
+                                                            openSearchResultInPaperTab(result);
+                                                        }}
+                                                    >
+                                                        Open paper
+                                                    </button>
+                                                </div>
+                                            </article>
+                                        ))}
+                                    </div>
+                                )}
+                        </div>
+                    )}
                     {isResultOverlayOpen && (
                         <div className="topic-search-overlay" role="region" aria-label="Search results">
                             <div className="topic-search-overlay-header">
@@ -389,7 +810,10 @@ export default function TopicWorkspace({
                                 <button
                                     type="button"
                                     className="topic-search-close-button"
-                                    onClick={() => setIsResultOverlayOpen(false)}
+                                    onClick={() => {
+                                        setIsResultOverlayOpen(false);
+                                        setSelectedSearchResult(null);
+                                    }}
                                 >
                                     Close
                                 </button>
@@ -406,7 +830,19 @@ export default function TopicWorkspace({
                             {topicSearchResults.length > 0 && (
                                 <div className="topic-search-results">
                                     {topicSearchResults.map((result) => (
-                                        <article key={result.title} className="topic-search-result-card">
+                                        <article
+                                            key={result.title}
+                                            className="topic-search-result-card topic-search-result-clickable"
+                                            onClick={() => setSelectedSearchResult(result)}
+                                            role="button"
+                                            tabIndex={0}
+                                            onKeyDown={(event) => {
+                                                if (event.key === "Enter" || event.key === " ") {
+                                                    event.preventDefault();
+                                                    setSelectedSearchResult(result);
+                                                }
+                                            }}
+                                        >
                                             <strong>{result.title}</strong>
                                             <small>
                                                 {formatAuthorsCompact(result.authors)} |{" "}
@@ -419,11 +855,9 @@ export default function TopicWorkspace({
                                                 <button
                                                     type="button"
                                                     className="topic-search-open-button"
-                                                    onClick={() => {
-                                                        setSelectedClusterId(null);
-                                                        setSelectedTreeNode(null);
-                                                        setRequestedPaperTitle(result.title);
-                                                        setIsResultOverlayOpen(false);
+                                                    onClick={(event) => {
+                                                        event.stopPropagation();
+                                                        openSearchResultInPaperTab(result);
                                                     }}
                                                 >
                                                     Open paper
@@ -433,6 +867,58 @@ export default function TopicWorkspace({
                                     ))}
                                 </div>
                             )}
+                        </div>
+                    )}
+                    {selectedSearchResult && (
+                        <div className="topic-search-modal-overlay" role="dialog" aria-modal="true">
+                            <div className="topic-search-modal">
+                                <h3>{selectedSearchResult.title || "Untitled paper"}</h3>
+                                <p className="topic-search-modal-meta">
+                                    {formatAuthorsCompact(selectedSearchResult.authors)} |{" "}
+                                    {selectedSearchResult.publication_date ||
+                                        selectedSearchResult.year ||
+                                        "Unknown year"}
+                                </p>
+                                {(selectedSearchResult.topics || []).length > 0 && (
+                                    <p className="topic-search-modal-topics">
+                                        {(selectedSearchResult.topics || [])
+                                            .slice(0, 5)
+                                            .join(" • ")}
+                                    </p>
+                                )}
+                                <p className="topic-search-modal-summary">
+                                    {selectedSearchResult.summary ||
+                                        selectedSearchResult.abstract ||
+                                        "No summary available for this paper."}
+                                </p>
+                                <div className="topic-search-modal-actions">
+                                    <button
+                                        type="button"
+                                        className="topic-search-open-button"
+                                        onClick={() =>
+                                            openSearchResultInPaperTab(selectedSearchResult)
+                                        }
+                                    >
+                                        Open paper
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="topic-search-open-button"
+                                        onClick={() =>
+                                            addSearchResultToReadingList(selectedSearchResult)
+                                        }
+                                    >
+                                        Add to reading list
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="topic-search-close-button"
+                                        onClick={() => setSelectedSearchResult(null)}
+                                    >
+                                        Close
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     )}
                 </section>
@@ -494,6 +980,8 @@ export default function TopicWorkspace({
                         }}
                         getPaperAnnotation={selectors.getPaperAnnotation}
                         onUpdatePaperAnnotation={actions.upsertPaperAnnotation}
+                        onRequestSimilarPapers={requestPaperRecommendations}
+                        onAddRecommendationToReadingList={addRecommendationToReadingList}
                     />
                     <div
                         className="topic-resizer topic-resizer-vertical"
@@ -514,6 +1002,10 @@ export default function TopicWorkspace({
                             setSelectedTreeNode(null);
                             setRequestedPaperTitle(paperTitle);
                         }}
+                        onRequestThemeRecommendations={requestThemeRecommendations}
+                        onAddRecommendationToReadingList={
+                            addThemeRecommendationToReadingList
+                        }
                     />
                 </div>
             </div>

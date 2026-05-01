@@ -19,6 +19,8 @@ export default function ThemeNotebook({
     onUpsertTheme,
     onReorderReadingItem,
     onSelectThemePaper,
+    onRequestThemeRecommendations,
+    onAddRecommendationToReadingList,
 }) {
     const selectedTheme = useMemo(
         () => themeNotes.find((note) => note.id === selectedThemeId) || null,
@@ -29,6 +31,10 @@ export default function ThemeNotebook({
     const [draggingItemId, setDraggingItemId] = useState(null);
     const [dragOverItemId, setDragOverItemId] = useState(null);
     const dragPreviewRef = useRef(null);
+    const [themeRecommendations, setThemeRecommendations] = useState([]);
+    const [themeRecommendationState, setThemeRecommendationState] = useState("idle");
+    const [themeRecommendationError, setThemeRecommendationError] = useState("");
+    const [expandedRecommendationKey, setExpandedRecommendationKey] = useState(null);
 
     useEffect(() => {
         if (!selectedTheme) {
@@ -42,6 +48,10 @@ export default function ThemeNotebook({
             sections: ensureSections(selectedTheme.sections),
             isNew: false,
         });
+        setThemeRecommendations([]);
+        setThemeRecommendationState("idle");
+        setThemeRecommendationError("");
+        setExpandedRecommendationKey(null);
     }, [selectedTheme]);
 
     const isShowingEditor = Boolean(activeDraft);
@@ -305,9 +315,6 @@ export default function ThemeNotebook({
                                             Open
                                         </a>
                                     )}
-                                    <span className="theme-queue-status">
-                                        {item.status}
-                                    </span>
                                 </div>
                             ))}
                         </div>
@@ -330,6 +337,133 @@ export default function ThemeNotebook({
                             {isAutoSaving ? "Saving..." : "Changes save automatically."}
                         </p>
                     )}
+                    {!activeDraft?.isNew && (
+                        <div className="paper-actions">
+                            <button
+                                type="button"
+                                onClick={async () => {
+                                    if (!onRequestThemeRecommendations || !activeDraft?.id) return;
+                                    setThemeRecommendationState("loading");
+                                    setThemeRecommendationError("");
+                                    setThemeRecommendations([]);
+                                    try {
+                                        const results = await onRequestThemeRecommendations(
+                                            activeDraft.id
+                                        );
+                                        setThemeRecommendations(
+                                            Array.isArray(results) ? results : []
+                                        );
+                                        setThemeRecommendationState("success");
+                                        setExpandedRecommendationKey(null);
+                                    } catch (error) {
+                                        setThemeRecommendationError(
+                                            `Theme recommendations failed: ${
+                                                error?.message || "Unknown error"
+                                            }`
+                                        );
+                                        setThemeRecommendationState("error");
+                                    }
+                                }}
+                            >
+                                Recommend papers for theme
+                            </button>
+                        </div>
+                    )}
+                    {themeRecommendationState === "loading" && (
+                        <p className="theme-sync-hint">Finding recommendations...</p>
+                    )}
+                    {themeRecommendationState === "error" && (
+                        <p className="validation-error">{themeRecommendationError}</p>
+                    )}
+                    {themeRecommendationState === "success" &&
+                        themeRecommendations.length > 0 && (
+                            <div className="linked-papers">
+                                <strong>Recommended papers</strong>
+                                <ul className="theme-linked-paper-list">
+                                    {themeRecommendations.map((paper, index) => (
+                                        <li key={paper.paperId || `${paper.title}-${index}`}>
+                                            <div className="theme-linked-paper-card">
+                                                <button
+                                                    type="button"
+                                                    className="paper-list-item"
+                                                    onClick={() => {
+                                                        const key =
+                                                            paper.paperId ||
+                                                            paper.title ||
+                                                            String(index);
+                                                        setExpandedRecommendationKey(
+                                                            (previous) =>
+                                                                previous === key ? null : key
+                                                        );
+                                                    }}
+                                                >
+                                                    <strong>
+                                                        {paper.title || "Untitled paper"}
+                                                    </strong>
+                                                    {paper.source && (
+                                                        <small>{paper.source}</small>
+                                                    )}
+                                                </button>
+                                                {expandedRecommendationKey ===
+                                                    (paper.paperId ||
+                                                        paper.title ||
+                                                        String(index)) && (
+                                                    <div className="theme-linked-paper-meta">
+                                                        <p>
+                                                            {(paper.authors || []).length
+                                                                ? paper.authors.join(", ")
+                                                                : "Unknown authors"}{" "}
+                                                            |{" "}
+                                                            {paper.year || "Unknown year"}
+                                                        </p>
+                                                        <p>
+                                                            {paper.abstract ||
+                                                                "No summary available."}
+                                                        </p>
+                                                        <div className="paper-actions">
+                                                            {paper.title &&
+                                                                onAddRecommendationToReadingList && (
+                                                                <button
+                                                                    type="button"
+                                                                    className="recommendation-action-button"
+                                                                    onClick={() =>
+                                                                        onAddRecommendationToReadingList(
+                                                                            paper,
+                                                                            activeDraft?.id ||
+                                                                                selectedThemeId ||
+                                                                                null
+                                                                        )
+                                                                    }
+                                                                >
+                                                                    Add to reading list
+                                                                </button>
+                                                            )}
+                                                            {paper.url && (
+                                                                <a
+                                                                    className="recommendation-action-button recommendation-action-link"
+                                                                    href={paper.url}
+                                                                    target="_blank"
+                                                                    rel="noreferrer"
+                                                                >
+                                                                    Open in browser
+                                                                </a>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+                    {themeRecommendationState === "success" &&
+                        themeRecommendations.length === 0 && (
+                            <p className="theme-sync-hint">
+                                No recommendations found for this theme yet. Try linking
+                                more seed papers with Semantic Scholar IDs.
+                            </p>
+                        )}
                     <div className="linked-papers">
                         <strong>Papers in this theme</strong>
                         {(activeDraft.linkedPaperTitles || []).length === 0 ? (
@@ -340,13 +474,17 @@ export default function ThemeNotebook({
                             <ul className="theme-linked-paper-list">
                                 {activeDraft.linkedPaperTitles.map((paperTitle) => (
                                     <li key={paperTitle}>
-                                        <button
-                                            type="button"
-                                            className="paper-list-item theme-linked-paper-card"
-                                            onClick={() => onSelectThemePaper(paperTitle)}
-                                        >
-                                            <strong>{paperTitle}</strong>
-                                        </button>
+                                        <div className="theme-linked-paper-card">
+                                            <div className="theme-linked-paper-row">
+                                                <button
+                                                    type="button"
+                                                    className="theme-linked-paper-title-button"
+                                                    onClick={() => onSelectThemePaper(paperTitle)}
+                                                >
+                                                    <strong>{paperTitle}</strong>
+                                                </button>
+                                            </div>
+                                        </div>
                                     </li>
                                 ))}
                             </ul>

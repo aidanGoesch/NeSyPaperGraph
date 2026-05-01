@@ -8,7 +8,95 @@ const TOPIC_NODE_MAX_RADIUS = 50;
 const TOPIC_SIZE_EXPONENT = 1.35;
 const COLLISION_PADDING = 12;
 
-const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, onTopicClick, highlightPath }, ref) => {
+const normalizeToken = (value) => String(value || '').trim().toLowerCase();
+
+const scoreLocalSimilarity = (seedPaper, candidatePaper) => {
+  if (!seedPaper || !candidatePaper) return 0;
+  const seedTopics = new Set((seedPaper.topics || []).map(normalizeToken).filter(Boolean));
+  const candidateTopics = new Set((candidatePaper.topics || []).map(normalizeToken).filter(Boolean));
+  let topicOverlap = 0;
+  seedTopics.forEach((topic) => {
+    if (candidateTopics.has(topic)) topicOverlap += 1;
+  });
+
+  const seedAuthors = new Set((seedPaper.authors || []).map(normalizeToken).filter(Boolean));
+  const candidateAuthors = new Set((candidatePaper.authors || []).map(normalizeToken).filter(Boolean));
+  let authorOverlap = 0;
+  seedAuthors.forEach((author) => {
+    if (candidateAuthors.has(author)) authorOverlap += 1;
+  });
+
+  const seedYear = Number(seedPaper.year || seedPaper.publication_date || 0) || null;
+  const candidateYear = Number(candidatePaper.year || candidatePaper.publication_date || 0) || null;
+  const yearScore =
+    seedYear && candidateYear ? Math.max(0, 1 - Math.min(Math.abs(seedYear - candidateYear), 8) / 8) : 0;
+
+  return topicOverlap * 3 + authorOverlap * 2 + yearScore;
+};
+
+const buildLocalGraphRecommendations = (seedPaper, graphPapers, limit = 8) => {
+  if (!seedPaper || !Array.isArray(graphPapers)) return [];
+  const seedTitle = normalizeToken(seedPaper.title);
+  return graphPapers
+    .filter((paper) => normalizeToken(paper.title) && normalizeToken(paper.title) !== seedTitle)
+    .map((paper) => ({
+      ...paper,
+      _localScore: scoreLocalSimilarity(seedPaper, paper),
+    }))
+    .filter((paper) => paper._localScore > 0)
+    .sort((left, right) => right._localScore - left._localScore)
+    .slice(0, Math.max(1, limit))
+    .map((paper) => ({
+      paperId: paper.paperId || null,
+      title: paper.title,
+      authors: paper.authors || [],
+      year: paper.year || paper.publication_date || null,
+      venue: paper.venue || null,
+      abstract: paper.abstract || '',
+      source: 'graph',
+      reason: 'Similar to selected paper in your graph',
+    }));
+};
+
+const interleaveRecommendations = (localItems, externalItems, limit = 8) => {
+  const merged = [];
+  const seenTitles = new Set();
+  const locals = Array.isArray(localItems) ? localItems : [];
+  const externals = Array.isArray(externalItems) ? externalItems : [];
+  let localIdx = 0;
+  let externalIdx = 0;
+  while (merged.length < limit && (localIdx < locals.length || externalIdx < externals.length)) {
+    if (localIdx < locals.length) {
+      const nextLocal = locals[localIdx++];
+      const key = normalizeToken(nextLocal?.title);
+      if (key && !seenTitles.has(key)) {
+        seenTitles.add(key);
+        merged.push(nextLocal);
+        if (merged.length >= limit) break;
+      }
+    }
+    if (externalIdx < externals.length) {
+      const nextExternal = externals[externalIdx++];
+      const key = normalizeToken(nextExternal?.title);
+      if (key && !seenTitles.has(key)) {
+        seenTitles.add(key);
+        merged.push({ ...nextExternal, source: nextExternal?.source || 'semanticScholar' });
+      }
+    }
+  }
+  return merged.slice(0, limit);
+};
+
+const recommendationSourceLabel = (source) =>
+  source === 'graph' ? 'In graph' : 'Semantic Scholar';
+
+const recommendationBrowserUrl = (paper) => {
+  if (paper?.url) return paper.url;
+  if (paper?.paperId) return `https://www.semanticscholar.org/paper/${paper.paperId}`;
+  return '';
+};
+
+const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, onTopicClick, highlightPath, apiBase, apiFetch, onAddRecommendationToReadingList }, ref) => {
   const svgRef = useRef();
   const containerRef = useRef();
   const [selectedPaper, setSelectedPaper] = useState(null);
@@ -17,6 +105,10 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
   const [showSemanticEdges, setShowSemanticEdges] = useState(true);
   const [showMenu, setShowMenu] = useState(false);
   const [semanticThreshold, setSemanticThreshold] = useState(0.25);
+  const [similarPapers, setSimilarPapers] = useState([]);
+  const [similarState, setSimilarState] = useState('idle');
+  const [similarError, setSimilarError] = useState('');
+  const [expandedSimilarKey, setExpandedSimilarKey] = useState(null);
   const selectedNodeRef = useRef(null);
   const pinnedNodeRef = useRef(null);
   const simulationRef = useRef(null);
@@ -35,7 +127,69 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     publication_date: paper?.publication_date,
     abstract: paper?.abstract || "No summary available.",
     topics: paper?.topics || [],
+    semanticScholarPaperId: paper?.semanticScholarPaperId || null,
   });
+
+  const parseResponseError = async (response) => {
+    try {
+      const payload = await response.json();
+      return payload?.detail || payload?.error || `HTTP ${response.status}`;
+    } catch {
+      return `HTTP ${response.status}`;
+    }
+  };
+
+  const requestSimilarPapers = async () => {
+    if (!apiBase || !apiFetch || !selectedPaper) {
+      setSimilarError("Recommendation API is unavailable.");
+      setSimilarState("error");
+      return;
+    }
+    setSimilarState("loading");
+    setSimilarError("");
+    setSimilarPapers([]);
+    try {
+      const requestBody = JSON.stringify({
+        semanticScholarPaperId: selectedPaper.semanticScholarPaperId || null,
+        title: selectedPaper.title || null,
+        authors: selectedPaper.authors || [],
+        year: selectedPaper.year || selectedPaper.publication_date || null,
+        abstract: selectedPaper.abstract || null,
+        limit: 8,
+      });
+      let response = await apiFetch(`${apiBase}/api/recommendations/paper`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: requestBody,
+      });
+      if (response.status === 404) {
+        response = await apiFetch(`${apiBase}/api/workspace/recommendations/paper`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: requestBody,
+        });
+      }
+      if (!response.ok) {
+        throw new Error(await parseResponseError(response));
+      }
+      const payload = await response.json();
+      const external = Array.isArray(payload?.results) ? payload.results : [];
+      const local = buildLocalGraphRecommendations(selectedPaper, data?.papers || [], 8);
+      setSimilarPapers(interleaveRecommendations(local, external, 8));
+      setExpandedSimilarKey(null);
+      setSimilarState("success");
+    } catch (error) {
+      setSimilarError(`Failed to load recommendations: ${error?.message || "Unknown error"}`);
+      setSimilarState("error");
+    }
+  };
+
+  useEffect(() => {
+    setSimilarPapers([]);
+    setSimilarState("idle");
+    setSimilarError("");
+    setExpandedSimilarKey(null);
+  }, [selectedPaper?.title]);
 
   const normalizeLinkEndpoint = (endpoint) => {
     if (endpoint && typeof endpoint === "object") {
@@ -812,6 +966,159 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
               <ReactMarkdown>{selectedPaper.abstract || 'No summary available.'}</ReactMarkdown>
             </div>
           </div>
+          <div style={{ marginBottom: '12px' }}>
+            <button
+              type="button"
+              onClick={requestSimilarPapers}
+              style={{
+                padding: '8px 12px',
+                borderRadius: '6px',
+                border: '1px solid #d0d0d0',
+                backgroundColor: '#f7f7f7',
+                cursor: 'pointer',
+              }}
+            >
+              See similar papers
+            </button>
+          </div>
+          {similarState === 'loading' && (
+            <p style={{ color: '#555' }}>Loading recommendations...</p>
+          )}
+          {similarState === 'error' && (
+            <p style={{ color: '#b00020' }}>{similarError}</p>
+          )}
+          {similarState === 'success' && similarPapers.length === 0 && (
+            <p style={{ color: '#555' }}>
+              No similar papers found for this selection.
+            </p>
+          )}
+          {similarState === 'success' && similarPapers.length > 0 && (
+            <div style={{ marginTop: '8px' }}>
+              <strong>Similar papers</strong>
+              <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                {similarPapers.map((paper, index) => (
+                  <div
+                    key={paper.paperId || `${paper.title}-${index}`}
+                    style={{
+                      border: '1px solid #e0e0e0',
+                      backgroundColor: '#fafafa',
+                      borderRadius: '6px',
+                      padding: '8px',
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const cardKey = paper.paperId || paper.title || String(index);
+                        setExpandedSimilarKey((previous) =>
+                          previous === cardKey ? null : cardKey
+                        );
+                      }}
+                      style={{
+                        width: '100%',
+                        textAlign: 'left',
+                        border: 'none',
+                        background: 'transparent',
+                        padding: 0,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <strong style={{ display: 'block' }}>{paper.title || 'Untitled paper'}</strong>
+                      <span
+                        style={{
+                          fontSize: '11px',
+                          fontWeight: 700,
+                          padding: '2px 8px',
+                          borderRadius: '999px',
+                          display: 'inline-flex',
+                          backgroundColor:
+                            paper.source === 'graph'
+                              ? 'rgba(76, 175, 80, 0.18)'
+                              : 'rgba(33, 150, 243, 0.18)',
+                          color: paper.source === 'graph' ? '#215f25' : '#0f4d82',
+                        }}
+                      >
+                        {recommendationSourceLabel(paper.source)}
+                      </span>
+                    </button>
+                    {expandedSimilarKey === (paper.paperId || paper.title || String(index)) && (
+                      <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                        <p style={{ margin: 0, color: '#555', fontSize: '12px' }}>
+                          {(paper.authors || []).length
+                            ? paper.authors.join(', ')
+                            : 'Unknown authors'}{' '}
+                          | {paper.year || 'Unknown year'}
+                        </p>
+                        <p style={{ margin: 0, color: '#555', lineHeight: 1.4, fontSize: '12px' }}>
+                          {paper.abstract || 'No summary available.'}
+                        </p>
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                          {paper.source === 'graph' && paper.title && paperByTitle.get(paper.title) && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const localPaper = paperByTitle.get(paper.title);
+                                if (localPaper) {
+                                  setSelectedPaper(toSelectedPaper(localPaper));
+                                }
+                              }}
+                              style={{
+                                padding: '6px 10px',
+                                borderRadius: '6px',
+                                border: '1px solid #d0d0d0',
+                                backgroundColor: '#fff',
+                                cursor: 'pointer',
+                              }}
+                            >
+                              Focus in graph
+                            </button>
+                          )}
+                          {paper.source !== 'graph' && onAddRecommendationToReadingList && (
+                            <button
+                              type="button"
+                              onClick={() => onAddRecommendationToReadingList(paper)}
+                              style={{
+                                padding: '6px 10px',
+                                borderRadius: '6px',
+                                border: '1px solid #d0d0d0',
+                                backgroundColor: '#fff',
+                                cursor: 'pointer',
+                              }}
+                            >
+                              Add to reading list
+                            </button>
+                          )}
+                          {paper.source !== 'graph' && recommendationBrowserUrl(paper) && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                window.open(
+                                  recommendationBrowserUrl(paper),
+                                  '_blank',
+                                  'noopener,noreferrer'
+                                )
+                              }
+                              style={{
+                                padding: '6px 10px',
+                                borderRadius: '6px',
+                                border: '1px solid #d0d0d0',
+                                backgroundColor: '#fff',
+                                color: '#333',
+                                fontSize: '13px',
+                                cursor: 'pointer',
+                              }}
+                            >
+                              Open in browser
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
       {selectedTopic && (

@@ -19,6 +19,69 @@ function createId(prefix) {
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function normalizeLookupValue(value) {
+    return String(value || "").trim().toLowerCase();
+}
+
+function findDuplicateReadingItemIndex(readingItems, candidate) {
+    const candidatePaperId = normalizeLookupValue(candidate.semanticScholarPaperId);
+    const candidateUrl = normalizeLookupValue(candidate.url);
+    const candidateTitle = normalizeLookupValue(
+        candidate.title || candidate.linkedPaperTitle
+    );
+    if (!candidatePaperId && !candidateUrl && !candidateTitle) {
+        return -1;
+    }
+    return readingItems.findIndex((item) => {
+        const itemPaperId = normalizeLookupValue(item.semanticScholarPaperId);
+        if (candidatePaperId && itemPaperId && candidatePaperId === itemPaperId) {
+            return true;
+        }
+        const itemUrl = normalizeLookupValue(item.url);
+        if (candidateUrl && itemUrl && candidateUrl === itemUrl) {
+            return true;
+        }
+        const itemTitle = normalizeLookupValue(item.title || item.linkedPaperTitle);
+        return Boolean(candidateTitle && itemTitle && candidateTitle === itemTitle);
+    });
+}
+
+function mergeReadingItem(existingItem, incomingItem) {
+    const merged = {
+        ...existingItem,
+        sourceType: existingItem.sourceType || incomingItem.sourceType || "url",
+        status: existingItem.status || incomingItem.status || "inbox",
+        topicHints: existingItem.topicHints?.length
+            ? existingItem.topicHints
+            : incomingItem.topicHints || [],
+        linkedPaperTitle:
+            existingItem.linkedPaperTitle || incomingItem.linkedPaperTitle || null,
+        linkedThemeId: existingItem.linkedThemeId || incomingItem.linkedThemeId || null,
+        title: existingItem.title || incomingItem.title || "",
+        url: existingItem.url || incomingItem.url || "",
+        semanticScholarPaperId:
+            existingItem.semanticScholarPaperId ||
+            incomingItem.semanticScholarPaperId ||
+            null,
+        authors:
+            Array.isArray(existingItem.authors) && existingItem.authors.length > 0
+                ? existingItem.authors
+                : Array.isArray(incomingItem.authors)
+                  ? incomingItem.authors
+                  : [],
+        year:
+            typeof existingItem.year === "number" && Number.isFinite(existingItem.year)
+                ? existingItem.year
+                : typeof incomingItem.year === "number" && Number.isFinite(incomingItem.year)
+                  ? incomingItem.year
+                  : null,
+        venue: existingItem.venue || incomingItem.venue || null,
+        quickNote: existingItem.quickNote || incomingItem.quickNote || "",
+        updatedAt: new Date().toISOString(),
+    };
+    return merged;
+}
+
 function reducer(state, action) {
     switch (action.type) {
         case "HYDRATE":
@@ -38,10 +101,26 @@ function reducer(state, action) {
                         : state.paperAnnotations,
             };
         case "ADD_READING_ITEM":
-            return {
-                ...state,
-                readingItems: [action.payload, ...state.readingItems],
-            };
+            {
+                const duplicateIndex = findDuplicateReadingItemIndex(
+                    state.readingItems,
+                    action.payload
+                );
+                if (duplicateIndex < 0) {
+                    return {
+                        ...state,
+                        readingItems: [action.payload, ...state.readingItems],
+                    };
+                }
+                const nextItems = [...state.readingItems];
+                const existing = nextItems[duplicateIndex];
+                nextItems.splice(duplicateIndex, 1);
+                nextItems.unshift(mergeReadingItem(existing, action.payload));
+                return {
+                    ...state,
+                    readingItems: nextItems,
+                };
+            }
         case "UPDATE_READING_ITEM":
             return {
                 ...state,

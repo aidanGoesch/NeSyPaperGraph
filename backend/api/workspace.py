@@ -3,6 +3,11 @@ from pydantic import BaseModel
 from pydantic import ValidationError
 
 from models.workspace import WorkspaceState, default_workspace_state, utc_now_iso
+from api.recommendations import (
+    PaperRecommendationsRequest,
+    ThemeRecommendationsRequest,
+    build_theme_recommendations_payload,
+)
 from services.semantic_scholar_service import (
     SemanticScholarError,
     SemanticScholarRateLimitError,
@@ -123,6 +128,8 @@ def put_workspace_state(state: WorkspaceState):
         canonical_state = _canonicalize_workspace_state(state, previous_state)
         save_workspace_state(canonical_state.model_dump())
         return canonical_state.model_dump()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
@@ -156,3 +163,63 @@ def resolve_paper_url(request: ResolvePaperUrlRequest):
             status_code=500,
             detail=f"Failed to resolve URL metadata: {exc}",
         ) from exc
+
+
+@router.post("/workspace/recommendations/theme")
+def workspace_theme_recommendations(request: ThemeRecommendationsRequest):
+    try:
+        if request.workspaceState is not None:
+            workspace = WorkspaceState.model_validate(request.workspaceState)
+        else:
+            payload = load_workspace_state()
+            workspace = (
+                WorkspaceState.model_validate(payload)
+                if payload is not None
+                else default_workspace_state()
+            )
+        return build_theme_recommendations_payload(workspace, request)
+    except HTTPException:
+        raise
+    except SemanticScholarRateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except SemanticScholarError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/workspace/recommendations/paper")
+def workspace_paper_recommendations(request: PaperRecommendationsRequest):
+    try:
+        seed = {
+            "paperId": request.semanticScholarPaperId,
+            "semanticScholarPaperId": request.semanticScholarPaperId,
+            "title": request.title,
+            "url": request.url,
+            "authors": request.authors,
+            "year": request.year,
+            "abstract": request.abstract,
+        }
+        has_any_seed = any(
+            [
+                (request.semanticScholarPaperId or "").strip(),
+                (request.title or "").strip(),
+                (request.url or "").strip(),
+            ]
+        )
+        if not has_any_seed:
+            raise HTTPException(
+                status_code=422,
+                detail="Provide semanticScholarPaperId, title, or url to resolve the paper.",
+            )
+        results = SemanticScholarService().find_similar_papers_from_seed(
+            seed_paper=seed,
+            limit=request.limit,
+        )
+        return {"status": "success", "results": results}
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SemanticScholarRateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except SemanticScholarError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
