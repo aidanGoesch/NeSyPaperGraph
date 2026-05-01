@@ -100,7 +100,9 @@ function App() {
     const [isDarkMode, setIsDarkMode] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
     const [isSearchExpanded, setIsSearchExpanded] = useState(false);
+    const [headerTopicActionMode, setHeaderTopicActionMode] = useState("search");
     const [isUploading, setIsUploading] = useState(false);
+    const [showUploadMenu, setShowUploadMenu] = useState(false);
     const [uploadError, setUploadError] = useState(null);
     const [showMermaid, setShowMermaid] = useState(false);
     const [agentArchitectureDiagram, setAgentArchitectureDiagram] =
@@ -176,7 +178,9 @@ function App() {
     const chatInputRef = useRef();
     const [isFadingOut, setIsFadingOut] = useState(false);
     const graphRef = useRef();
+    const topicWorkspaceRef = useRef();
     const searchInputRef = useRef();
+    const uploadMenuRef = useRef();
     const eventSourceRef = useRef(null);
     const activeUploadJobsRef = useRef(new Set());
     const uploadJobStateRef = useRef(new Map());
@@ -520,6 +524,21 @@ function App() {
         document.addEventListener("keydown", handleKeyDown);
         return () => document.removeEventListener("keydown", handleKeyDown);
     }, []);
+
+    useEffect(() => {
+        const handleClickOutside = (event) => {
+            if (
+                showUploadMenu &&
+                uploadMenuRef.current &&
+                !uploadMenuRef.current.contains(event.target)
+            ) {
+                setShowUploadMenu(false);
+            }
+        };
+
+        document.addEventListener("mousedown", handleClickOutside);
+        return () => document.removeEventListener("mousedown", handleClickOutside);
+    }, [showUploadMenu]);
 
     useEffect(() => {
         mermaid.initialize({ startOnLoad: true });
@@ -1090,6 +1109,22 @@ function App() {
         }
     };
 
+    const runHeaderTopicAction = () => {
+        const query = searchTerm.trim();
+        if (!query || isSearching) return;
+        if (activeView === "workspace") {
+            topicWorkspaceRef.current?.runTopicAction?.({
+                query,
+                mode: headerTopicActionMode,
+            });
+        } else if (headerTopicActionMode === "recommend") {
+            handleSearch(`Recommend papers about: ${query}`);
+        } else {
+            handleSearch(query);
+        }
+        setSearchTerm("");
+    };
+
     const handleFileUpload = async (event) => {
         const selectedFiles = Array.from(event.target.files || []);
         const files = selectedFiles.filter(
@@ -1365,33 +1400,60 @@ function App() {
                 </div>
             )}
             <header className="app-header">
-                <div className="header-left-controls">
-                    <button
-                        onClick={() =>
-                            document.getElementById("file-upload").click()
-                        }
-                        className="upload-button"
-                        disabled={!accessKey}
-                    >
-                        {isUploading ? "📁 Upload More Papers" : "📁 Upload Papers"}
-                    </button>
-                    <button
-                        onClick={() =>
-                            document.getElementById("folder-upload").click()
-                        }
-                        className="upload-button"
-                        disabled={!accessKey}
-                    >
-                        {isUploading ? "📂 Add Folder" : "📂 Upload Folder"}
-                    </button>
-                    <div className="theme-toggle">
-                        <button onClick={() => setIsDarkMode(!isDarkMode)}>
-                            {isDarkMode ? "☀️" : "🌙"}
+                <div className="app-title-label">Paper Graph</div>
+                <div className="header-search">
+                    <div className="topic-search-controls header-topic-search-controls">
+                        <input
+                            type="text"
+                            className="header-topic-search-input"
+                            placeholder={
+                                headerTopicActionMode === "recommend"
+                                    ? "Recommendation topic (e.g., causal reasoning)"
+                                    : "Search papers, authors, or topics"
+                            }
+                            value={searchTerm}
+                            onChange={(e) => {
+                                setSearchTerm(e.target.value);
+                            }}
+                            onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    runHeaderTopicAction();
+                                }
+                            }}
+                            ref={searchInputRef}
+                        />
+                        <button
+                            type="button"
+                            className={`topic-search-submit-button topic-mode-toggle ${
+                                headerTopicActionMode === "recommend"
+                                    ? "is-recommend"
+                                    : "is-search"
+                            }`}
+                            onClick={() =>
+                                setHeaderTopicActionMode((previous) =>
+                                    previous === "search" ? "recommend" : "search"
+                                )
+                            }
+                            aria-label="Toggle header action mode"
+                        >
+                            <span className="topic-mode-toggle-spacer" aria-hidden="true">
+                                Recommend
+                            </span>
+                            <span className="topic-mode-toggle-label topic-mode-toggle-search">
+                                Search
+                            </span>
+                            <span className="topic-mode-toggle-label topic-mode-toggle-recommend">
+                                Recommend
+                            </span>
                         </button>
                     </div>
                 </div>
-                <h1>Paper Graph Visualization</h1>
-                <div className="view-toggle">
+                <div
+                    className={`header-view-toggle ${
+                        activeView === "workspace" ? "is-workspace" : "is-graph"
+                    }`}
+                >
                     <button
                         type="button"
                         className={activeView === "graph" ? "active" : ""}
@@ -1411,6 +1473,54 @@ function App() {
                         Topic Workspace
                     </button>
                 </div>
+                <div className="upload-menu" ref={uploadMenuRef}>
+                    <button
+                        type="button"
+                        className="upload-button"
+                        onClick={() => setShowUploadMenu((previous) => !previous)}
+                        disabled={!accessKey}
+                    >
+                        <span className="upload-button-icon" aria-hidden="true">
+                            ⬆
+                        </span>
+                        Upload
+                    </button>
+                    {showUploadMenu && accessKey && (
+                        <div className="upload-dropdown">
+                            <button
+                                type="button"
+                                className="upload-dropdown-item"
+                                onClick={() => {
+                                    document.getElementById("file-upload").click();
+                                    setShowUploadMenu(false);
+                                }}
+                            >
+                                {isUploading ? "Upload More Papers" : "Upload Papers"}
+                            </button>
+                            <button
+                                type="button"
+                                className="upload-dropdown-item"
+                                onClick={() => {
+                                    document.getElementById("folder-upload").click();
+                                    setShowUploadMenu(false);
+                                }}
+                            >
+                                {isUploading ? "Add Folder" : "Upload Folder"}
+                            </button>
+                        </div>
+                    )}
+                </div>
+                <div className="theme-toggle">
+                    <button
+                        type="button"
+                        onClick={() => setIsDarkMode(!isDarkMode)}
+                        aria-label={
+                            isDarkMode ? "Switch to light mode" : "Switch to dark mode"
+                        }
+                    >
+                        <span aria-hidden="true">{isDarkMode ? "☀️" : "🌙"}</span>
+                    </button>
+                </div>
             </header>
             <main className="app-main">
                 {isBootingBackend ? (
@@ -1424,59 +1534,77 @@ function App() {
                         </div>
                         <div className="skeleton-status">{backendBootMessage}</div>
                     </div>
-                ) : activeView === "workspace" && visibleGraphData ? (
-                    <TopicWorkspace
-                        graphData={visibleGraphData}
-                        workspaceStore={workspaceStore}
-                        apiBase={API_BASE}
-                        apiFetch={apiFetch}
-                        onResolveReadingUrl={resolveReadingUrlMetadata}
-                        onIngestReadingItem={ingestReadingItemToGraph}
-                        onFocusPaper={(paperTitle) => {
-                            setHighlightPath(null);
-                            setActiveView("graph");
-                            setPendingFocus({ type: "paper", value: paperTitle });
-                        }}
-                        onSetGraphHighlight={(pathPayload) =>
-                            setHighlightPath({
-                                mode: "selection",
-                                nodes: pathPayload?.nodes || [],
-                            })
-                        }
-                    />
                 ) : visibleGraphData ? (
-                    <GraphVisualization
-                        ref={graphRef}
-                        data={visibleGraphData}
-                        isDarkMode={isDarkMode}
-                        onShowArchitecture={showAgentArchitecture}
-                        highlightPath={highlightPath}
-                        apiBase={API_BASE}
-                        apiFetch={apiFetch}
-                        onAddRecommendationToReadingList={(paper) => {
-                            if (!paper?.title) return;
-                            workspaceStore.actions.addReadingItem({
-                                sourceType: paper.url ? "url" : "semantic_scholar",
-                                status: "inbox",
-                                title: paper.title,
-                                url: paper.url || "",
-                                semanticScholarPaperId: paper.paperId || null,
-                                authors: Array.isArray(paper.authors)
-                                    ? paper.authors
-                                    : [],
-                                year:
-                                    typeof paper.year === "number" &&
-                                    Number.isFinite(paper.year)
-                                        ? paper.year
-                                        : null,
-                                venue: paper.venue || null,
-                                quickNote:
-                                    paper.source === "graph"
-                                        ? "Added from graph recommendation."
-                                        : "Added from Semantic Scholar recommendation.",
-                            });
-                        }}
-                    />
+                    <div className="view-stack">
+                        <div
+                            className={`view-panel ${
+                                activeView === "graph"
+                                    ? "view-panel-active"
+                                    : "view-panel-hidden"
+                            }`}
+                        >
+                            <GraphVisualization
+                                ref={graphRef}
+                                data={visibleGraphData}
+                                isDarkMode={isDarkMode}
+                                onShowArchitecture={showAgentArchitecture}
+                                highlightPath={highlightPath}
+                                apiBase={API_BASE}
+                                apiFetch={apiFetch}
+                                onAddRecommendationToReadingList={(paper) => {
+                                    if (!paper?.title) return;
+                                    workspaceStore.actions.addReadingItem({
+                                        sourceType: paper.url ? "url" : "semantic_scholar",
+                                        status: "inbox",
+                                        title: paper.title,
+                                        url: paper.url || "",
+                                        semanticScholarPaperId: paper.paperId || null,
+                                        authors: Array.isArray(paper.authors)
+                                            ? paper.authors
+                                            : [],
+                                        year:
+                                            typeof paper.year === "number" &&
+                                            Number.isFinite(paper.year)
+                                                ? paper.year
+                                                : null,
+                                        venue: paper.venue || null,
+                                        quickNote:
+                                            paper.source === "graph"
+                                                ? "Added from graph recommendation."
+                                                : "Added from Semantic Scholar recommendation.",
+                                    });
+                                }}
+                            />
+                        </div>
+                        {activeView === "workspace" && (
+                            <div className="view-panel view-panel-active">
+                                <TopicWorkspace
+                                    ref={topicWorkspaceRef}
+                                    graphData={visibleGraphData}
+                                    workspaceStore={workspaceStore}
+                                    apiBase={API_BASE}
+                                    apiFetch={apiFetch}
+                                    showSearchPanel={false}
+                                    onResolveReadingUrl={resolveReadingUrlMetadata}
+                                    onIngestReadingItem={ingestReadingItemToGraph}
+                                    onFocusPaper={(paperTitle) => {
+                                        setHighlightPath(null);
+                                        setActiveView("graph");
+                                        setPendingFocus({
+                                            type: "paper",
+                                            value: paperTitle,
+                                        });
+                                    }}
+                                    onSetGraphHighlight={(pathPayload) =>
+                                        setHighlightPath({
+                                            mode: "selection",
+                                            nodes: pathPayload?.nodes || [],
+                                        })
+                                    }
+                                />
+                            </div>
+                        )}
+                    </div>
                 ) : (
                     <div className="loading">
                         Upload papers to visualize the graph
@@ -1600,15 +1728,13 @@ function App() {
                         }}
                         onKeyDown={(e) => {
                             if (e.key === "Enter") {
-                                handleSearch(searchTerm);
-                                setSearchTerm("");
+                                runHeaderTopicAction();
                             }
                         }}
                         onFocus={() => setIsSearchExpanded(true)}
                         onBlur={() => setIsSearchExpanded(false)}
                         onWheel={(e) => {
                             if (e.deltaY > 0 && chatHistory.length > 0) {
-                                // Scrolling down
                                 e.preventDefault();
                                 setShowChatPanel(true);
                             }
@@ -1616,7 +1742,6 @@ function App() {
                         className={`search-bar unified-input ${
                             isSearchExpanded ? "expanded" : ""
                         }`}
-                        ref={searchInputRef}
                     />
                 )}
                 {activeView === "graph" && showChatPanel && (

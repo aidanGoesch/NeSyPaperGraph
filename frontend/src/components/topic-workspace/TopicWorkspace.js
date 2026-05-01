@@ -1,6 +1,8 @@
 import React, {
+    forwardRef,
     useDeferredValue,
     useEffect,
+    useImperativeHandle,
     useMemo,
     useRef,
     useState,
@@ -165,7 +167,7 @@ async function parseResponseError(response) {
     return `HTTP ${response.status}`;
 }
 
-export default function TopicWorkspace({
+const TopicWorkspace = forwardRef(function TopicWorkspace({
     graphData,
     workspaceStore,
     onFocusPaper,
@@ -174,7 +176,8 @@ export default function TopicWorkspace({
     onIngestReadingItem,
     apiBase,
     apiFetch,
-}) {
+    showSearchPanel = true,
+}, ref) {
     const { state, actions, selectors } = workspaceStore;
     const deferredGraphData = useDeferredValue(graphData);
     const { clusters } = useMemo(
@@ -404,8 +407,8 @@ export default function TopicWorkspace({
         ? `${panelWidthsPx[0]}px ${SPLITTER_SIZE_PX}px ${panelWidthsPx[1]}px ${SPLITTER_SIZE_PX}px ${panelWidthsPx[2]}px`
         : "minmax(220px, 0.9fr) 8px minmax(360px, 1.5fr) 8px minmax(320px, 1.2fr)";
 
-    const runTopicSearch = () => {
-        const query = topicSearchQuery.trim();
+    const runTopicSearch = (queryOverride = null) => {
+        const query = (queryOverride ?? topicSearchQuery).trim();
         if (!query || !apiBase || !apiFetch) return;
         setTopicSearchState("loading");
         setTopicSearchError("");
@@ -559,9 +562,9 @@ export default function TopicWorkspace({
         });
     };
 
-    const runTopicRecommendations = async () => {
+    const runTopicRecommendations = async (queryOverride = null) => {
         if (!apiBase || !apiFetch) return;
-        const query = topicSearchQuery.trim();
+        const query = (queryOverride ?? topicSearchQuery).trim();
         if (!query) {
             setTopicRecommendationState("error");
             setTopicRecommendationError(
@@ -601,8 +604,9 @@ export default function TopicWorkspace({
         }
     };
 
-    const scheduleTopicSearch = () => {
-        if (!topicSearchQuery.trim() || !apiBase || !apiFetch) return;
+    const scheduleTopicSearch = (queryOverride = null) => {
+        const query = (queryOverride ?? topicSearchQuery).trim();
+        if (!query || !apiBase || !apiFetch) return;
         setTopicSearchState("loading");
         setTopicSearchError("");
         setTopicSearchResults([]);
@@ -610,7 +614,7 @@ export default function TopicWorkspace({
         if (topicSearchTimerRef.current) {
             clearTimeout(topicSearchTimerRef.current);
         }
-        topicSearchTimerRef.current = setTimeout(runTopicSearch, 300);
+        topicSearchTimerRef.current = setTimeout(() => runTopicSearch(query), 300);
     };
 
     const runActiveTopicAction = () => {
@@ -620,6 +624,24 @@ export default function TopicWorkspace({
         }
         scheduleTopicSearch();
     };
+
+    useImperativeHandle(
+        ref,
+        () => ({
+            runTopicAction: ({ query, mode = "search" }) => {
+                const normalizedQuery = String(query || "").trim();
+                if (!normalizedQuery) return;
+                setTopicSearchQuery(normalizedQuery);
+                setTopicActionMode(mode === "recommend" ? "recommend" : "search");
+                if (mode === "recommend") {
+                    runTopicRecommendations(normalizedQuery);
+                } else {
+                    scheduleTopicSearch(normalizedQuery);
+                }
+            },
+        }),
+        [apiBase, apiFetch, topicSearchQuery]
+    );
 
     const openSearchResultInPaperTab = (result) => {
         if (!result?.title) return;
@@ -674,49 +696,58 @@ export default function TopicWorkspace({
             }}
         >
             <div className="topic-workspace-main">
-                <section className="topic-search-panel">
-                    <div className="topic-search-controls">
-                        <input
-                            type="text"
-                            value={topicSearchQuery}
-                            placeholder={
-                                topicActionMode === "recommend"
-                                    ? "Recommendation topic (e.g., causal reasoning)"
-                                    : "Search papers, authors, or topics"
-                            }
-                            onChange={(event) => setTopicSearchQuery(event.target.value)}
-                            onKeyDown={(event) => {
-                                if (event.key === "Enter") {
-                                    event.preventDefault();
-                                    runActiveTopicAction();
+                <section
+                    className={`topic-search-panel ${
+                        showSearchPanel ? "" : "topic-search-panel-host-only"
+                    }`}
+                >
+                    {showSearchPanel && (
+                        <div className="topic-search-controls">
+                            <input
+                                type="text"
+                                value={topicSearchQuery}
+                                placeholder={
+                                    topicActionMode === "recommend"
+                                        ? "Recommendation topic (e.g., causal reasoning)"
+                                        : "Search papers, authors, or topics"
                                 }
-                            }}
-                        />
-                        <button
-                            type="button"
-                            className={`topic-search-submit-button topic-mode-toggle ${
-                                topicActionMode === "recommend"
-                                    ? "is-recommend"
-                                    : "is-search"
-                            }`}
-                            onClick={() =>
-                                setTopicActionMode((previous) =>
-                                    previous === "search" ? "recommend" : "search"
-                                )
-                            }
-                            aria-label="Toggle topic action mode"
-                        >
-                            <span className="topic-mode-toggle-spacer" aria-hidden="true">
-                                Recommend
-                            </span>
-                            <span className="topic-mode-toggle-label topic-mode-toggle-search">
-                                Search
-                            </span>
-                            <span className="topic-mode-toggle-label topic-mode-toggle-recommend">
-                                Recommend
-                            </span>
-                        </button>
-                    </div>
+                                onChange={(event) => setTopicSearchQuery(event.target.value)}
+                                onKeyDown={(event) => {
+                                    if (event.key === "Enter") {
+                                        event.preventDefault();
+                                        runActiveTopicAction();
+                                    }
+                                }}
+                            />
+                            <button
+                                type="button"
+                                className={`topic-search-submit-button topic-mode-toggle ${
+                                    topicActionMode === "recommend"
+                                        ? "is-recommend"
+                                        : "is-search"
+                                }`}
+                                onClick={() =>
+                                    setTopicActionMode((previous) =>
+                                        previous === "search" ? "recommend" : "search"
+                                    )
+                                }
+                                aria-label="Toggle topic action mode"
+                            >
+                                <span
+                                    className="topic-mode-toggle-spacer"
+                                    aria-hidden="true"
+                                >
+                                    Recommend
+                                </span>
+                                <span className="topic-mode-toggle-label topic-mode-toggle-search">
+                                    Search
+                                </span>
+                                <span className="topic-mode-toggle-label topic-mode-toggle-recommend">
+                                    Recommend
+                                </span>
+                            </button>
+                        </div>
+                    )}
                     {isRecommendationOverlayOpen && (
                         <div
                             className="topic-search-overlay topic-recommendation-overlay"
@@ -1056,4 +1087,6 @@ export default function TopicWorkspace({
             )}
         </div>
     );
-}
+});
+
+export default TopicWorkspace;

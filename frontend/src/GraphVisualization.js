@@ -722,7 +722,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
         simulationRef.current.stop();
       }
     };
-  }, [data, highlightPath]);
+  }, [data]);
 
   // Separate effect for theme changes
   useEffect(() => {
@@ -738,6 +738,57 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       .attr("fill", isDarkMode ? "#ccc" : "#333")
       .style("stroke", isDarkMode ? "#2a2a2a" : "white");
   }, [isDarkMode]);
+
+  // Update highlighted nodes/edges without recreating simulation.
+  useEffect(() => {
+    if (!simulationRef.current || !data || !svgRef.current) return;
+
+    const highlightedNodeSet = new Set(
+      Array.isArray(highlightPath?.nodes) ? highlightPath.nodes : []
+    );
+    const pathNodes =
+      highlightPath?.mode === "path" && Array.isArray(highlightPath?.nodes)
+        ? highlightPath.nodes
+        : [];
+    const isEdgeInHighlightedPath = (edge) => {
+      if (pathNodes.length < 2) return false;
+      const sourceId = edge?.source?.id || edge?.source;
+      const targetId = edge?.target?.id || edge?.target;
+      for (let i = 0; i < pathNodes.length - 1; i++) {
+        if (
+          (pathNodes[i] === sourceId && pathNodes[i + 1] === targetId) ||
+          (pathNodes[i] === targetId && pathNodes[i + 1] === sourceId)
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const svg = d3.select(svgRef.current);
+    const g = svg.select("g");
+    if (g.empty()) return;
+
+    g.selectAll("line")
+      .attr("stroke", (d) => {
+        if (isEdgeInHighlightedPath(d)) return "#FFD600";
+        return d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000");
+      })
+      .attr("stroke-width", (d) => {
+        if (isEdgeInHighlightedPath(d)) return 6;
+        return d.type === 'semantic' ? ((d.weight - 0.25) * 4) : 4;
+      });
+
+    g.selectAll("circle")
+      .attr("fill", (d) => {
+        if (highlightedNodeSet.has(d.id)) {
+          return d.type === 'paper' ? "#FF6B35" : "#FF1744";
+        }
+        return d.type === 'paper' ? "#4CAF50" : "#FF6B6B";
+      })
+      .attr("stroke", (d) => (highlightedNodeSet.has(d.id) ? "#FFD600" : "#fff"))
+      .attr("stroke-width", (d) => (highlightedNodeSet.has(d.id) ? 4 : 2));
+  }, [highlightPath, isDarkMode, data]);
 
   // Effect for semantic edges toggle and threshold
   useEffect(() => {
@@ -766,7 +817,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
 
 
   return (
-    <div ref={containerRef} style={{ width: '100%', height: '100vh', position: 'relative', backgroundColor: 'white' }}>
+    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative', backgroundColor: 'white' }}>
       <div style={{ position: 'absolute', top: '20px', right: '20px', zIndex: 1001 }}>
         <button
           onClick={() => setShowMenu(!showMenu)}
