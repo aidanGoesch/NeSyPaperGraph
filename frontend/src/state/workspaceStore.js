@@ -6,7 +6,7 @@ const PERSIST_DEBOUNCE_MS = 800;
 const MAX_READING_ITEMS = 200;
 const MAX_THEME_NOTES = 150;
 const MAX_ANNOTATIONS = 400;
-const MAX_NOTE_CHARS = 12000;
+const MAX_NOTE_CHARS = 250000;
 const MAX_QUICK_NOTE_CHARS = 2000;
 
 const initialState = {

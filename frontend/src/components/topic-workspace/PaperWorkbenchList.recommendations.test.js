@@ -2,6 +2,10 @@ import React from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import PaperWorkbenchList from "./PaperWorkbenchList";
 
+jest.mock("./DesktopPaperWebview", () => (props) => (
+    <div data-testid="desktop-paper-webview">{props.url}</div>
+));
+
 function renderList(overrides = {}) {
     const props = {
         papers: [
@@ -101,7 +105,7 @@ describe("PaperWorkbenchList recommendations", () => {
             screen.getByRole("dialog", { name: "Paper reader and notes" })
         ).toBeTruthy();
         const modalTextarea = screen.getByPlaceholderText(
-            "Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets, and paste screenshots directly."
+            "Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets."
         );
         fireEvent.change(modalTextarea, { target: { value: "Expanded note text" } });
 
@@ -121,7 +125,7 @@ describe("PaperWorkbenchList recommendations", () => {
         fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
         fireEvent.click(screen.getByRole("button", { name: "Open paper" }));
         const modalTextarea = screen.getByPlaceholderText(
-            "Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets, and paste screenshots directly."
+            "Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets."
         );
 
         modalTextarea.selectionStart = 0;
@@ -138,6 +142,25 @@ describe("PaperWorkbenchList recommendations", () => {
         expect(onUpdatePaperAnnotation).toHaveBeenCalledWith(
             "Neuro-Symbolic Program Synthesis",
             { notesMarkdown: "- item\n- " }
+        );
+    });
+
+    test("uses desktop webview in desktop runtime with browser support", async () => {
+        renderList({
+            desktopConfig: { isDesktop: true, supportsInAppBrowser: true },
+            requestedReaderItem: {
+                title: "Remote paper",
+                annotationKey: "Remote paper",
+                url: "https://example.org/paper",
+                status: "reading",
+            },
+            requestedReaderNonce: 1,
+        });
+
+        await waitFor(() =>
+            expect(
+                screen.getByTestId("desktop-paper-webview").textContent
+            ).toContain("https://example.org/paper")
         );
     });
 });

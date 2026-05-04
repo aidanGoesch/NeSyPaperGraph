@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import DesktopPaperWebview from "./DesktopPaperWebview";
 
 function normalizeAuthor(authors) {
     if (!authors) return "Unknown";
@@ -22,18 +23,7 @@ function normalizePaperTitle(title) {
     return String(title || "").trim().toLowerCase();
 }
 
-function formatReaderUrl(url) {
-    if (!url) return "";
-    try {
-        const parsed = new URL(url);
-        const preview = `${parsed.hostname}${parsed.pathname}`;
-        return preview.length > 78 ? `${preview.slice(0, 78)}...` : preview;
-    } catch {
-        return url.length > 78 ? `${url.slice(0, 78)}...` : url;
-    }
-}
-
-const MAX_PAPER_NOTE_CHARS = 12000;
+const MAX_PAPER_NOTE_CHARS = 250000;
 
 function insertAtSelection(sourceText, selectionStart, selectionEnd, insertText) {
     const before = sourceText.slice(0, selectionStart);
@@ -80,6 +70,7 @@ export default function PaperWorkbenchList({
     requestedReaderNonce = 0,
     onRequestSimilarPapers,
     onAddRecommendationToReadingList,
+    desktopConfig = {},
 }) {
     const [selectedPaperTitle, setSelectedPaperTitle] = useState(null);
     const [similarPapers, setSimilarPapers] = useState([]);
@@ -87,13 +78,11 @@ export default function PaperWorkbenchList({
     const [similarError, setSimilarError] = useState("");
     const [expandedSimilarKey, setExpandedSimilarKey] = useState(null);
     const [isPaperReaderOpen, setIsPaperReaderOpen] = useState(false);
-    const [isPreviewOpen, setIsPreviewOpen] = useState(false);
     const [noteEditorError, setNoteEditorError] = useState("");
     const [flashPaperTitle, setFlashPaperTitle] = useState(null);
     const [externalReaderItem, setExternalReaderItem] = useState(null);
     const [isReaderFrameLoaded, setIsReaderFrameLoaded] = useState(false);
     const [readerFrameError, setReaderFrameError] = useState("");
-    const noteTextareaRef = useRef(null);
     const flashTimerRef = useRef(null);
 
     useEffect(() => {
@@ -159,6 +148,9 @@ export default function PaperWorkbenchList({
     const activeReaderAnnotation = activeReaderAnnotationKey
         ? getPaperAnnotation(activeReaderAnnotationKey)
         : null;
+    const useDesktopInAppBrowser = Boolean(
+        desktopConfig?.isDesktop && desktopConfig?.supportsInAppBrowser
+    );
 
     useEffect(() => {
         setIsReaderFrameLoaded(false);
@@ -171,7 +163,6 @@ export default function PaperWorkbenchList({
         setSimilarError("");
         setExpandedSimilarKey(null);
         setNoteEditorError("");
-        setIsPreviewOpen(false);
     }, [selectedPaperTitle]);
 
     useEffect(() => {
@@ -253,52 +244,16 @@ export default function PaperWorkbenchList({
         });
     };
 
-    const handleNotePaste = async (event) => {
-        if (!activeReaderAnnotationKey) return;
+    const handleNotePaste = (event) => {
         const clipboardItems = Array.from(event.clipboardData?.items || []);
-        const imageItem = clipboardItems.find(
+        const hasImage = clipboardItems.some(
             (item) => item.kind === "file" && item.type.startsWith("image/")
         );
-        if (!imageItem) return;
-        const file = imageItem.getAsFile();
-        if (!file) return;
+        if (!hasImage) return;
         event.preventDefault();
-        const readAsDataUrl = () =>
-            new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(String(reader.result || ""));
-                reader.onerror = () => reject(new Error("Failed to read pasted image."));
-                reader.readAsDataURL(file);
-            });
-        try {
-            const dataUrl = await readAsDataUrl();
-            if (!dataUrl) return;
-            const textarea = noteTextareaRef.current;
-            const sourceValue = activeReaderAnnotation?.notesMarkdown || "";
-            const selectionStart = textarea?.selectionStart ?? sourceValue.length;
-            const selectionEnd = textarea?.selectionEnd ?? sourceValue.length;
-            const timestamp = new Date()
-                .toISOString()
-                .replace("T", " ")
-                .replace(/\.\d+Z$/, " UTC");
-            const imageMarkdown = `\n![Screenshot ${timestamp}](${dataUrl})\n`;
-            const result = insertAtSelection(
-                sourceValue,
-                selectionStart,
-                selectionEnd,
-                imageMarkdown
-            );
-            const accepted = setPaperNotes(activeReaderAnnotationKey, result.text, {
-                rejectMessage:
-                    "Pasted image is too large for the current note size limit. Try a smaller screenshot.",
-            });
-            if (!accepted || !textarea) return;
-            requestAnimationFrame(() => {
-                textarea.setSelectionRange(result.start, result.end);
-            });
-        } catch (error) {
-            setNoteEditorError(error?.message || "Unable to paste screenshot.");
-        }
+        setNoteEditorError(
+            "Image pasting is disabled in notes. Please paste text only."
+        );
     };
 
     return (
@@ -591,227 +546,55 @@ export default function PaperWorkbenchList({
                                     {activeReader.venue ? ` • ${activeReader.venue}` : ""}
                                 </p>
                                 {activeReader.url ? (
-                                    <>
-                                        <div className="paper-reader-frame-toolbar">
-                                            <a
-                                                href={activeReader.url}
-                                                target="_blank"
-                                                rel="noreferrer"
-                                                className="paper-reader-source-link"
-                                                title={activeReader.url}
-                                            >
-                                                {formatReaderUrl(activeReader.url)}
-                                            </a>
-                                            <a
-                                                href={activeReader.url}
-                                                target="_blank"
-                                                rel="noreferrer"
-                                                className="open-link-button"
-                                            >
-                                                Open in browser
-                                            </a>
-                                        </div>
-                                        {!isReaderFrameLoaded && (
-                                            <p className="theme-sync-hint">
-                                                Loading paper page...
-                                            </p>
-                                        )}
-                                        {readerFrameError && (
-                                            <p className="validation-error">{readerFrameError}</p>
-                                        )}
-                                        <iframe
-                                            key={activeReader.url}
-                                            className="paper-reader-frame"
-                                            src={activeReader.url}
-                                            title={`Paper content: ${activeReader.title}`}
-                                            onLoad={() => setIsReaderFrameLoaded(true)}
-                                            onError={() => {
-                                                setReaderFrameError(
-                                                    "This site blocked in-app embedding. Use 'Open in browser' to read it."
-                                                );
-                                            }}
+                                    useDesktopInAppBrowser ? (
+                                        <DesktopPaperWebview
+                                            url={activeReader.url}
+                                            title={activeReader.title}
                                         />
-                                        <p className="theme-sync-hint">
-                                            If this pane appears blank, the publisher likely blocks
-                                            embedding. Use "Open in browser".
-                                        </p>
-                                    </>
+                                    ) : (
+                                        <>
+                                            {!isReaderFrameLoaded && (
+                                                <p className="theme-sync-hint">
+                                                    Loading paper page...
+                                                </p>
+                                            )}
+                                            {readerFrameError && (
+                                                <p className="validation-error">
+                                                    {readerFrameError}
+                                                </p>
+                                            )}
+                                            <iframe
+                                                key={activeReader.url}
+                                                className="paper-reader-frame"
+                                                src={activeReader.url}
+                                                title={`Paper content: ${activeReader.title}`}
+                                                onLoad={() => setIsReaderFrameLoaded(true)}
+                                                onError={() => {
+                                                    setReaderFrameError(
+                                                        "This site blocked in-app embedding. Use 'Open in browser' to read it."
+                                                    );
+                                                }}
+                                            />
+                                            <div className="paper-reader-frame-toolbar">
+                                                <a
+                                                    href={activeReader.url}
+                                                    target="_blank"
+                                                    rel="noreferrer"
+                                                    className="open-link-button"
+                                                >
+                                                    Open in browser
+                                                </a>
+                                            </div>
+                                            <p className="theme-sync-hint">
+                                                If this pane appears blank, the publisher likely
+                                                blocks embedding. Use "Open in browser".
+                                            </p>
+                                        </>
+                                    )
                                 ) : (
                                     <p className="paper-details-abstract">
                                         {activeReader.abstract || "No summary available."}
                                     </p>
-                                )}
-                                {selectedPaper && (
-                                    <>
-                                        <div className="paper-actions">
-                                            <button
-                                                type="button"
-                                                onClick={() =>
-                                                    onOpenThemeAssignmentModal(selectedPaper.title)
-                                                }
-                                            >
-                                                Send to Theme
-                                            </button>
-                                            <button
-                                                type="button"
-                                                onClick={async () => {
-                                                    if (!onRequestSimilarPapers) return;
-                                                    setSimilarState("loading");
-                                                    setSimilarError("");
-                                                    setSimilarPapers([]);
-                                                    try {
-                                                        const results =
-                                                            (await onRequestSimilarPapers(
-                                                                selectedPaper
-                                                            )) || [];
-                                                        setSimilarPapers(
-                                                            Array.isArray(results) ? results : []
-                                                        );
-                                                        setSimilarState("success");
-                                                        setExpandedSimilarKey(null);
-                                                    } catch (error) {
-                                                        setSimilarError(
-                                                            `Failed to load recommendations: ${
-                                                                error?.message || "Unknown error"
-                                                            }`
-                                                        );
-                                                        setSimilarState("error");
-                                                    }
-                                                }}
-                                            >
-                                                See similar papers
-                                            </button>
-                                        </div>
-                                        {similarState === "loading" && (
-                                            <p className="theme-sync-hint">
-                                                Loading recommendations...
-                                            </p>
-                                        )}
-                                        {similarState === "error" && (
-                                            <p className="validation-error">{similarError}</p>
-                                        )}
-                                        {similarState === "success" &&
-                                            similarPapers.length === 0 && (
-                                                <p className="theme-sync-hint">
-                                                    No similar papers found for this paper.
-                                                </p>
-                                            )}
-                                        {similarState === "success" &&
-                                            similarPapers.length > 0 && (
-                                                <div className="linked-papers">
-                                                    <strong>Similar papers</strong>
-                                                    <ul className="theme-linked-paper-list">
-                                                        {similarPapers.map((paper, index) => (
-                                                            <li
-                                                                key={
-                                                                    paper.paperId ||
-                                                                    `${paper.title}-${index}`
-                                                                }
-                                                            >
-                                                                <div className="theme-linked-paper-card">
-                                                                    <button
-                                                                        type="button"
-                                                                        className="paper-list-item"
-                                                                        onClick={() => {
-                                                                            const cardKey =
-                                                                                paper.paperId ||
-                                                                                paper.title ||
-                                                                                String(index);
-                                                                            setExpandedSimilarKey(
-                                                                                (previous) =>
-                                                                                    previous ===
-                                                                                    cardKey
-                                                                                        ? null
-                                                                                        : cardKey
-                                                                            );
-                                                                        }}
-                                                                    >
-                                                                        <strong>
-                                                                            {paper.title ||
-                                                                                "Untitled paper"}
-                                                                        </strong>
-                                                                        <small>
-                                                                            <span
-                                                                                className={`recommendation-source-badge ${
-                                                                                    paper.source ===
-                                                                                    "graph"
-                                                                                        ? "recommendation-source-graph"
-                                                                                        : "recommendation-source-semantic"
-                                                                                }`}
-                                                                            >
-                                                                                {recommendationSourceLabel(
-                                                                                    paper.source
-                                                                                )}
-                                                                            </span>
-                                                                        </small>
-                                                                    </button>
-                                                                    {expandedSimilarKey ===
-                                                                        (paper.paperId ||
-                                                                            paper.title ||
-                                                                            String(index)) && (
-                                                                        <div className="theme-linked-paper-meta">
-                                                                            <p>
-                                                                                {(paper.authors ||
-                                                                                    []).length
-                                                                                    ? paper.authors.join(
-                                                                                          ", "
-                                                                                      )
-                                                                                    : "Unknown authors"}{" "}
-                                                                                |{" "}
-                                                                                {paper.year ||
-                                                                                    "Unknown year"}
-                                                                            </p>
-                                                                            <p>
-                                                                                {paper.abstract ||
-                                                                                    "No summary available."}
-                                                                            </p>
-                                                                            <div className="paper-actions">
-                                                                                {paper.source !==
-                                                                                    "graph" &&
-                                                                                    onAddRecommendationToReadingList && (
-                                                                                        <button
-                                                                                            type="button"
-                                                                                            onClick={() =>
-                                                                                                onAddRecommendationToReadingList(
-                                                                                                    paper
-                                                                                                )
-                                                                                            }
-                                                                                        >
-                                                                                            Add to reading
-                                                                                            list
-                                                                                        </button>
-                                                                                    )}
-                                                                                {paper.source !==
-                                                                                    "graph" &&
-                                                                                    recommendationBrowserUrl(
-                                                                                        paper
-                                                                                    ) && (
-                                                                                        <button
-                                                                                            type="button"
-                                                                                            className="theme-queue-open-button"
-                                                                                            onClick={() =>
-                                                                                                window.open(
-                                                                                                    recommendationBrowserUrl(
-                                                                                                        paper
-                                                                                                    ),
-                                                                                                    "_blank",
-                                                                                                    "noopener,noreferrer"
-                                                                                                )
-                                                                                            }
-                                                                                        >
-                                                                                            Open in browser
-                                                                                        </button>
-                                                                                    )}
-                                                                            </div>
-                                                                        </div>
-                                                                    )}
-                                                                </div>
-                                                            </li>
-                                                        ))}
-                                                    </ul>
-                                                </div>
-                                            )}
-                                    </>
                                 )}
                             </section>
                             <section className="paper-notes-pane">
@@ -822,39 +605,24 @@ export default function PaperWorkbenchList({
                                             {(activeReaderAnnotation?.notesMarkdown || "").length} /{" "}
                                             {MAX_PAPER_NOTE_CHARS}
                                         </span>
-                                        <button
-                                            type="button"
-                                            className="topic-search-open-button"
-                                            onClick={() =>
-                                                setIsPreviewOpen((previous) => !previous)
-                                            }
-                                        >
-                                            {isPreviewOpen ? "Hide preview" : "Show preview"}
-                                        </button>
                                     </div>
                                 </div>
                                 <textarea
-                                    ref={noteTextareaRef}
                                     id="annotation-modal-input"
                                     className="paper-note-modal-textarea"
                                     value={activeReaderAnnotation?.notesMarkdown || ""}
                                     onChange={(event) =>
-                                        setPaperNotes(activeReaderAnnotationKey, event.target.value)
+                                        setPaperNotes(
+                                            activeReaderAnnotationKey,
+                                            event.target.value
+                                        )
                                     }
                                     onKeyDown={handleNoteKeyDown}
                                     onPaste={handleNotePaste}
-                                    placeholder="Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets, and paste screenshots directly."
+                                    placeholder="Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets."
                                 />
                                 {noteEditorError && (
                                     <p className="validation-error">{noteEditorError}</p>
-                                )}
-                                {isPreviewOpen && (
-                                    <div className="paper-note-markdown-preview">
-                                        <pre>
-                                            {activeReaderAnnotation?.notesMarkdown ||
-                                                "No notes yet."}
-                                        </pre>
-                                    </div>
                                 )}
                             </section>
                         </div>

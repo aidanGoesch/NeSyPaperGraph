@@ -1,7 +1,8 @@
 const path = require("path");
-const { app, BrowserWindow, ipcMain, dialog } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell, session } = require("electron");
 const { getSecret, setSecret, deleteSecret } = require("./services/keychain");
 const { SidecarManager } = require("./services/sidecarManager");
+const { createSecurityPolicyRuntime } = require("./webSecurity");
 
 const APP_NAME = "NeSyPaperGraph";
 const OPENAI_KEY_SERVICE = `${APP_NAME}.desktop`;
@@ -44,7 +45,34 @@ function buildDesktopConfig() {
     return {
         isDesktop: true,
         apiBaseUrl: runtimeState.apiBaseUrl,
+        supportsInAppBrowser: true,
     };
+}
+
+function registerDesktopSecurityPolicies() {
+    const runtime = createSecurityPolicyRuntime({
+        getMainWindowWebContents: () => mainWindow?.webContents || null,
+        getRendererEntry,
+        openExternal: (url) => shell.openExternal(url),
+    });
+
+    app.on("web-contents-created", (_event, contents) => {
+        contents.setWindowOpenHandler(({ url }) => runtime.handleWindowOpen(url));
+        contents.on("will-navigate", (event, url) =>
+            runtime.handleWillNavigate(event, url, contents)
+        );
+    });
+
+    if (session.defaultSession) {
+        session.defaultSession.setPermissionRequestHandler(
+            runtime.handlePermissionRequest
+        );
+        if (typeof session.defaultSession.setPermissionCheckHandler === "function") {
+            session.defaultSession.setPermissionCheckHandler(
+                runtime.handlePermissionCheck
+            );
+        }
+    }
 }
 
 async function createMainWindow() {
@@ -59,6 +87,7 @@ async function createMainWindow() {
             contextIsolation: true,
             nodeIntegration: false,
             sandbox: true,
+            webviewTag: true,
         },
     });
 
@@ -132,6 +161,7 @@ async function startSidecar() {
 
 app.whenReady().then(async () => {
     registerIpcHandlers();
+    registerDesktopSecurityPolicies();
     try {
         await startSidecar();
     } catch (error) {

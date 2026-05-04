@@ -11,6 +11,7 @@
     "desktop:build:frontend": "npm run frontend:build",
     "desktop:build:sidecar": "node desktop/scripts/build-sidecar.js",
     "desktop:build:mac": "npm run desktop:build:frontend && npm run desktop:build:sidecar && electron-builder --mac",
+    "desktop:test": "node --test desktop/*.test.js",
     "desktop:smoke": "node desktop/scripts/smoke.js",
     "desktop:memory:stress": "node desktop/scripts/memory-stress.js"
   },

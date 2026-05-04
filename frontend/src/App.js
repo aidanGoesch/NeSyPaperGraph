@@ -16,6 +16,15 @@ const MAX_UPLOAD_FILES_PER_REQUEST = 25;
 const MAX_UPLOAD_BATCH_BYTES = 40 * 1024 * 1024; // 40 MB per request
 const MAX_UPLOAD_BATCH_RETRIES = 3;
 const UPLOAD_BATCH_RETRY_BASE_MS = 1200;
+const MAX_ACTIVATION_TRACE_STEPS = 140;
+const PROMPT_ACTIVATION_COLORS = [
+    "#177cbc",
+    "#c15f9e",
+    "#36a37c",
+    "#8d7ad1",
+    "#d17b45",
+    "#6ea6d8",
+];
 
 function capChatHistory(entries) {
     return entries.length > MAX_CHAT_HISTORY
@@ -43,6 +52,77 @@ function trimSearchResult(result) {
         topics: Array.isArray(result.topics) ? result.topics.slice(0, 12) : [],
         summary: (result.summary || "").slice(0, MAX_RESULT_SUMMARY_CHARS),
     };
+}
+
+function normalizeStructuredAnswer(answerStructured, fallbackAnswer) {
+    if (!answerStructured || typeof answerStructured !== "object") {
+        return {
+            segments: [{ text: fallbackAnswer || "", claim_id: null }],
+            claims: [],
+            warnings: [],
+        };
+    }
+    const claims = Array.isArray(answerStructured.claims)
+        ? answerStructured.claims
+              .map((claim) => {
+                  if (!claim || typeof claim !== "object") return null;
+                  const citations = Array.isArray(claim.citations)
+                      ? claim.citations.filter(
+                            (citation) =>
+                                citation &&
+                                typeof citation.paper_title === "string" &&
+                                citation.paper_title.trim() &&
+                                typeof citation.excerpt === "string" &&
+                                citation.excerpt.trim()
+                        )
+                      : [];
+                  if (
+                      !claim.id ||
+                      typeof claim.id !== "string" ||
+                      !claim.text ||
+                      typeof claim.text !== "string" ||
+                      citations.length === 0
+                  ) {
+                      return null;
+                  }
+                  return {
+                      id: claim.id,
+                      text: claim.text,
+                      citations,
+                  };
+              })
+              .filter(Boolean)
+        : [];
+    const claimIdSet = new Set(claims.map((claim) => claim.id));
+    const segments = Array.isArray(answerStructured.segments)
+        ? answerStructured.segments
+              .map((segment) => {
+                  if (!segment || typeof segment !== "object") return null;
+                  const text = typeof segment.text === "string" ? segment.text : "";
+                  if (!text) return null;
+                  const claimId = claimIdSet.has(segment.claim_id)
+                      ? segment.claim_id
+                      : null;
+                  return {
+                      text,
+                      claim_id: claimId,
+                  };
+              })
+              .filter(Boolean)
+        : [];
+    const warnings = Array.isArray(answerStructured.warnings)
+        ? answerStructured.warnings
+              .map((item) => (typeof item === "string" ? item : ""))
+              .filter(Boolean)
+        : [];
+    if (segments.length === 0) {
+        return {
+            segments: [{ text: fallbackAnswer || "", claim_id: null }],
+            claims,
+            warnings,
+        };
+    }
+    return { segments, claims, warnings };
 }
 
 function buildUploadBatches(files) {
@@ -82,6 +162,7 @@ function App() {
         apiBaseUrl: isDesktopRuntime
             ? ""
             : process.env.REACT_APP_API_URL || "http://localhost:8000",
+        supportsInAppBrowser: false,
     }));
     const [runtimeConfigLoaded, setRuntimeConfigLoaded] = useState(
         !isDesktopRuntime
@@ -107,8 +188,9 @@ function App() {
     const [showMermaid, setShowMermaid] = useState(false);
     const [agentArchitectureDiagram, setAgentArchitectureDiagram] =
         useState("");
-    const [showChatPanel, setShowChatPanel] = useState(false);
+    const [showChatPanel, setShowChatPanel] = useState(true);
     const [chatHistory, setChatHistory] = useState([]);
+    const [activeClaimPopover, setActiveClaimPopover] = useState(null);
     const [isSearching, setIsSearching] = useState(false);
     const [followUpQuestion, setFollowUpQuestion] = useState("");
     const [highlightPath, setHighlightPath] = useState(null);
@@ -128,13 +210,6 @@ function App() {
 
     // Function to handle paper citation clicks
     const handlePaperCitationClick = (paperTitle) => {
-        // Hide chat panel
-        setIsFadingOut(true);
-        setTimeout(() => {
-            setShowChatPanel(false);
-            setIsFadingOut(false);
-        }, 800);
-
         if (graphRef.current && graphData) {
             // Find the paper in the graph data
             const paper = graphData.papers.find((p) => p.title === paperTitle);
@@ -172,11 +247,42 @@ function App() {
 
         return htmlText;
     };
+    const getPaperDetails = (paperTitle) => {
+        if (!graphData || !Array.isArray(graphData.papers)) return null;
+        return (
+            graphData.papers.find((paper) => paper.title === paperTitle) || null
+        );
+    };
+    const toggleClaimPopover = (entryIndex, claimId) => {
+        setActiveClaimPopover((prev) => {
+            if (
+                prev &&
+                prev.entryIndex === entryIndex &&
+                prev.claimId === claimId
+            ) {
+                return null;
+            }
+            return { entryIndex, claimId };
+        });
+    };
     const agentArchitectureMermaidRef = useRef();
     const chatContentRef = useRef();
     const [expandedResult, setExpandedResult] = useState(null);
     const chatInputRef = useRef();
     const [isFadingOut, setIsFadingOut] = useState(false);
+    const [activationFrame, setActivationFrame] = useState({
+        roundIndex: 0,
+        step: 0,
+        nodes: {},
+        nodeColors: {},
+        traversedEdges: {},
+        edgeColors: {},
+        maxTraversalCount: 0,
+        promptColor: PROMPT_ACTIVATION_COLORS[0],
+        promptIndex: 0,
+        seedNodeIds: [],
+        focusNodeId: null,
+    });
     const graphRef = useRef();
     const topicWorkspaceRef = useRef();
     const searchInputRef = useRef();
@@ -187,7 +293,257 @@ function App() {
     const pendingUploadAckCountRef = useRef(0);
     const graphLoadPromiseRef = useRef(null);
     const architectureLoadedRef = useRef(false);
+    const activationPlaybackTimeoutRef = useRef([]);
+    const persistentActivationRef = useRef({
+        nodes: {},
+        nodeColors: {},
+        traversedEdges: {},
+        edgeColors: {},
+        maxTraversalCount: 0,
+    });
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const clearActivationPlayback = useCallback(() => {
+        activationPlaybackTimeoutRef.current.forEach((timerId) =>
+            window.clearTimeout(timerId)
+        );
+        activationPlaybackTimeoutRef.current = [];
+    }, []);
+
+    const startActivationPlayback = useCallback(
+        (rounds, promptColor, promptIndex = 0) => {
+            clearActivationPlayback();
+            const activePromptColor =
+                promptColor || PROMPT_ACTIVATION_COLORS[0];
+            if (!Array.isArray(rounds) || rounds.length === 0) {
+                setActivationFrame({
+                    roundIndex: 0,
+                    step: 0,
+                    nodes: { ...(persistentActivationRef.current.nodes || {}) },
+                    nodeColors: {
+                        ...(persistentActivationRef.current.nodeColors || {}),
+                    },
+                    traversedEdges: {
+                        ...(persistentActivationRef.current.traversedEdges || {}),
+                    },
+                    edgeColors: {
+                        ...(persistentActivationRef.current.edgeColors || {}),
+                    },
+                    maxTraversalCount:
+                        Number(
+                            persistentActivationRef.current.maxTraversalCount || 0
+                        ) || 0,
+                    promptColor: activePromptColor,
+                    promptIndex,
+                    seedNodeIds: [],
+                    focusNodeId: null,
+                });
+                return;
+            }
+
+            const frames = [];
+            const cumulativeNodes = {
+                ...(persistentActivationRef.current.nodes || {}),
+            };
+            const cumulativeNodeColors = {
+                ...(persistentActivationRef.current.nodeColors || {}),
+            };
+            const cumulativeTraversedEdges = {
+                ...(persistentActivationRef.current.traversedEdges || {}),
+            };
+            const cumulativeEdgeColors = {
+                ...(persistentActivationRef.current.edgeColors || {}),
+            };
+            const toEdgeKey = (source, target) => {
+                const left = String(source || "");
+                const right = String(target || "");
+                if (!left || !right) return null;
+                return [left, right].sort().join("___");
+            };
+
+            // Precompute a fixed denominator for the whole playback so
+            // thickness is monotonic with traversal counts.
+            const totalTraversalCounts = {};
+            rounds.forEach((round) => {
+                const stepTrace = Array.isArray(round?.step_trace)
+                    ? round.step_trace.slice(0, MAX_ACTIVATION_TRACE_STEPS)
+                    : [];
+                let previousNodeId = null;
+                stepTrace.forEach((stepItem) => {
+                    const nodeId = stepItem?.node_id;
+                    if (!nodeId) return;
+                    if (previousNodeId && previousNodeId !== nodeId) {
+                        const edgeKey = toEdgeKey(previousNodeId, nodeId);
+                        if (edgeKey) {
+                            totalTraversalCounts[edgeKey] =
+                                Number(totalTraversalCounts[edgeKey] || 0) + 1;
+                        }
+                    }
+                    previousNodeId = nodeId;
+                });
+            });
+            const fixedMaxTraversalCount = Math.max(
+                1,
+                Number(persistentActivationRef.current.maxTraversalCount || 0),
+                ...Object.values(totalTraversalCounts).map((count) => Number(count) || 0)
+            );
+            rounds.forEach((round) => {
+                const roundIndex = Number(round?.round_index) || 1;
+                const seedNodes = Array.isArray(round?.seed_nodes)
+                    ? round.seed_nodes
+                    : [];
+                const roundSeedNodeIds = seedNodes
+                    .map((seed) => seed?.node_id)
+                    .filter(Boolean);
+                const primarySeedNodeId = roundSeedNodeIds[0] || null;
+                const stepTrace = Array.isArray(round?.step_trace)
+                    ? round.step_trace.slice(0, MAX_ACTIVATION_TRACE_STEPS)
+                    : [];
+
+                seedNodes.forEach((seed) => {
+                    const nodeId = seed?.node_id;
+                    if (!nodeId) return;
+                    cumulativeNodes[nodeId] = {
+                        score: Math.max(0.35, Number(seed?.score) || 0.35),
+                        stage: "seed",
+                        roundIndex,
+                    };
+                    if (!cumulativeNodeColors[nodeId]) {
+                        cumulativeNodeColors[nodeId] = activePromptColor;
+                    }
+                });
+                frames.push({
+                    roundIndex,
+                    step: 0,
+                    nodes: { ...cumulativeNodes },
+                    nodeColors: { ...cumulativeNodeColors },
+                    traversedEdges: { ...cumulativeTraversedEdges },
+                    edgeColors: { ...cumulativeEdgeColors },
+                    maxTraversalCount: fixedMaxTraversalCount,
+                    promptColor: activePromptColor,
+                    promptIndex,
+                    seedNodeIds: roundSeedNodeIds,
+                    focusNodeId: primarySeedNodeId,
+                });
+
+                let previousNodeId = null;
+                stepTrace.forEach((stepItem) => {
+                    const nodeId = stepItem?.node_id;
+                    if (!nodeId) return;
+                    const stepScore = Math.max(
+                        0,
+                        Math.min(1, Number(stepItem?.score_after_step) || 0)
+                    );
+                    cumulativeNodes[nodeId] = {
+                        score: Math.max(
+                            stepScore,
+                            cumulativeNodes[nodeId]?.score || 0
+                        ),
+                        stage:
+                            cumulativeNodes[nodeId]?.stage === "seed"
+                                ? "seed"
+                                : "spread",
+                        roundIndex,
+                    };
+                    if (!cumulativeNodeColors[nodeId]) {
+                        cumulativeNodeColors[nodeId] = activePromptColor;
+                    }
+
+                    if (previousNodeId && previousNodeId !== nodeId) {
+                        const edgeKey = toEdgeKey(previousNodeId, nodeId);
+                        if (edgeKey) {
+                            const nextCount =
+                                Number(cumulativeTraversedEdges[edgeKey] || 0) + 1;
+                            cumulativeTraversedEdges[edgeKey] = nextCount;
+                            if (!cumulativeEdgeColors[edgeKey]) {
+                                cumulativeEdgeColors[edgeKey] = activePromptColor;
+                            }
+                        }
+                    }
+                    previousNodeId = nodeId;
+
+                    frames.push({
+                        roundIndex,
+                        step: Number(stepItem?.step) || 0,
+                        nodes: { ...cumulativeNodes },
+                        nodeColors: { ...cumulativeNodeColors },
+                        traversedEdges: { ...cumulativeTraversedEdges },
+                        edgeColors: { ...cumulativeEdgeColors },
+                        maxTraversalCount: fixedMaxTraversalCount,
+                        promptColor: activePromptColor,
+                        promptIndex,
+                        seedNodeIds: roundSeedNodeIds,
+                        focusNodeId: primarySeedNodeId,
+                    });
+                });
+            });
+
+            const decayNodes = {};
+            Object.keys(frames[frames.length - 1]?.nodes || {}).forEach((nodeId) => {
+                const node = frames[frames.length - 1].nodes[nodeId];
+                decayNodes[nodeId] = {
+                    ...node,
+                    stage: "decay",
+                    score: Number((node.score * 0.35).toFixed(6)),
+                };
+            });
+            frames.push({
+                roundIndex:
+                    Number(frames[frames.length - 1]?.roundIndex || 1) + 1,
+                step: 0,
+                nodes: decayNodes,
+                nodeColors: {
+                    ...(frames[frames.length - 1]?.nodeColors || {}),
+                },
+                traversedEdges: {
+                    ...(frames[frames.length - 1]?.traversedEdges || {}),
+                },
+                edgeColors: {
+                    ...(frames[frames.length - 1]?.edgeColors || {}),
+                },
+                maxTraversalCount: fixedMaxTraversalCount,
+                promptColor: activePromptColor,
+                promptIndex,
+                seedNodeIds:
+                    frames[frames.length - 1]?.seedNodeIds || [],
+                focusNodeId:
+                    frames[frames.length - 1]?.focusNodeId || null,
+            });
+
+            persistentActivationRef.current = {
+                nodes: { ...(frames[frames.length - 1]?.nodes || {}) },
+                nodeColors: {
+                    ...(frames[frames.length - 1]?.nodeColors || {}),
+                },
+                traversedEdges: {
+                    ...(frames[frames.length - 1]?.traversedEdges || {}),
+                },
+                edgeColors: {
+                    ...(frames[frames.length - 1]?.edgeColors || {}),
+                },
+                maxTraversalCount: fixedMaxTraversalCount,
+            };
+
+            frames.forEach((frame, idx) => {
+                const timerId = window.setTimeout(() => {
+                    setActivationFrame(frame);
+                }, idx * 90);
+                activationPlaybackTimeoutRef.current.push(timerId);
+            });
+        },
+        [clearActivationPlayback]
+    );
+    useEffect(() => {
+        if (activeView === "graph" && !showChatPanel) {
+            setShowChatPanel(true);
+        }
+    }, [activeView, showChatPanel]);
+
+    useEffect(() => {
+        return () => {
+            clearActivationPlayback();
+        };
+    }, [clearActivationPlayback]);
+
     const setUploadProgress = (current, total) => {
         const safeTotal = Math.max(0, Number(total) || 0);
         const safeCurrent = Math.max(0, Number(current) || 0);
@@ -490,12 +846,12 @@ function App() {
             }
             try {
                 const config = await bridge.getConfig();
-                if (config?.apiBaseUrl) {
-                    setDesktopConfig({
-                        isDesktop: Boolean(config.isDesktop),
-                        apiBaseUrl: config.apiBaseUrl,
-                    });
-                }
+                setDesktopConfig((previous) => ({
+                    ...previous,
+                    isDesktop: Boolean(config?.isDesktop),
+                    apiBaseUrl: config?.apiBaseUrl || previous.apiBaseUrl,
+                    supportsInAppBrowser: Boolean(config?.supportsInAppBrowser),
+                }));
                 const storedAccessKey = await bridge.getSecret("APP_ACCESS_KEY");
                 if (storedAccessKey) {
                     setAccessKey(storedAccessKey);
@@ -962,6 +1318,10 @@ function App() {
 
     const handleSearch = async (query) => {
         if (!query.trim() || isSearching) return;
+        const promptColor =
+            PROMPT_ACTIVATION_COLORS[
+                chatHistory.length % PROMPT_ACTIVATION_COLORS.length
+            ];
 
         // Check for special search syntax
         if (query.startsWith(':topic=')) {
@@ -1008,12 +1368,14 @@ function App() {
 
         setIsSearching(true);
         setShowChatPanel(true);
+        setActiveClaimPopover(null);
 
         // Add question to chat history immediately with loading state
         const questionEntry = {
             question: query,
             answer: null, // null indicates loading
             timestamp: new Date().toLocaleTimeString(),
+            promptColor,
         };
         setChatHistory((prev) => capChatHistory([...prev, questionEntry]));
 
@@ -1039,7 +1401,20 @@ function App() {
                 headers: {
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify({ query }),
+                body: JSON.stringify({
+                    query,
+                    activation_mode: true,
+                    conversation_history: chatHistory
+                        .slice(-6)
+                        .map((entry) => ({
+                            question: entry?.question || "",
+                            answer:
+                                entry?.answer &&
+                                entry.answer !== "SEARCH_RESULTS"
+                                    ? entry.answer
+                                    : "",
+                        })),
+                }),
             });
 
             const data = await response.json();
@@ -1072,9 +1447,25 @@ function App() {
                               .map(trimSearchResult)
                         : null,
                     mermaid: data.mermaid || null,
+                    confidence:
+                        typeof data.confidence === "number"
+                            ? data.confidence
+                            : null,
+                    needs_more_context: Boolean(data.needs_more_context),
+                    rounds: Array.isArray(data.rounds) ? data.rounds : [],
+                    promptColor,
                     sources_used: Array.isArray(data.sources_used)
                         ? data.sources_used.slice(0, 20)
                         : null,
+                    answer_structured: normalizeStructuredAnswer(
+                        data.answer_structured,
+                        data.status === "search_results"
+                            ? "SEARCH_RESULTS"
+                            : (data.answer || data.error || "No response").slice(
+                                  0,
+                                  MAX_ANSWER_CHARS
+                              )
+                    ),
                 };
 
                 // Auto-scroll after updating chat history
@@ -1093,6 +1484,11 @@ function App() {
 
                 return capChatHistory(updated);
             });
+            startActivationPlayback(
+                data.rounds || [],
+                promptColor,
+                chatHistory.length + 1
+            );
         } catch (error) {
             console.error("Search error:", error);
             // Update the last entry with error
@@ -1101,6 +1497,10 @@ function App() {
                 updated[updated.length - 1] = {
                     ...updated[updated.length - 1],
                     answer: "Error: Could not connect to server",
+                    answer_structured: normalizeStructuredAnswer(
+                        null,
+                        "Error: Could not connect to server"
+                    ),
                 };
                 return capChatHistory(updated);
             });
@@ -1549,6 +1949,8 @@ function App() {
                                 isDarkMode={isDarkMode}
                                 onShowArchitecture={showAgentArchitecture}
                                 highlightPath={highlightPath}
+                                activationFrame={activationFrame}
+                                hasChatOverlay={activeView === "graph" && showChatPanel}
                                 apiBase={API_BASE}
                                 apiFetch={apiFetch}
                                 onAddRecommendationToReadingList={(paper) => {
@@ -1584,6 +1986,7 @@ function App() {
                                     workspaceStore={workspaceStore}
                                     apiBase={API_BASE}
                                     apiFetch={apiFetch}
+                                    desktopConfig={desktopConfig}
                                     showSearchPanel={false}
                                     onResolveReadingUrl={resolveReadingUrlMetadata}
                                     onIngestReadingItem={ingestReadingItemToGraph}
@@ -1772,30 +2175,29 @@ function App() {
                                         "Closing chat panel from React handler"
                                     );
                                     e.preventDefault();
-                                    setIsFadingOut(true);
-                                    setTimeout(() => {
-                                        setShowChatPanel(false);
-                                        setIsFadingOut(false);
-                                    }, 800);
+                                    setIsFadingOut(false);
                                 }
                             }}
                         >
                             {/* X CLOSE BUTTON — now in top right corner */}
                             <button
                                 onClick={() => {
-                                    setShowChatPanel(false);
-                                    setTimeout(() => {
-                                        setSearchTerm("");
-                                        setIsSearchExpanded(false);
-                                    }, 300);
+                                    setSearchTerm("");
+                                    setFollowUpQuestion("");
+                                    chatInputRef.current?.focus();
                                 }}
                                 className="close-button"
                             >
-                                ×
+                                ↺
                             </button>
 
                             {/* Scrollable content */}
                             <div className="chat-content" ref={chatContentRef}>
+                                <div className="activation-live-indicator">
+                                    Memory activation: round{" "}
+                                    {activationFrame?.roundIndex || 0}, step{" "}
+                                    {activationFrame?.step || 0}
+                                </div>
                                 {chatHistory.map((entry, index) => (
                                     <div key={index} className="chat-entry">
                                         <div className="question">
@@ -1804,6 +2206,27 @@ function App() {
                                                 {entry.timestamp}
                                             </span>
                                         </div>
+                                        {(typeof entry.confidence === "number" ||
+                                            Array.isArray(entry.rounds)) && (
+                                            <div className="activation-meta">
+                                                {typeof entry.confidence ===
+                                                    "number" && (
+                                                    <span className="activation-chip">
+                                                        Confidence:{" "}
+                                                        {Math.round(
+                                                            entry.confidence * 100
+                                                        )}
+                                                        %
+                                                    </span>
+                                                )}
+                                                {Array.isArray(entry.rounds) && (
+                                                    <span className="activation-chip">
+                                                        Retrieval rounds:{" "}
+                                                        {entry.rounds.length}
+                                                    </span>
+                                                )}
+                                            </div>
+                                        )}
                                         <div className="answer">
                                             <strong>A:</strong>
                                             {entry.answer === null ? (
@@ -1889,28 +2312,14 @@ function App() {
                                                                                         e
                                                                                     ) => {
                                                                                         e.stopPropagation();
-                                                                                        setIsFadingOut(
-                                                                                            true
-                                                                                        );
-                                                                                        setTimeout(
-                                                                                            () => {
-                                                                                                setShowChatPanel(
-                                                                                                    false
-                                                                                                );
-                                                                                                setIsFadingOut(
-                                                                                                    false
-                                                                                                );
-                                                                                                // Focus on topic in graph
-                                                                                                if (
-                                                                                                    graphRef.current
-                                                                                                ) {
-                                                                                                    graphRef.current.focusOnTopic(
-                                                                                                        topic
-                                                                                                    );
-                                                                                                }
-                                                                                            },
-                                                                                            800
-                                                                                        );
+                                                                                        // Focus on topic in graph without closing chat.
+                                                                                        if (
+                                                                                            graphRef.current
+                                                                                        ) {
+                                                                                            graphRef.current.focusOnTopic(
+                                                                                                topic
+                                                                                            );
+                                                                                        }
                                                                                     }}
                                                                                 >
                                                                                     {
@@ -1969,29 +2378,194 @@ function App() {
                                                 </>
                                             ) : (
                                                 <>
-                                                    <div
-                                                        className="markdown-content"
-                                                        onClick={(e) => {
-                                                            if (
-                                                                e.target.classList.contains(
-                                                                    "paper-citation"
-                                                                )
-                                                            ) {
-                                                                const paperTitle =
-                                                                    e.target.getAttribute(
-                                                                        "data-paper-title"
-                                                                    );
-                                                                handlePaperCitationClick(
-                                                                    paperTitle
-                                                                );
-                                                            }
-                                                        }}
-                                                        dangerouslySetInnerHTML={{
-                                                            __html: processTextWithCitations(
+                                                    {(() => {
+                                                        const structured =
+                                                            normalizeStructuredAnswer(
+                                                                entry.answer_structured,
                                                                 entry.answer
-                                                            ),
-                                                        }}
-                                                    />
+                                                            );
+                                                        const claimsById = new Map(
+                                                            structured.claims.map(
+                                                                (claim) => [
+                                                                    claim.id,
+                                                                    claim,
+                                                                ]
+                                                            )
+                                                        );
+                                                        const hasInteractiveClaims =
+                                                            structured.claims.length >
+                                                            0;
+                                                        if (
+                                                            !hasInteractiveClaims
+                                                        ) {
+                                                            return (
+                                                                <div
+                                                                    className="markdown-content"
+                                                                    onClick={(e) => {
+                                                                        if (
+                                                                            e.target.classList.contains(
+                                                                                "paper-citation"
+                                                                            )
+                                                                        ) {
+                                                                            const paperTitle =
+                                                                                e.target.getAttribute(
+                                                                                    "data-paper-title"
+                                                                                );
+                                                                            handlePaperCitationClick(
+                                                                                paperTitle
+                                                                            );
+                                                                        }
+                                                                    }}
+                                                                    dangerouslySetInnerHTML={{
+                                                                        __html: processTextWithCitations(
+                                                                            entry.answer
+                                                                        ),
+                                                                    }}
+                                                                />
+                                                            );
+                                                        }
+                                                        return (
+                                                            <div className="markdown-content structured-answer">
+                                                                {structured.segments.map(
+                                                                    (
+                                                                        segment,
+                                                                        segmentIdx
+                                                                    ) => {
+                                                                        if (
+                                                                            !segment.claim_id
+                                                                        ) {
+                                                                            return (
+                                                                                <span
+                                                                                    key={`segment-${segmentIdx}`}
+                                                                                >
+                                                                                    {
+                                                                                        segment.text
+                                                                                    }
+                                                                                </span>
+                                                                            );
+                                                                        }
+                                                                        const claim =
+                                                                            claimsById.get(
+                                                                                segment.claim_id
+                                                                            );
+                                                                        const isPopoverOpen =
+                                                                            activeClaimPopover &&
+                                                                            activeClaimPopover.entryIndex ===
+                                                                                index &&
+                                                                            activeClaimPopover.claimId ===
+                                                                                segment.claim_id;
+                                                                        return (
+                                                                            <span
+                                                                                key={`segment-${segmentIdx}`}
+                                                                                className="claim-segment-wrapper"
+                                                                            >
+                                                                                <span
+                                                                                    className="claim-segment"
+                                                                                    role="button"
+                                                                                    tabIndex={0}
+                                                                                    onClick={() =>
+                                                                                        toggleClaimPopover(
+                                                                                            index,
+                                                                                            segment.claim_id
+                                                                                        )
+                                                                                    }
+                                                                                    onKeyDown={(
+                                                                                        event
+                                                                                    ) => {
+                                                                                        if (
+                                                                                            event.key ===
+                                                                                                "Enter" ||
+                                                                                            event.key ===
+                                                                                                " "
+                                                                                        ) {
+                                                                                            event.preventDefault();
+                                                                                            toggleClaimPopover(
+                                                                                                index,
+                                                                                                segment.claim_id
+                                                                                            );
+                                                                                        }
+                                                                                    }}
+                                                                                >
+                                                                                    {
+                                                                                        segment.text
+                                                                                    }
+                                                                                </span>
+                                                                                {isPopoverOpen &&
+                                                                                    claim && (
+                                                                                        <div className="claim-popover">
+                                                                                            <div className="claim-popover-title">
+                                                                                                Evidence
+                                                                                            </div>
+                                                                                            {claim.citations.map(
+                                                                                                (
+                                                                                                    citation,
+                                                                                                    cIdx
+                                                                                                ) => {
+                                                                                                    const paperDetails =
+                                                                                                        getPaperDetails(
+                                                                                                            citation.paper_title
+                                                                                                        );
+                                                                                                    return (
+                                                                                                        <div
+                                                                                                            key={`citation-${cIdx}`}
+                                                                                                            className="claim-citation-item"
+                                                                                                        >
+                                                                                                            <button
+                                                                                                                type="button"
+                                                                                                                className="claim-citation-paper"
+                                                                                                                onClick={() =>
+                                                                                                                    handlePaperCitationClick(
+                                                                                                                        citation.paper_title
+                                                                                                                    )
+                                                                                                                }
+                                                                                                            >
+                                                                                                                {
+                                                                                                                    citation.paper_title
+                                                                                                                }
+                                                                                                            </button>
+                                                                                                            {paperDetails?.authors &&
+                                                                                                                Array.isArray(
+                                                                                                                    paperDetails.authors
+                                                                                                                ) &&
+                                                                                                                paperDetails
+                                                                                                                    .authors
+                                                                                                                    .length >
+                                                                                                                    0 && (
+                                                                                                                    <div className="claim-citation-meta">
+                                                                                                                        {paperDetails.authors.join(
+                                                                                                                            ", "
+                                                                                                                        )}
+                                                                                                                    </div>
+                                                                                                                )}
+                                                                                                            <div className="claim-citation-excerpt">
+                                                                                                                "
+                                                                                                                {
+                                                                                                                    citation.excerpt
+                                                                                                                }
+                                                                                                                "
+                                                                                                            </div>
+                                                                                                        </div>
+                                                                                                    );
+                                                                                                }
+                                                                                            )}
+                                                                                        </div>
+                                                                                    )}
+                                                                            </span>
+                                                                        );
+                                                                    }
+                                                                )}
+                                                                {structured.warnings
+                                                                    .length >
+                                                                    0 && (
+                                                                    <div className="claim-warnings">
+                                                                        {structured.warnings.join(
+                                                                            " "
+                                                                        )}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        );
+                                                    })()}
                                                     {/* {entry.mermaid && (
                                                         <div
                                                             style={{
@@ -2025,24 +2599,14 @@ function App() {
                                                         </div>
                                                     )} */}
                                                     {entry.sources_used && entry.sources_used.length > 0 && (
-                                                        <div className="sources-section" style={{
-                                                            marginTop: "15px",
-                                                            paddingTop: "15px",
-                                                            borderTop: isDarkMode ? "1px solid #444" : "1px solid #ddd"
-                                                        }}>
-                                                            <strong>Sources:</strong>
-                                                            <div style={{ marginTop: "8px" }}>
+                                                        <div className="sources-section">
+                                                            <strong className="sources-title">Sources:</strong>
+                                                            <div className="sources-list">
                                                                 {entry.sources_used.map((source, sIdx) => (
                                                                     <div
                                                                         key={sIdx}
                                                                         className="source-item"
                                                                         onClick={() => handlePaperCitationClick(source)}
-                                                                        style={{
-                                                                            color: "#4CAF50",
-                                                                            cursor: "pointer",
-                                                                            textDecoration: "underline",
-                                                                            marginBottom: "4px"
-                                                                        }}
                                                                     >
                                                                         {source}
                                                                     </div>

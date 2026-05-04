@@ -185,6 +185,7 @@ async function parseResponseError(response) {
 const TopicWorkspace = forwardRef(function TopicWorkspace({
     graphData,
     workspaceStore,
+    desktopConfig = {},
     onFocusPaper,
     onSetGraphHighlight,
     onResolveReadingUrl,
@@ -1066,6 +1067,7 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                         onUpdatePaperAnnotation={actions.upsertPaperAnnotation}
                         onRequestSimilarPapers={requestPaperRecommendations}
                         onAddRecommendationToReadingList={addRecommendationToReadingList}
+                        desktopConfig={desktopConfig}
                     />
                     <div
                         className="topic-resizer topic-resizer-vertical"
