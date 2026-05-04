@@ -33,6 +33,21 @@ function renderList(overrides = {}) {
 }
 
 describe("PaperWorkbenchList recommendations", () => {
+    test("selects requested paper using normalized title matching", async () => {
+        renderList({
+            requestedPaperTitle: "  neuro-symbolic program synthesis  ",
+        });
+
+        await waitFor(() =>
+            expect(
+                screen.getByRole("heading", {
+                    level: 4,
+                    name: "Neuro-Symbolic Program Synthesis",
+                })
+            ).toBeTruthy()
+        );
+    });
+
     test("fetches similar papers for selected paper", async () => {
         const onRequestSimilarPapers = jest.fn().mockResolvedValue([
             { paperId: "rec-1", title: "Composable Neuro-Symbolic Inference" },

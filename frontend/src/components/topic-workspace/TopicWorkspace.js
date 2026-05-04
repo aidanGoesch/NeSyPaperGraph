@@ -56,6 +56,10 @@ function normalizeToken(value) {
     return String(value || "").trim().toLowerCase();
 }
 
+function normalizePaperTitle(value) {
+    return String(value || "").trim().toLowerCase();
+}
+
 function scoreLocalSimilarity(seedPaper, candidatePaper) {
     if (!seedPaper || !candidatePaper) return 0;
     const seedTopics = new Set((seedPaper.topics || []).map(normalizeToken).filter(Boolean));
@@ -190,6 +194,7 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
     const [hasAutoSelectedCluster, setHasAutoSelectedCluster] = useState(false);
     const [selectedThemeId, setSelectedThemeId] = useState(null);
     const [requestedPaperTitle, setRequestedPaperTitle] = useState(null);
+    const [requestedPaperNonce, setRequestedPaperNonce] = useState(0);
     const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
     const [themeModalPaperTitle, setThemeModalPaperTitle] = useState(null);
     const [paperRenderLimit, setPaperRenderLimit] = useState(
@@ -255,8 +260,11 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
 
     useEffect(() => {
         if (!requestedPaperTitle) return;
+        const requestedKey = normalizePaperTitle(requestedPaperTitle);
         const requestedIndex = filteredPapers.findIndex(
-            (paper) => paper.title === requestedPaperTitle
+            (paper) =>
+                paper.title === requestedPaperTitle ||
+                normalizePaperTitle(paper.title) === requestedKey
         );
         if (requestedIndex >= 0 && requestedIndex + 1 > paperRenderLimit) {
             setPaperRenderLimit(
@@ -645,19 +653,20 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
 
     const openSearchResultInPaperTab = (result) => {
         if (!result?.title) return;
-        const existsInGraph = (graphData?.papers || []).some(
-            (paper) => paper?.title === result.title
+        const resultKey = normalizePaperTitle(result.title);
+        const matchedGraphPaper = (graphData?.papers || []).find(
+            (paper) =>
+                paper?.title === result.title ||
+                normalizePaperTitle(paper?.title) === resultKey
         );
-        if (!existsInGraph) {
+        if (!matchedGraphPaper) {
             const browserUrl = recommendationBrowserUrl(result);
             if (browserUrl) {
                 window.open(browserUrl, "_blank", "noopener,noreferrer");
             }
             return;
         }
-        setSelectedClusterId(null);
-        setSelectedTreeNode(null);
-        setRequestedPaperTitle(result.title);
+        openPaperInWorkbench(matchedGraphPaper.title);
         setIsResultOverlayOpen(false);
         setSelectedSearchResult(null);
     };
@@ -686,6 +695,17 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
         topicRecommendationState === "loading" ||
         topicRecommendationState === "error" ||
         (topicRecommendationState === "success" && topicRecommendations.length > 0);
+
+    const openPaperInWorkbench = (paperTitle, options = {}) => {
+        const { flash = false } = options;
+        if (!paperTitle) return;
+        setSelectedClusterId(null);
+        setSelectedTreeNode(null);
+        setRequestedPaperTitle(paperTitle);
+        if (flash) {
+            setRequestedPaperNonce((prev) => prev + 1);
+        }
+    };
 
     return (
         <div
@@ -1003,8 +1023,8 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                             setSelectedClusterId(null);
                             setSelectedTreeNode(null);
                         }}
-                        onFocusPaper={onFocusPaper}
                         requestedPaperTitle={requestedPaperTitle}
+                        requestedPaperNonce={requestedPaperNonce}
                         onOpenThemeAssignmentModal={(paperTitle) => {
                             setThemeModalPaperTitle(paperTitle);
                             setIsThemeModalOpen(true);
@@ -1029,9 +1049,7 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                         onUpsertTheme={actions.upsertThemeNote}
                         onReorderReadingItem={actions.reorderReadingItem}
                         onSelectThemePaper={(paperTitle) => {
-                            setSelectedClusterId(null);
-                            setSelectedTreeNode(null);
-                            setRequestedPaperTitle(paperTitle);
+                            openPaperInWorkbench(paperTitle);
                         }}
                         onRequestThemeRecommendations={requestThemeRecommendations}
                         onAddRecommendationToReadingList={
@@ -1064,9 +1082,7 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                     }
                     actions.removeReadingItem(item.id);
                     if (result?.paper_title) {
-                        setSelectedClusterId(null);
-                        setSelectedTreeNode(null);
-                        setRequestedPaperTitle(result.paper_title);
+                        openPaperInWorkbench(result.paper_title, { flash: true });
                     }
                 }}
             />

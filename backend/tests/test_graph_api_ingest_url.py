@@ -133,3 +133,67 @@ def test_ingest_url_reports_duplicate_and_keeps_graph_unchanged(client, monkeypa
     assert payload["status"] == "skipped"
     assert payload["reason"] == "duplicate_title"
     assert len(payload["graph"]["papers"]) == 1
+
+
+def test_ingest_url_duplicate_returns_canonical_existing_title(client, monkeypatch):
+    import api.graph as graph_api
+
+    class _FakeSemanticScholarService:
+        def hydrate_paper(self, url: str, paper_id: str | None = None):
+            _ = paper_id
+            return {
+                "url": url,
+                "semanticScholarPaperId": "paper-123",
+                "title": "Attention Is All You Need",
+                "authors": ["Ashish Vaswani"],
+                "year": 2017,
+                "venue": "NeurIPS",
+                "abstract": "Transformer abstract",
+            }
+
+    class _FakeClient:
+        def generate_embeddings(self, texts):
+            return [[0.1, 0.2, 0.3] for _ in texts]
+
+        def generate_topic_synonyms(self, topics):
+            return {topic: [] for topic in topics}
+
+    class _FakeTopicExtractor:
+        def __init__(self, _client):
+            pass
+
+        def extract_topics(self, text, current_topics=None, max_chars=8000):
+            _ = text
+            _ = current_topics
+            _ = max_chars
+            return ["Attention Mechanisms"]
+
+    monkeypatch.setattr(graph_api, "SemanticScholarService", _FakeSemanticScholarService)
+    monkeypatch.setattr(graph_api, "OpenAILLMClient", _FakeClient)
+    monkeypatch.setattr(graph_api, "TopicExtractor", _FakeTopicExtractor)
+    monkeypatch.setattr("services.verification.verify_bipartite", lambda *args, **kwargs: True)
+    monkeypatch.setattr("services.verification.find_optimal_topic_merge", lambda *_: {})
+
+    graph = PaperGraph()
+    graph.add_paper(
+        Paper(
+            title="Attention Is All You Need (ArXiv mirror)",
+            file_path="https://arxiv.org/abs/1706.03762",
+            content_hash="semantic_scholar:paper-123",
+            summary="Transformer abstract",
+            authors=["Ashish Vaswani"],
+            publication_date="2017",
+            topics=["Attention Mechanisms"],
+            embedding=[0.1, 0.2, 0.3],
+        )
+    )
+    client.app.state.graph = graph
+
+    response = client.post(
+        "/api/graph/ingest-url",
+        json={"url": "https://arxiv.org/abs/1706.03762", "semanticScholarPaperId": "paper-123"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "skipped"
+    assert payload["paper_title"] == "Attention Is All You Need (ArXiv mirror)"

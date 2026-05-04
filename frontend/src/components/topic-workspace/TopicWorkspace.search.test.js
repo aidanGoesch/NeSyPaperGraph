@@ -235,6 +235,42 @@ describe("TopicWorkspace inferred search", () => {
         );
     });
 
+    test("search result open uses normalized title lookup", async () => {
+        const apiFetch = jest.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({
+                status: "success",
+                results: [
+                    {
+                        title: "  neural program repair for code  ",
+                        authors: ["Alice Chen"],
+                        publication_date: "2023",
+                        topics: ["Program Repair"],
+                        summary: "Repair methods.",
+                        score: 0.72,
+                        score_breakdown: {},
+                    },
+                ],
+            }),
+        });
+        renderWorkspace({ apiFetch });
+
+        const input = screen.getByPlaceholderText("Search papers, authors, or topics");
+        fireEvent.change(input, { target: { value: "program repair chen" } });
+        fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+        act(() => {
+            jest.advanceTimersByTime(350);
+        });
+
+        await waitFor(() =>
+            expect(screen.getByText(/neural program repair for code/i)).toBeTruthy()
+        );
+        fireEvent.click(screen.getByText("Open paper"));
+        expect(lastPaperWorkbenchProps.requestedPaperTitle).toBe(
+            "Neural Program Repair for Code"
+        );
+    });
+
     test("clicking a search result opens details popup and adds to reading list", async () => {
         const workspaceStore = makeWorkspaceStore();
         const apiFetch = jest.fn().mockResolvedValue({

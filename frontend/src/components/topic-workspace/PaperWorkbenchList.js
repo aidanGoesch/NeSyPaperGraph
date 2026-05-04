@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 function normalizeAuthor(authors) {
     if (!authors) return "Unknown";
@@ -18,6 +18,10 @@ function recommendationBrowserUrl(paper) {
     return "";
 }
 
+function normalizePaperTitle(title) {
+    return String(title || "").trim().toLowerCase();
+}
+
 export default function PaperWorkbenchList({
     papers,
     totalPaperCount,
@@ -27,11 +31,11 @@ export default function PaperWorkbenchList({
     selectedTopicLabel,
     hasActiveFilter,
     onClearFilters,
-    onFocusPaper,
     onOpenThemeAssignmentModal,
     getPaperAnnotation,
     onUpdatePaperAnnotation,
     requestedPaperTitle,
+    requestedPaperNonce = 0,
     onRequestSimilarPapers,
     onAddRecommendationToReadingList,
 }) {
@@ -41,16 +45,38 @@ export default function PaperWorkbenchList({
     const [similarError, setSimilarError] = useState("");
     const [expandedSimilarKey, setExpandedSimilarKey] = useState(null);
     const [isNoteModalOpen, setIsNoteModalOpen] = useState(false);
+    const [flashPaperTitle, setFlashPaperTitle] = useState(null);
+    const flashTimerRef = useRef(null);
 
     useEffect(() => {
         if (!requestedPaperTitle) return;
-        const existsInList = papers.some(
-            (paper) => paper.title === requestedPaperTitle
+        const requestedKey = normalizePaperTitle(requestedPaperTitle);
+        const matchedPaper = papers.find(
+            (paper) =>
+                paper.title === requestedPaperTitle ||
+                normalizePaperTitle(paper.title) === requestedKey
         );
-        if (existsInList) {
-            setSelectedPaperTitle(requestedPaperTitle);
+        if (matchedPaper?.title) {
+            setSelectedPaperTitle(matchedPaper.title);
+            if (requestedPaperNonce > 0) {
+                setFlashPaperTitle(matchedPaper.title);
+                if (flashTimerRef.current) {
+                    clearTimeout(flashTimerRef.current);
+                }
+                flashTimerRef.current = setTimeout(() => {
+                    setFlashPaperTitle((current) =>
+                        current === matchedPaper.title ? null : current
+                    );
+                }, 1000);
+            }
         }
-    }, [requestedPaperTitle, papers]);
+        return () => {
+            if (flashTimerRef.current) {
+                clearTimeout(flashTimerRef.current);
+                flashTimerRef.current = null;
+            }
+        };
+    }, [requestedPaperTitle, requestedPaperNonce, papers]);
 
     const selectedPaper = useMemo(
         () => papers.find((paper) => paper.title === selectedPaperTitle) || null,
@@ -103,6 +129,8 @@ export default function PaperWorkbenchList({
                             type="button"
                             className={`paper-list-item ${
                                 selectedPaperTitle === paper.title ? "active" : ""
+                            } ${
+                                flashPaperTitle === paper.title ? "paper-list-item-flash" : ""
                             }`}
                             onClick={() => setSelectedPaperTitle(paper.title)}
                         >
@@ -121,7 +149,14 @@ export default function PaperWorkbenchList({
                         </button>
                     )}
                 </div>
-                <div className="paper-details">
+                <div
+                    className={`paper-details ${
+                        selectedPaper?.title &&
+                        flashPaperTitle === selectedPaper.title
+                            ? "paper-details-flash"
+                            : ""
+                    }`}
+                >
                     {selectedPaper ? (
                         <>
                             <h4>{selectedPaper.title}</h4>
@@ -133,12 +168,6 @@ export default function PaperWorkbenchList({
                                 {selectedPaper.abstract || "No summary available."}
                             </p>
                             <div className="paper-actions">
-                                <button
-                                    type="button"
-                                    onClick={() => onFocusPaper(selectedPaper.title)}
-                                >
-                                    Focus in Graph
-                                </button>
                                 <button
                                     type="button"
                                     onClick={() =>
@@ -242,19 +271,6 @@ export default function PaperWorkbenchList({
                                                                     "No summary available."}
                                                             </p>
                                                             <div className="paper-actions">
-                                                                {paper.source === "graph" &&
-                                                                    paper.title && (
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={() =>
-                                                                            onFocusPaper(
-                                                                                paper.title
-                                                                            )
-                                                                        }
-                                                                    >
-                                                                        Focus in Graph
-                                                                    </button>
-                                                                )}
                                                                 {paper.source !== "graph" &&
                                                                     onAddRecommendationToReadingList && (
                                                                         <button

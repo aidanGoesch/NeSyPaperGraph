@@ -18,6 +18,14 @@ def verify_bipartite(pg: PaperGraph, new_nodes: set = None, new_edges: set = Non
 
     solver = Solver()
 
+    tracked_edge_details = {}
+    edge_index = 0
+
+    def should_check_edge(node1: str, node2: str) -> bool:
+        edge_attrs = pg.graph.get_edge_data(node1, node2) or {}
+        # Semantic (paper-paper) edges are intentionally excluded from bipartite checks.
+        return edge_attrs.get("type") != "semantic"
+
     # If incremental, only check new elements
     if new_nodes is not None or new_edges is not None:
         # Construct mapping only for relevant nodes
@@ -43,8 +51,19 @@ def verify_bipartite(pg: PaperGraph, new_nodes: set = None, new_edges: set = Non
         # Only check new edges
         edges_to_check = new_edges if new_edges else []
         for node1, node2 in edges_to_check:
+            if not should_check_edge(node1, node2):
+                continue
             if node1 in is_paper and node2 in is_paper:
-                solver.assert_and_track(Xor(is_paper[node1], is_paper[node2]), f"edge_{node1}_{node2}")
+                edge_label = f"edge_{edge_index}"
+                edge_index += 1
+                solver.assert_and_track(Xor(is_paper[node1], is_paper[node2]), edge_label)
+                tracked_edge_details[edge_label] = {
+                    "node1": node1,
+                    "node2": node2,
+                    "node1_type": pg.graph.nodes[node1].get("type"),
+                    "node2_type": pg.graph.nodes[node2].get("type"),
+                    "edge_type": (pg.graph.get_edge_data(node1, node2) or {}).get("type", "topic"),
+                }
     else:
         # Full verification (original behavior)
         is_paper = {node: Bool(f"paper_{node.replace(' ', '_')}") for node in pg.graph.nodes()}
@@ -56,7 +75,18 @@ def verify_bipartite(pg: PaperGraph, new_nodes: set = None, new_edges: set = Non
                 solver.add(Not(is_paper[node]))
 
         for node1, node2 in pg.graph.edges():
-            solver.assert_and_track(Xor(is_paper[node1], is_paper[node2]), f"edge_{node1}_{node2}")
+            if not should_check_edge(node1, node2):
+                continue
+            edge_label = f"edge_{edge_index}"
+            edge_index += 1
+            solver.assert_and_track(Xor(is_paper[node1], is_paper[node2]), edge_label)
+            tracked_edge_details[edge_label] = {
+                "node1": node1,
+                "node2": node2,
+                "node1_type": pg.graph.nodes[node1].get("type"),
+                "node2_type": pg.graph.nodes[node2].get("type"),
+                "edge_type": (pg.graph.get_edge_data(node1, node2) or {}).get("type", "topic"),
+            }
 
     result = solver.check()
 
@@ -68,7 +98,16 @@ def verify_bipartite(pg: PaperGraph, new_nodes: set = None, new_edges: set = Non
         print("constraints are unsatisfied")
         print("problem edges:")
         for edge in solver.unsat_core():
-            print("\t" + str(edge))
+            detail = tracked_edge_details.get(str(edge))
+            if detail:
+                print(
+                    "\t"
+                    + f"{detail['node1']} ({detail['node1_type']})"
+                    + f" --[{detail['edge_type']}]-- "
+                    + f"{detail['node2']} ({detail['node2_type']})"
+                )
+            else:
+                print("\t" + str(edge))
         return False
     
     return False

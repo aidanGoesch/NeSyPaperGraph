@@ -3,6 +3,7 @@ import time
 import json
 import asyncio
 import hashlib
+import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -58,6 +59,13 @@ class IngestUrlRequest(BaseModel):
     authors: list[str] | None = None
     year: int | None = None
     venue: str | None = None
+
+
+def _normalize_title_lookup(title: str | None) -> str:
+    value = (title or "").lower()
+    value = re.sub(r"[^\w\s]", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
 
 
 def prune_jobs(jobs: dict) -> None:
@@ -686,10 +694,30 @@ async def ingest_url_paper(request: Request, payload: IngestUrlRequest):
                 "graph": build_graph_payload(updated_graph),
             }
 
+        canonical_duplicate_title = (semantic_payload.get("title") or "").strip()
+        lookup_title = _normalize_title_lookup(canonical_duplicate_title)
+        semantic_scholar_id = (semantic_payload.get("semanticScholarPaperId") or "").strip()
+        lookup_hash = f"semantic_scholar:{semantic_scholar_id}" if semantic_scholar_id else ""
+        for node, data in updated_graph.graph.nodes(data=True):
+            if data.get("type") != "paper":
+                continue
+            paper_data = data.get("data")
+            candidate_title = (getattr(paper_data, "title", None) or str(node)).strip()
+            candidate_hash = (getattr(paper_data, "content_hash", None) or "").strip()
+            if lookup_hash and candidate_hash == lookup_hash:
+                canonical_duplicate_title = candidate_title
+                break
+            if (
+                lookup_title
+                and _normalize_title_lookup(candidate_title) == lookup_title
+            ):
+                canonical_duplicate_title = candidate_title
+                break
+
         return {
             "status": "skipped",
             "reason": "duplicate_title",
-            "paper_title": semantic_payload.get("title"),
+            "paper_title": canonical_duplicate_title or semantic_payload.get("title"),
             "graph": build_graph_payload(updated_graph),
         }
     except HTTPException:
