@@ -37,6 +37,7 @@ export default function ToReadInbox({
     onFocusPaper,
     onResolveReadingUrl,
     onMarkReadingItemDone,
+    onOpenReadingItem,
 }) {
     const [urlInput, setUrlInput] = useState("");
     const [titleInput, setTitleInput] = useState("");
@@ -322,15 +323,17 @@ export default function ToReadInbox({
                                     </small>
                                 )}
                             </div>
-                            {item.url && (
-                                <a
-                                    href={item.url}
-                                    target="_blank"
-                                    rel="noreferrer"
+                            {item.url && item.status !== "done" && (
+                                <button
+                                    type="button"
                                     className="open-link-button"
+                                    onClick={() => {
+                                        if (!onOpenReadingItem) return;
+                                        onOpenReadingItem(item);
+                                    }}
                                 >
                                     Open
-                                </a>
+                                </button>
                             )}
                             <div className="inbox-controls inbox-controls-inline">
                                 <select

@@ -60,6 +60,17 @@ function normalizePaperTitle(value) {
     return String(value || "").trim().toLowerCase();
 }
 
+function deriveReaderTitleFromUrl(url) {
+    if (!url) return "";
+    try {
+        const parsed = new URL(url);
+        const lastPath = parsed.pathname.split("/").filter(Boolean).pop();
+        return lastPath ? decodeURIComponent(lastPath).slice(0, 80) : parsed.hostname;
+    } catch {
+        return "";
+    }
+}
+
 function scoreLocalSimilarity(seedPaper, candidatePaper) {
     if (!seedPaper || !candidatePaper) return 0;
     const seedTopics = new Set((seedPaper.topics || []).map(normalizeToken).filter(Boolean));
@@ -195,6 +206,8 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
     const [selectedThemeId, setSelectedThemeId] = useState(null);
     const [requestedPaperTitle, setRequestedPaperTitle] = useState(null);
     const [requestedPaperNonce, setRequestedPaperNonce] = useState(0);
+    const [requestedReaderItem, setRequestedReaderItem] = useState(null);
+    const [requestedReaderNonce, setRequestedReaderNonce] = useState(0);
     const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
     const [themeModalPaperTitle, setThemeModalPaperTitle] = useState(null);
     const [paperRenderLimit, setPaperRenderLimit] = useState(
@@ -707,6 +720,24 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
         }
     };
 
+    const openReadingItemInPopup = (item) => {
+        if (!item || item.status === "done") return;
+        const readerTitle = item.linkedPaperTitle || item.title || deriveReaderTitleFromUrl(item.url);
+        if (readerTitle) {
+            openPaperInWorkbench(readerTitle);
+        }
+        setRequestedReaderItem({
+            title: readerTitle || "Untitled paper",
+            annotationKey: readerTitle || item.url || null,
+            url: item.url || "",
+            authors: Array.isArray(item.authors) ? item.authors : [],
+            publication_date: item.year ? String(item.year) : "",
+            venue: item.venue || "",
+            status: item.status || "inbox",
+        });
+        setRequestedReaderNonce((prev) => prev + 1);
+    };
+
     return (
         <div
             className="topic-workspace"
@@ -1025,6 +1056,8 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                         }}
                         requestedPaperTitle={requestedPaperTitle}
                         requestedPaperNonce={requestedPaperNonce}
+                        requestedReaderItem={requestedReaderItem}
+                        requestedReaderNonce={requestedReaderNonce}
                         onOpenThemeAssignmentModal={(paperTitle) => {
                             setThemeModalPaperTitle(paperTitle);
                             setIsThemeModalOpen(true);
@@ -1085,6 +1118,7 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                         openPaperInWorkbench(result.paper_title, { flash: true });
                     }
                 }}
+                onOpenReadingItem={openReadingItemInPopup}
             />
             {isThemeModalOpen && themeModalPaperTitle && (
                 <ThemeAssignmentModal

@@ -55,7 +55,7 @@ describe("PaperWorkbenchList recommendations", () => {
         renderList({ onRequestSimilarPapers });
 
         fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
-        fireEvent.click(screen.getByText("See similar papers"));
+        fireEvent.click(screen.getAllByText("See similar papers")[0]);
 
         await waitFor(() =>
             expect(onRequestSimilarPapers).toHaveBeenCalledWith(
@@ -66,8 +66,8 @@ describe("PaperWorkbenchList recommendations", () => {
         );
         await waitFor(() =>
             expect(
-                screen.getByText("Composable Neuro-Symbolic Inference")
-            ).toBeTruthy()
+                screen.getAllByText("Composable Neuro-Symbolic Inference").length
+            ).toBeGreaterThan(0)
         );
     });
 
@@ -78,14 +78,16 @@ describe("PaperWorkbenchList recommendations", () => {
         renderList({ onRequestSimilarPapers });
 
         fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
-        fireEvent.click(screen.getByText("See similar papers"));
+        fireEvent.click(screen.getAllByText("See similar papers")[0]);
 
         await waitFor(() =>
-            expect(screen.getByText(/Failed to load recommendations/i)).toBeTruthy()
+            expect(screen.getAllByText(/Failed to load recommendations/i).length).toBeGreaterThan(
+                0
+            )
         );
     });
 
-    test("opens full note editor modal and updates note text", async () => {
+    test("opens split paper reader modal and updates note text", async () => {
         const onUpdatePaperAnnotation = jest.fn();
         renderList({
             getPaperAnnotation: jest.fn(() => ({ notesMarkdown: "Seed note" })),
@@ -93,17 +95,49 @@ describe("PaperWorkbenchList recommendations", () => {
         });
 
         fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
-        fireEvent.click(screen.getByRole("button", { name: "Seed note" }));
+        fireEvent.click(screen.getByRole("button", { name: "Open paper" }));
 
-        expect(screen.getByRole("dialog")).toBeTruthy();
+        expect(
+            screen.getByRole("dialog", { name: "Paper reader and notes" })
+        ).toBeTruthy();
         const modalTextarea = screen.getByPlaceholderText(
-            "Capture paper-specific insights and how they connect to topics."
+            "Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets, and paste screenshots directly."
         );
         fireEvent.change(modalTextarea, { target: { value: "Expanded note text" } });
 
         expect(onUpdatePaperAnnotation).toHaveBeenCalledWith(
             "Neuro-Symbolic Program Synthesis",
             { notesMarkdown: "Expanded note text" }
+        );
+    });
+
+    test("supports tab indentation and enter continuation for bullet notes", () => {
+        const onUpdatePaperAnnotation = jest.fn();
+        renderList({
+            getPaperAnnotation: jest.fn(() => ({ notesMarkdown: "- item" })),
+            onUpdatePaperAnnotation,
+        });
+
+        fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
+        fireEvent.click(screen.getByRole("button", { name: "Open paper" }));
+        const modalTextarea = screen.getByPlaceholderText(
+            "Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets, and paste screenshots directly."
+        );
+
+        modalTextarea.selectionStart = 0;
+        modalTextarea.selectionEnd = "- item".length;
+        fireEvent.keyDown(modalTextarea, { key: "Tab", code: "Tab" });
+        expect(onUpdatePaperAnnotation).toHaveBeenCalledWith(
+            "Neuro-Symbolic Program Synthesis",
+            { notesMarkdown: "  - item" }
+        );
+
+        modalTextarea.selectionStart = "- item".length;
+        modalTextarea.selectionEnd = "- item".length;
+        fireEvent.keyDown(modalTextarea, { key: "Enter", code: "Enter" });
+        expect(onUpdatePaperAnnotation).toHaveBeenCalledWith(
+            "Neuro-Symbolic Program Synthesis",
+            { notesMarkdown: "- item\n- " }
         );
     });
 });
