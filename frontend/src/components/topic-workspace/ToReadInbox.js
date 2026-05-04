@@ -120,7 +120,7 @@ export default function ToReadInbox({
 
         onAddReadingItem({
             sourceType: "url",
-            url: trimmedUrl,
+            url: resolvedMetadata?.url || trimmedUrl,
             title: titleInput.trim() || resolvedMetadata?.title || fallbackTitle,
             status: statusInput,
             linkedThemeId: themeInput || null,

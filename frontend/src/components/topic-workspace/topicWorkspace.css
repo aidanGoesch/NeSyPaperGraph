@@ -926,6 +926,29 @@
   display: inline-flex;
 }
 
+.paper-reader-link-fallback {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.paper-reader-manual-link-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.paper-reader-manual-link-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid rgba(0, 0, 0, 0.16);
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.95);
+  color: inherit;
+}
+
 .paper-notes-pane {
   display: flex;
   flex-direction: column;
@@ -1009,6 +1032,11 @@
 
 .app.dark .paper-reader-webview {
   border-color: rgba(255, 255, 255, 0.24);
+}
+
+.app.dark .paper-reader-manual-link-input {
+  border-color: rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .app.dark .paper-note-modal-textarea {

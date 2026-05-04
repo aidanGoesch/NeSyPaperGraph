@@ -1,4 +1,5 @@
 import React, {
+    useCallback,
     forwardRef,
     useDeferredValue,
     useEffect,
@@ -189,6 +190,7 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
     onFocusPaper,
     onSetGraphHighlight,
     onResolveReadingUrl,
+    onResolvePaperMetadata,
     onIngestReadingItem,
     apiBase,
     apiFetch,
@@ -710,7 +712,7 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
         topicRecommendationState === "error" ||
         (topicRecommendationState === "success" && topicRecommendations.length > 0);
 
-    const openPaperInWorkbench = (paperTitle, options = {}) => {
+    const openPaperInWorkbench = useCallback((paperTitle, options = {}) => {
         const { flash = false } = options;
         if (!paperTitle) return;
         setSelectedClusterId(null);
@@ -719,9 +721,9 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
         if (flash) {
             setRequestedPaperNonce((prev) => prev + 1);
         }
-    };
+    }, []);
 
-    const openReadingItemInPopup = (item) => {
+    const openReadingItemInPopup = useCallback((item) => {
         if (!item || item.status === "done") return;
         const readerTitle = item.linkedPaperTitle || item.title || deriveReaderTitleFromUrl(item.url);
         if (readerTitle) {
@@ -737,7 +739,32 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
             status: item.status || "inbox",
         });
         setRequestedReaderNonce((prev) => prev + 1);
-    };
+    }, [openPaperInWorkbench]);
+
+    useEffect(() => {
+        if (!desktopConfig?.isDesktop) return undefined;
+        const bridge = window?.desktopBridge;
+        if (!bridge?.onOpenInReaderUrl) return undefined;
+
+        const unsubscribe = bridge.onOpenInReaderUrl((url) => {
+            if (!url || typeof url !== "string") return;
+            openReadingItemInPopup({
+                title: deriveReaderTitleFromUrl(url),
+                linkedPaperTitle: null,
+                url,
+                authors: [],
+                year: null,
+                venue: null,
+                status: "reading",
+            });
+        });
+
+        return () => {
+            if (typeof unsubscribe === "function") {
+                unsubscribe();
+            }
+        };
+    }, [desktopConfig?.isDesktop, openReadingItemInPopup]);
 
     return (
         <div
@@ -1067,6 +1094,7 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                         onUpdatePaperAnnotation={actions.upsertPaperAnnotation}
                         onRequestSimilarPapers={requestPaperRecommendations}
                         onAddRecommendationToReadingList={addRecommendationToReadingList}
+                        onResolvePaperMetadata={onResolvePaperMetadata}
                         desktopConfig={desktopConfig}
                     />
                     <div

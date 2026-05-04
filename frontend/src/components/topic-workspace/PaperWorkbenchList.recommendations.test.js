@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import PaperWorkbenchList from "./PaperWorkbenchList";
 
@@ -15,6 +15,7 @@ function renderList(overrides = {}) {
                 publication_date: "2024",
                 abstract: "Combines neural and symbolic systems.",
                 topics: ["Neurosymbolic AI"],
+                url: "https://example.org/paper/neuro-symbolic",
             },
         ],
         totalPaperCount: 1,
@@ -33,6 +34,67 @@ function renderList(overrides = {}) {
         ...overrides,
     };
     render(<PaperWorkbenchList {...props} />);
+    return props;
+}
+
+function renderListWithAnnotationState(overrides = {}) {
+    const props = {
+        papers: [
+            {
+                title: "Neuro-Symbolic Program Synthesis",
+                authors: ["A. Author"],
+                publication_date: "2024",
+                abstract: "Combines neural and symbolic systems.",
+                topics: ["Neurosymbolic AI"],
+            },
+        ],
+        onResolvePaperMetadata: jest.fn(),
+        ...overrides,
+    };
+
+    function Wrapper() {
+        const [annotations, setAnnotations] = useState({});
+        return (
+            <PaperWorkbenchList
+                papers={props.papers}
+                totalPaperCount={props.papers.length}
+                hasMorePapers={false}
+                onLoadMorePapers={jest.fn()}
+                selectedTopic={null}
+                selectedTopicLabel={null}
+                hasActiveFilter={false}
+                onClearFilters={jest.fn()}
+                onOpenThemeAssignmentModal={jest.fn()}
+                getPaperAnnotation={(paperTitle) =>
+                    annotations[paperTitle] || {
+                        paperTitle,
+                        notesMarkdown: "",
+                        sourceUrl: "",
+                        topicLinks: [],
+                        status: "unread",
+                    }
+                }
+                onUpdatePaperAnnotation={(paperTitle, patch) => {
+                    setAnnotations((previous) => ({
+                        ...previous,
+                        [paperTitle]: {
+                            paperTitle,
+                            notesMarkdown: "",
+                            sourceUrl: "",
+                            topicLinks: [],
+                            status: "unread",
+                            ...(previous[paperTitle] || {}),
+                            ...patch,
+                        },
+                    }));
+                }}
+                onRequestSimilarPapers={jest.fn().mockResolvedValue([])}
+                onResolvePaperMetadata={props.onResolvePaperMetadata}
+            />
+        );
+    }
+
+    render(<Wrapper />);
     return props;
 }
 
@@ -93,13 +155,17 @@ describe("PaperWorkbenchList recommendations", () => {
 
     test("opens split paper reader modal and updates note text", async () => {
         const onUpdatePaperAnnotation = jest.fn();
+        const onResolvePaperMetadata = jest.fn().mockResolvedValue({
+            url: "https://arxiv.org/abs/1706.03762",
+        });
         renderList({
             getPaperAnnotation: jest.fn(() => ({ notesMarkdown: "Seed note" })),
             onUpdatePaperAnnotation,
+            onResolvePaperMetadata,
         });
 
         fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
-        fireEvent.click(screen.getByRole("button", { name: "Open paper" }));
+        fireEvent.click(screen.getByRole("button", { name: "Seed note" }));
 
         expect(
             screen.getByRole("dialog", { name: "Paper reader and notes" })
@@ -115,15 +181,45 @@ describe("PaperWorkbenchList recommendations", () => {
         );
     });
 
-    test("supports tab indentation and enter continuation for bullet notes", () => {
+    test("stores existing paper url on note-open when annotation url is missing", async () => {
         const onUpdatePaperAnnotation = jest.fn();
         renderList({
-            getPaperAnnotation: jest.fn(() => ({ notesMarkdown: "- item" })),
             onUpdatePaperAnnotation,
+            getPaperAnnotation: jest.fn(() => ({
+                paperTitle: "Neuro-Symbolic Program Synthesis",
+                notesMarkdown: "",
+                sourceUrl: "",
+            })),
         });
 
         fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
-        fireEvent.click(screen.getByRole("button", { name: "Open paper" }));
+        fireEvent.click(
+            screen.getByRole("button", {
+                name: /No note yet\. Click to open the split paper reader popup\./i,
+            })
+        );
+
+        await waitFor(() =>
+            expect(onUpdatePaperAnnotation).toHaveBeenCalledWith(
+                "Neuro-Symbolic Program Synthesis",
+                { sourceUrl: "https://example.org/paper/neuro-symbolic" }
+            )
+        );
+    });
+
+    test("supports tab indentation and enter continuation for bullet notes", () => {
+        const onUpdatePaperAnnotation = jest.fn();
+        const onResolvePaperMetadata = jest.fn().mockResolvedValue({
+            url: "https://arxiv.org/abs/1706.03762",
+        });
+        renderList({
+            getPaperAnnotation: jest.fn(() => ({ notesMarkdown: "- item" })),
+            onUpdatePaperAnnotation,
+            onResolvePaperMetadata,
+        });
+
+        fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
+        fireEvent.click(screen.getByRole("button", { name: "- item" }));
         const modalTextarea = screen.getByPlaceholderText(
             "Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets."
         );
@@ -162,5 +258,141 @@ describe("PaperWorkbenchList recommendations", () => {
                 screen.getByTestId("desktop-paper-webview").textContent
             ).toContain("https://example.org/paper")
         );
+    });
+
+    test("auto-resolves missing reader url when opening note card", async () => {
+        const onResolvePaperMetadata = jest.fn().mockResolvedValue({
+            title: "Neuro-Symbolic Program Synthesis",
+            url: "https://arxiv.org/abs/2401.12345",
+            authors: ["A. Author"],
+            year: 2024,
+            venue: "ICLR",
+        });
+        renderList({
+            papers: [
+                {
+                    title: "Neuro-Symbolic Program Synthesis",
+                    authors: ["A. Author"],
+                    publication_date: "2024",
+                    abstract: "Combines neural and symbolic systems.",
+                    topics: ["Neurosymbolic AI"],
+                    url: "",
+                },
+            ],
+            onResolvePaperMetadata,
+        });
+
+        fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
+        fireEvent.click(
+            screen.getByRole("button", {
+                name: /No note yet\. Click to open the split paper reader popup\./i,
+            })
+        );
+
+        await waitFor(() =>
+            expect(onResolvePaperMetadata).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    title: "Neuro-Symbolic Program Synthesis",
+                    authors: ["A. Author"],
+                    year: 2024,
+                })
+            )
+        );
+        await waitFor(() =>
+            expect(
+                screen.getByTitle("Paper content: Neuro-Symbolic Program Synthesis")
+            ).toBeTruthy()
+        );
+        expect(
+            screen.getByTitle("Paper content: Neuro-Symbolic Program Synthesis").getAttribute(
+                "src"
+            )
+        ).toBe("https://arxiv.org/abs/2401.12345");
+    });
+
+    test("shows manual link input when auto-resolve fails", async () => {
+        renderList({
+            papers: [
+                {
+                    title: "Neuro-Symbolic Program Synthesis",
+                    authors: ["A. Author"],
+                    publication_date: "2024",
+                    abstract: "Combines neural and symbolic systems.",
+                    topics: ["Neurosymbolic AI"],
+                    url: "",
+                },
+            ],
+            onResolvePaperMetadata: jest
+                .fn()
+                .mockRejectedValue(new Error("Unable to resolve")),
+        });
+
+        fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
+        fireEvent.click(
+            screen.getByRole("button", {
+                name: /No note yet\. Click to open the split paper reader popup\./i,
+            })
+        );
+
+        await waitFor(() =>
+            expect(screen.getByText("Unable to resolve")).toBeTruthy()
+        );
+        expect(
+            screen.getByPlaceholderText("https://arxiv.org/abs/...")
+        ).toBeTruthy();
+    });
+
+    test("manual link save loads reader and persists for next open", async () => {
+        const onResolvePaperMetadata = jest
+            .fn()
+            .mockRejectedValue(new Error("Unable to resolve"));
+        renderListWithAnnotationState({ onResolvePaperMetadata });
+
+        fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
+        fireEvent.click(
+            screen.getByRole("button", {
+                name: /No note yet\. Click to open the split paper reader popup\./i,
+            })
+        );
+
+        await waitFor(() =>
+            expect(
+                screen.getByPlaceholderText("https://arxiv.org/abs/...")
+            ).toBeTruthy()
+        );
+        fireEvent.change(screen.getByPlaceholderText("https://arxiv.org/abs/..."), {
+            target: { value: "https://arxiv.org/abs/2501.00001" },
+        });
+        fireEvent.click(screen.getByRole("button", { name: "Save link" }));
+
+        await waitFor(() =>
+            expect(
+                screen.getByTitle("Paper content: Neuro-Symbolic Program Synthesis")
+            ).toBeTruthy()
+        );
+        expect(
+            screen.getByTitle("Paper content: Neuro-Symbolic Program Synthesis").getAttribute(
+                "src"
+            )
+        ).toBe("https://arxiv.org/abs/2501.00001");
+
+        fireEvent.click(screen.getByRole("button", { name: "Done" }));
+        fireEvent.click(
+            screen.getByRole("button", {
+                name: /No note yet\. Click to open the split paper reader popup\./i,
+            })
+        );
+
+        await waitFor(() =>
+            expect(
+                screen.getByTitle("Paper content: Neuro-Symbolic Program Synthesis")
+            ).toBeTruthy()
+        );
+        expect(
+            screen.getByTitle("Paper content: Neuro-Symbolic Program Synthesis").getAttribute(
+                "src"
+            )
+        ).toBe("https://arxiv.org/abs/2501.00001");
+        expect(onResolvePaperMetadata).toHaveBeenCalledTimes(1);
     });
 });

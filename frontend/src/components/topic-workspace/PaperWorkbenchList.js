@@ -70,6 +70,7 @@ export default function PaperWorkbenchList({
     requestedReaderNonce = 0,
     onRequestSimilarPapers,
     onAddRecommendationToReadingList,
+    onResolvePaperMetadata,
     desktopConfig = {},
 }) {
     const [selectedPaperTitle, setSelectedPaperTitle] = useState(null);
@@ -83,6 +84,10 @@ export default function PaperWorkbenchList({
     const [externalReaderItem, setExternalReaderItem] = useState(null);
     const [isReaderFrameLoaded, setIsReaderFrameLoaded] = useState(false);
     const [readerFrameError, setReaderFrameError] = useState("");
+    const [isResolvingReaderUrl, setIsResolvingReaderUrl] = useState(false);
+    const [readerResolveError, setReaderResolveError] = useState("");
+    const [manualReaderUrl, setManualReaderUrl] = useState("");
+    const [manualReaderUrlError, setManualReaderUrlError] = useState("");
     const flashTimerRef = useRef(null);
 
     useEffect(() => {
@@ -148,6 +153,7 @@ export default function PaperWorkbenchList({
     const activeReaderAnnotation = activeReaderAnnotationKey
         ? getPaperAnnotation(activeReaderAnnotationKey)
         : null;
+    const readerUrl = (activeReader?.url || activeReaderAnnotation?.sourceUrl || "").trim();
     const useDesktopInAppBrowser = Boolean(
         desktopConfig?.isDesktop && desktopConfig?.supportsInAppBrowser
     );
@@ -155,7 +161,7 @@ export default function PaperWorkbenchList({
     useEffect(() => {
         setIsReaderFrameLoaded(false);
         setReaderFrameError("");
-    }, [activeReader?.url]);
+    }, [readerUrl]);
 
     useEffect(() => {
         setSimilarPapers([]);
@@ -176,6 +182,101 @@ export default function PaperWorkbenchList({
         return () => window.removeEventListener("keydown", handleEscape);
     }, [isPaperReaderOpen]);
 
+    useEffect(() => {
+        if (!isPaperReaderOpen || externalReaderItem || !selectedPaper) return;
+        if (readerUrl || !onResolvePaperMetadata) return;
+        const selectedTitle = (selectedPaper.title || "").trim();
+        if (!selectedTitle) return;
+
+        const parsedYear = Number.parseInt(
+            String(selectedPaper.publication_date || "").slice(0, 4),
+            10
+        );
+        let isCancelled = false;
+        setIsResolvingReaderUrl(true);
+        setReaderResolveError("");
+        setManualReaderUrlError("");
+
+        onResolvePaperMetadata({
+            semanticScholarPaperId: selectedPaper.semanticScholarPaperId || "",
+            url: selectedPaper.url || "",
+            title: selectedTitle,
+            authors: Array.isArray(selectedPaper.authors) ? selectedPaper.authors : [],
+            year: Number.isFinite(parsedYear) ? parsedYear : null,
+        })
+            .then((resolved) => {
+                if (isCancelled) return;
+                const resolvedUrl = String(resolved?.url || "").trim();
+                if (!resolvedUrl) {
+                    setReaderResolveError(
+                        "Unable to auto-resolve this paper. Enter a link manually."
+                    );
+                    return;
+                }
+                onUpdatePaperAnnotation(activeReaderAnnotationKey, {
+                    sourceUrl: resolvedUrl,
+                });
+                setExternalReaderItem({
+                    title: resolved?.title || selectedPaper.title || "Untitled paper",
+                    annotationKey: activeReaderAnnotationKey,
+                    url: resolvedUrl,
+                    authors:
+                        Array.isArray(resolved?.authors) && resolved.authors.length > 0
+                            ? resolved.authors
+                            : selectedPaper.authors || [],
+                    publication_date:
+                        resolved?.year != null
+                            ? String(resolved.year)
+                            : selectedPaper.publication_date || "",
+                    venue: resolved?.venue || selectedPaper.venue || "",
+                    status: "reading",
+                });
+                setManualReaderUrl("");
+            })
+            .catch((error) => {
+                if (isCancelled) return;
+                setReaderResolveError(
+                    error?.message ||
+                        "Unable to auto-resolve this paper. Enter a link manually."
+                );
+            })
+            .finally(() => {
+                if (!isCancelled) {
+                    setIsResolvingReaderUrl(false);
+                }
+            });
+
+        return () => {
+            isCancelled = true;
+        };
+    }, [
+        activeReaderAnnotationKey,
+        externalReaderItem,
+        isPaperReaderOpen,
+        onResolvePaperMetadata,
+        onUpdatePaperAnnotation,
+        readerUrl,
+        selectedPaper,
+    ]);
+
+    useEffect(() => {
+        if (!isPaperReaderOpen || !activeReaderAnnotationKey) return;
+        const resolvedReaderUrl = String(readerUrl || "").trim();
+        if (!resolvedReaderUrl) return;
+        const storedSourceUrl = String(activeReaderAnnotation?.sourceUrl || "").trim();
+        if (storedSourceUrl === resolvedReaderUrl) return;
+        // Persist the canonical reader URL so every paper annotation keeps an associated link.
+        onUpdatePaperAnnotation(activeReaderAnnotationKey, {
+            sourceUrl: resolvedReaderUrl,
+        });
+    }, [
+        activeReaderAnnotation?.sourceUrl,
+        activeReaderAnnotationKey,
+        isPaperReaderOpen,
+        onUpdatePaperAnnotation,
+        readerUrl,
+    ]);
+
     const setPaperNotes = (
         paperTitle,
         nextValue,
@@ -190,6 +291,50 @@ export default function PaperWorkbenchList({
             notesMarkdown: nextValue,
         });
         setNoteEditorError("");
+        return true;
+    };
+
+    const persistReaderUrl = (inputUrl) => {
+        if (!activeReaderAnnotationKey) return false;
+        const trimmed = String(inputUrl || "").trim();
+        if (!trimmed) {
+            setManualReaderUrlError("Enter a paper URL.");
+            return false;
+        }
+        let parsed;
+        try {
+            parsed = new URL(trimmed);
+        } catch {
+            setManualReaderUrlError("Enter a valid URL, including https://");
+            return false;
+        }
+        if (!["http:", "https:"].includes(parsed.protocol)) {
+            setManualReaderUrlError("Only http(s) links are supported.");
+            return false;
+        }
+        const normalizedUrl = parsed.toString();
+        onUpdatePaperAnnotation(activeReaderAnnotationKey, {
+            sourceUrl: normalizedUrl,
+        });
+        setExternalReaderItem((previous) => ({
+            title: previous?.title || selectedPaper?.title || activeReader?.title || "Untitled paper",
+            annotationKey: activeReaderAnnotationKey,
+            url: normalizedUrl,
+            authors:
+                previous?.authors ||
+                selectedPaper?.authors ||
+                activeReader?.authors ||
+                [],
+            publication_date:
+                previous?.publication_date ||
+                selectedPaper?.publication_date ||
+                activeReader?.publication_date ||
+                "",
+            venue: previous?.venue || selectedPaper?.venue || activeReader?.venue || "",
+            status: previous?.status || activeReader?.status || "reading",
+        }));
+        setReaderResolveError("");
+        setManualReaderUrlError("");
         return true;
     };
 
@@ -485,6 +630,9 @@ export default function PaperWorkbenchList({
                                 className="annotation-preview-card"
                                 onClick={() => {
                                     setExternalReaderItem(null);
+                                    setManualReaderUrl("");
+                                    setManualReaderUrlError("");
+                                    setReaderResolveError("");
                                     setIsPaperReaderOpen(true);
                                 }}
                             >
@@ -495,16 +643,6 @@ export default function PaperWorkbenchList({
                                         No note yet. Click to open the split paper reader popup.
                                     </span>
                                 )}
-                            </button>
-                            <button
-                                type="button"
-                                className="topic-search-open-button"
-                                onClick={() => {
-                                    setExternalReaderItem(null);
-                                    setIsPaperReaderOpen(true);
-                                }}
-                            >
-                                Open paper
                             </button>
                         </>
                     ) : (
@@ -545,10 +683,10 @@ export default function PaperWorkbenchList({
                                     {activeReader.publication_date || "Unknown year"}
                                     {activeReader.venue ? ` • ${activeReader.venue}` : ""}
                                 </p>
-                                {activeReader.url ? (
+                                {readerUrl ? (
                                     useDesktopInAppBrowser ? (
                                         <DesktopPaperWebview
-                                            url={activeReader.url}
+                                            url={readerUrl}
                                             title={activeReader.title}
                                         />
                                     ) : (
@@ -564,9 +702,9 @@ export default function PaperWorkbenchList({
                                                 </p>
                                             )}
                                             <iframe
-                                                key={activeReader.url}
+                                                key={readerUrl}
                                                 className="paper-reader-frame"
-                                                src={activeReader.url}
+                                                src={readerUrl}
                                                 title={`Paper content: ${activeReader.title}`}
                                                 onLoad={() => setIsReaderFrameLoaded(true)}
                                                 onError={() => {
@@ -577,7 +715,7 @@ export default function PaperWorkbenchList({
                                             />
                                             <div className="paper-reader-frame-toolbar">
                                                 <a
-                                                    href={activeReader.url}
+                                                    href={readerUrl}
                                                     target="_blank"
                                                     rel="noreferrer"
                                                     className="open-link-button"
@@ -592,9 +730,48 @@ export default function PaperWorkbenchList({
                                         </>
                                     )
                                 ) : (
-                                    <p className="paper-details-abstract">
-                                        {activeReader.abstract || "No summary available."}
-                                    </p>
+                                    <div className="paper-reader-link-fallback">
+                                        {isResolvingReaderUrl ? (
+                                            <p className="theme-sync-hint">
+                                                Resolving paper page from Semantic Scholar...
+                                            </p>
+                                        ) : (
+                                            <p className="theme-sync-hint">
+                                                No paper URL is saved yet. Add a link to open the
+                                                reader pane.
+                                            </p>
+                                        )}
+                                        {readerResolveError && (
+                                            <p className="validation-error">{readerResolveError}</p>
+                                        )}
+                                        <div className="paper-reader-manual-link-row">
+                                            <input
+                                                type="url"
+                                                value={manualReaderUrl}
+                                                onChange={(event) =>
+                                                    setManualReaderUrl(event.target.value)
+                                                }
+                                                placeholder="https://arxiv.org/abs/..."
+                                                className="paper-reader-manual-link-input"
+                                                disabled={isResolvingReaderUrl}
+                                            />
+                                            <button
+                                                type="button"
+                                                className="topic-search-open-button"
+                                                disabled={isResolvingReaderUrl}
+                                                onClick={() => {
+                                                    persistReaderUrl(manualReaderUrl);
+                                                }}
+                                            >
+                                                Save link
+                                            </button>
+                                        </div>
+                                        {manualReaderUrlError && (
+                                            <p className="validation-error">
+                                                {manualReaderUrlError}
+                                            </p>
+                                        )}
+                                    </div>
                                 )}
                             </section>
                             <section className="paper-notes-pane">

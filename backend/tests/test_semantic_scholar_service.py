@@ -70,6 +70,40 @@ def test_hydrate_paper_tries_multiple_identifiers(monkeypatch):
     assert len(calls) == 2
 
 
+def test_normalize_paper_payload_prefers_arxiv_external_id():
+    service = SemanticScholarService(api_key="test-key")
+    payload = service._normalize_paper_payload(
+        {
+            "paperId": "paper-1",
+            "title": "Example",
+            "authors": [{"name": "A. Author"}],
+            "year": 2024,
+            "venue": "NeurIPS",
+            "url": "https://www.semanticscholar.org/paper/paper-1",
+            "externalIds": {"ArXiv": "1706.03762v2"},
+        },
+        fallback_url="https://example.org/original",
+    )
+    assert payload["url"] == "https://arxiv.org/abs/1706.03762v2"
+
+
+def test_normalize_candidate_prefers_arxiv_doi_variant():
+    service = SemanticScholarService(api_key="test-key")
+    payload = service._normalize_candidate(
+        {
+            "paperId": "paper-2",
+            "title": "Candidate",
+            "authors": ["A. Author"],
+            "year": 2023,
+            "venue": "ICLR",
+            "abstract": "Test",
+            "url": "https://www.semanticscholar.org/paper/paper-2",
+            "externalIds": {"DOI": "10.48550/arXiv.2301.01234"},
+        }
+    )
+    assert payload["url"] == "https://arxiv.org/abs/2301.01234"
+
+
 def test_compute_centroid_embedding_averages_vectors():
     service = SemanticScholarService(api_key="test-key")
     centroid = service.compute_centroid_embedding(

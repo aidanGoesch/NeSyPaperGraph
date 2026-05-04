@@ -29,6 +29,7 @@ function createSecurityPolicyRuntime({
     getMainWindowWebContents,
     getRendererEntry,
     openExternal,
+    openInReader,
 }) {
     const rendererEntry = getRendererEntry();
     const rendererOrigin =
@@ -36,9 +37,28 @@ function createSecurityPolicyRuntime({
             ? new URL(rendererEntry.value).origin
             : null;
 
-    function handleWindowOpen(url) {
+    function isRendererReferrer(referrerUrl) {
+        if (!referrerUrl) return false;
+        if (rendererEntry?.type === "file") {
+            return isFileUrl(referrerUrl);
+        }
+        return isSameOrigin(referrerUrl, rendererOrigin);
+    }
+
+    function handleWindowOpen(details, sourceWebContents) {
+        const url = details?.url || "";
+        const referrerUrl = details?.referrer?.url || "";
+        const mainWindowContents = getMainWindowWebContents();
+        const isMainWindow = Boolean(
+            mainWindowContents && sourceWebContents === mainWindowContents
+        );
         if (isHttpLikeUrl(url)) {
-            openExternal(url);
+            const rendererInitiated = isRendererReferrer(referrerUrl);
+            if (isMainWindow && rendererInitiated) {
+                openExternal(url);
+            } else {
+                openInReader(url);
+            }
         }
         return { action: "deny" };
     }

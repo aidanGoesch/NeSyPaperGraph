@@ -323,6 +323,7 @@ function trimWorkspaceState(state) {
                     annotation?.notesMarkdown,
                     MAX_NOTE_CHARS
                 ),
+                sourceUrl: clampText(annotation?.sourceUrl, 4096),
             },
         ])
     );
@@ -541,6 +542,7 @@ export function useWorkspaceStore(options = {}) {
                     state.paperAnnotations[paperTitle] || {
                         paperTitle,
                         notesMarkdown: "",
+                        sourceUrl: "",
                         topicLinks: [],
                         status: "unread",
                     }

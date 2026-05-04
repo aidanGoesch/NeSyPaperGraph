@@ -86,12 +86,14 @@ describe("TopicWorkspace inferred search", () => {
         jest.useFakeTimers();
         lastPaperWorkbenchProps = null;
         lastThemeNotebookProps = null;
+        delete window.desktopBridge;
     });
 
     afterEach(() => {
         jest.runOnlyPendingTimers();
         jest.useRealTimers();
         jest.clearAllMocks();
+        delete window.desktopBridge;
     });
 
     test("renders search input and submits inferred query on Enter", async () => {
@@ -480,6 +482,36 @@ describe("TopicWorkspace inferred search", () => {
         expect(apiFetch.mock.calls[0][0]).toContain("/api/recommendations/paper");
         expect(apiFetch.mock.calls[1][0]).toContain(
             "/api/workspace/recommendations/paper"
+        );
+    });
+
+    test("desktop webview open event routes url to reader popup", () => {
+        let onOpen = null;
+        window.desktopBridge = {
+            onOpenInReaderUrl(handler) {
+                onOpen = handler;
+                return () => {
+                    onOpen = null;
+                };
+            },
+        };
+
+        renderWorkspace({
+            desktopConfig: {
+                isDesktop: true,
+                supportsInAppBrowser: true,
+            },
+        });
+
+        act(() => {
+            onOpen?.("https://arxiv.org/abs/1706.03762");
+        });
+
+        expect(lastPaperWorkbenchProps.requestedReaderItem).toEqual(
+            expect.objectContaining({
+                url: "https://arxiv.org/abs/1706.03762",
+                status: "reading",
+            })
         );
     });
 });

@@ -1,6 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from models.workspace import WorkspaceState, default_workspace_state, utc_now_iso
 from api.recommendations import (
@@ -20,6 +19,14 @@ router = APIRouter()
 
 class ResolvePaperUrlRequest(BaseModel):
     url: str
+
+
+class ResolvePaperRequest(BaseModel):
+    semanticScholarPaperId: str | None = None
+    url: str | None = None
+    title: str | None = None
+    authors: list[str] = Field(default_factory=list)
+    year: int | None = None
 
 
 def _timestamps_equal(left: dict, right: dict) -> bool:
@@ -162,6 +169,56 @@ def resolve_paper_url(request: ResolvePaperUrlRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to resolve URL metadata: {exc}",
+        ) from exc
+
+
+@router.post("/workspace/resolve-paper")
+def resolve_paper(request: ResolvePaperRequest):
+    try:
+        seed = {
+            "semanticScholarPaperId": (request.semanticScholarPaperId or "").strip(),
+            "url": (request.url or "").strip(),
+            "title": (request.title or "").strip(),
+            "authors": request.authors or [],
+            "year": request.year,
+        }
+        if not any([seed["semanticScholarPaperId"], seed["url"], seed["title"]]):
+            raise HTTPException(
+                status_code=422,
+                detail="Provide semanticScholarPaperId, title, or url to resolve the paper.",
+            )
+
+        details = SemanticScholarService().resolve_seed_paper_details(seed)
+        if not details:
+            raise HTTPException(
+                status_code=404,
+                detail="Unable to resolve the paper in Semantic Scholar.",
+            )
+
+        return {
+            "semanticScholarPaperId": details.get("paperId")
+            or details.get("semanticScholarPaperId"),
+            "url": details.get("url") or "",
+            "title": details.get("title") or seed["title"] or "",
+            "authors": details.get("authors") or [],
+            "year": details.get("year"),
+            "venue": details.get("venue"),
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SemanticScholarRateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except SemanticScholarError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        detail = str(exc)
+        if "rate limit" in detail.lower():
+            raise HTTPException(status_code=429, detail=detail) from exc
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to resolve paper metadata: {exc}",
         ) from exc
 
 

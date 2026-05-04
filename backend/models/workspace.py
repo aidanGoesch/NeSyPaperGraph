@@ -47,6 +47,7 @@ class ThemeNote(BaseModel):
 class PaperAnnotation(BaseModel):
     paperTitle: str
     notesMarkdown: str = ""
+    sourceUrl: str = ""
     topicLinks: List[str] = Field(default_factory=list)
     status: str = "unread"
     updatedAt: str | None = None

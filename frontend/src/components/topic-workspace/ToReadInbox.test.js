@@ -1,5 +1,5 @@
 import React from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ToReadInbox from "./ToReadInbox";
 
 function renderInbox(overrides = {}) {
@@ -52,5 +52,34 @@ describe("ToReadInbox open action", () => {
         renderInbox({ readingItems });
 
         expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
+    });
+
+    test("uses resolved metadata url when adding item", async () => {
+        const onAddReadingItem = jest.fn();
+        const onResolveReadingUrl = jest.fn().mockResolvedValue({
+            url: "https://arxiv.org/abs/1706.03762",
+            title: "Attention Is All You Need",
+            semanticScholarPaperId: "s2-1",
+            authors: ["Ashish Vaswani"],
+            year: 2017,
+            venue: "NeurIPS",
+        });
+
+        renderInbox({ onAddReadingItem, onResolveReadingUrl });
+
+        fireEvent.change(
+            screen.getByPlaceholderText("Paste paper URL"),
+            { target: { value: "https://www.semanticscholar.org/paper/s2-1" } }
+        );
+        fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+        await waitFor(() =>
+            expect(onAddReadingItem).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    url: "https://arxiv.org/abs/1706.03762",
+                    semanticScholarPaperId: "s2-1",
+                })
+            )
+        );
     });
 });

@@ -65,6 +65,62 @@ def test_resolve_paper_url_surfaces_rate_limit_as_429(client, monkeypatch):
     assert "rate limit" in response.json()["detail"].lower()
 
 
+def test_resolve_paper_returns_normalized_fields(client, monkeypatch):
+    class _FakeSemanticScholarService:
+        def resolve_seed_paper_details(self, seed):
+            assert seed["title"] == "Attention Is All You Need"
+            assert seed["authors"] == ["Ashish Vaswani"]
+            return {
+                "paperId": "paper-123",
+                "title": "Attention Is All You Need",
+                "authors": ["Ashish Vaswani", "Noam Shazeer"],
+                "year": 2017,
+                "venue": "NeurIPS",
+                "url": "https://arxiv.org/abs/1706.03762",
+            }
+
+    monkeypatch.setattr("api.workspace.SemanticScholarService", _FakeSemanticScholarService)
+
+    response = client.post(
+        "/api/workspace/resolve-paper",
+        json={
+            "title": "Attention Is All You Need",
+            "authors": ["Ashish Vaswani"],
+            "year": 2017,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "semanticScholarPaperId": "paper-123",
+        "title": "Attention Is All You Need",
+        "authors": ["Ashish Vaswani", "Noam Shazeer"],
+        "year": 2017,
+        "venue": "NeurIPS",
+        "url": "https://arxiv.org/abs/1706.03762",
+    }
+
+
+def test_resolve_paper_returns_404_when_unresolved(client, monkeypatch):
+    class _FakeSemanticScholarService:
+        def resolve_seed_paper_details(self, _seed):
+            return None
+
+    monkeypatch.setattr("api.workspace.SemanticScholarService", _FakeSemanticScholarService)
+
+    response = client.post(
+        "/api/workspace/resolve-paper",
+        json={"title": "Some Unresolved Paper"},
+    )
+    assert response.status_code == 404
+    assert "Unable to resolve the paper" in response.json()["detail"]
+
+
+def test_resolve_paper_requires_seed_identifier(client):
+    response = client.post("/api/workspace/resolve-paper", json={"authors": ["A"]})
+    assert response.status_code == 422
+    assert "Provide semanticScholarPaperId, title, or url" in response.json()["detail"]
+
+
 def test_workspace_theme_recommendations_route_available(client, monkeypatch):
     monkeypatch.setattr(
         "api.workspace.load_workspace_state",

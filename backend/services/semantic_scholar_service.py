@@ -282,7 +282,7 @@ class SemanticScholarService:
             return None
         payload = self._request_json(
             f"/paper/{quote(paper_id, safe=':')}",
-            query="fields=paperId,title,authors,year,venue,abstract,url,embedding",
+            query="fields=paperId,title,authors,year,venue,abstract,url,embedding,externalIds",
             suppress_not_found=True,
         )
         if not payload:
@@ -301,7 +301,7 @@ class SemanticScholarService:
             f"/papers/forpaper/{quote(normalized_paper_id, safe=':')}",
             query=(
                 f"limit={max(1, min(limit, 100))}"
-                "&fields=paperId,title,authors,year,venue,abstract,url,embedding"
+                "&fields=paperId,title,authors,year,venue,abstract,url,embedding,externalIds"
             ),
             suppress_not_found=True,
             base_url=SEMANTIC_SCHOLAR_RECOMMENDATIONS_BASE_URL,
@@ -322,7 +322,7 @@ class SemanticScholarService:
             query=(
                 f"query={quote(cleaned_query)}"
                 f"&limit={max(1, min(limit, 100))}"
-                "&fields=paperId,title,authors,year,venue,abstract,url,embedding"
+                "&fields=paperId,title,authors,year,venue,abstract,url,embedding,externalIds"
             ),
             suppress_not_found=True,
         )
@@ -573,7 +573,7 @@ class SemanticScholarService:
             "year": payload.get("year"),
             "venue": payload.get("venue"),
             "abstract": payload.get("abstract") or "",
-            "url": payload.get("url"),
+            "url": self._preferred_paper_url(payload),
             "embedding": payload.get("embedding"),
         }
 
@@ -800,7 +800,7 @@ class SemanticScholarService:
             year = int(year)
 
         return {
-            "url": payload.get("url") or fallback_url,
+            "url": self._preferred_paper_url(payload, fallback_url=fallback_url),
             "semanticScholarPaperId": payload.get("paperId"),
             "title": payload.get("title"),
             "authors": normalized_authors,
@@ -808,6 +808,48 @@ class SemanticScholarService:
             "venue": payload.get("venue"),
             "abstract": payload.get("abstract") or "",
         }
+
+    def _preferred_paper_url(
+        self, payload: dict[str, Any], fallback_url: str | None = None
+    ) -> str:
+        payload_url = (payload.get("url") or "").strip()
+        fallback = (fallback_url or "").strip()
+        external_ids = payload.get("externalIds") or {}
+        if not isinstance(external_ids, dict):
+            external_ids = {}
+
+        arxiv_raw = ""
+        for key in ("ArXiv", "ARXIV", "arXiv", "arxiv"):
+            value = external_ids.get(key)
+            if isinstance(value, str) and value.strip():
+                arxiv_raw = value.strip()
+                break
+
+        if not arxiv_raw:
+            doi = external_ids.get("DOI")
+            if isinstance(doi, str):
+                match = re.search(
+                    r"10\.48550/arxiv\.([0-9]{4}\.[0-9]{4,5}(?:v[0-9]+)?)",
+                    doi,
+                    re.IGNORECASE,
+                )
+                if match:
+                    arxiv_raw = match.group(1)
+
+        normalized_arxiv_id = ""
+        if arxiv_raw:
+            normalized_arxiv_id = re.sub(
+                r"^arxiv:",
+                "",
+                arxiv_raw,
+                flags=re.IGNORECASE,
+            ).strip()
+            normalized_arxiv_id = normalized_arxiv_id.replace(".pdf", "")
+
+        if normalized_arxiv_id:
+            return f"https://arxiv.org/abs/{normalized_arxiv_id}"
+
+        return payload_url or fallback
 
     def _request_json(
         self,

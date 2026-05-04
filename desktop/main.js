@@ -54,10 +54,16 @@ function registerDesktopSecurityPolicies() {
         getMainWindowWebContents: () => mainWindow?.webContents || null,
         getRendererEntry,
         openExternal: (url) => shell.openExternal(url),
+        openInReader: (url) => {
+            if (!mainWindow?.webContents) return;
+            mainWindow.webContents.send("desktop:open-in-reader-url", url);
+        },
     });
 
     app.on("web-contents-created", (_event, contents) => {
-        contents.setWindowOpenHandler(({ url }) => runtime.handleWindowOpen(url));
+        contents.setWindowOpenHandler((details) =>
+            runtime.handleWindowOpen(details, contents)
+        );
         contents.on("will-navigate", (event, url) =>
             runtime.handleWillNavigate(event, url, contents)
         );

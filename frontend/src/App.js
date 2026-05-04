@@ -1231,6 +1231,39 @@ function App() {
         [API_BASE, accessKey, apiFetch]
     );
 
+    const resolvePaperMetadata = useCallback(
+        async ({ semanticScholarPaperId = "", url = "", title = "", authors = [], year = null }) => {
+            if (!accessKey || !API_BASE) {
+                throw new Error("Backend connection is not ready.");
+            }
+            const response = await apiFetch(`${API_BASE}/api/workspace/resolve-paper`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    semanticScholarPaperId,
+                    url,
+                    title,
+                    authors: Array.isArray(authors) ? authors : [],
+                    year: Number.isFinite(Number(year)) ? Number(year) : null,
+                }),
+            });
+            if (!response.ok) {
+                let detail = "Failed to resolve paper metadata.";
+                try {
+                    const payload = await response.json();
+                    if (payload?.detail) {
+                        detail = payload.detail;
+                    }
+                } catch {
+                    // Keep default detail fallback.
+                }
+                throw new Error(detail);
+            }
+            return response.json();
+        },
+        [API_BASE, accessKey, apiFetch]
+    );
+
     const ingestReadingItemToGraph = useCallback(
         async (item) => {
             if (!accessKey || !API_BASE) {
@@ -1989,6 +2022,7 @@ function App() {
                                     desktopConfig={desktopConfig}
                                     showSearchPanel={false}
                                     onResolveReadingUrl={resolveReadingUrlMetadata}
+                                    onResolvePaperMetadata={resolvePaperMetadata}
                                     onIngestReadingItem={ingestReadingItemToGraph}
                                     onFocusPaper={(paperTitle) => {
                                         setHighlightPath(null);
