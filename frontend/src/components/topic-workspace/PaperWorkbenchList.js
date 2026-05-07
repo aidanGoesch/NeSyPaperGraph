@@ -1,5 +1,17 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import DesktopPaperWebview from "./DesktopPaperWebview";
+import PaperNotesEditor from "./PaperNotesEditor";
+import {
+    backupPaperNoteSnapshot,
+    isRichPaperNotesEditorEnabled,
+} from "./paperNotesRichText";
+import {
+    normalizePaperTitle,
+    normalizeReaderLookupUrl,
+    normalizeSemanticScholarId,
+    resolvePaperAnnotationKey,
+    extractSemanticScholarPaperIdFromUrl,
+} from "./readerIdentity";
 
 function normalizeAuthor(authors) {
     if (!authors) return "Unknown";
@@ -19,8 +31,119 @@ function recommendationBrowserUrl(paper) {
     return "";
 }
 
-function normalizePaperTitle(title) {
-    return String(title || "").trim().toLowerCase();
+function findMatchingPaperForReader(papers, readerItem) {
+    if (!Array.isArray(papers) || papers.length === 0 || !readerItem) return null;
+    const readerSs = normalizeSemanticScholarId(readerItem.semanticScholarPaperId);
+    const readerUrl = normalizeReaderLookupUrl(readerItem.url || "");
+    const readerTitle = normalizePaperTitle(readerItem.title || readerItem.annotationKey || "");
+
+    if (readerSs) {
+        const bySs = papers.find((paper) => {
+            const paperSs = normalizeSemanticScholarId(
+                paper.semanticScholarPaperId || paper.paperId
+            );
+            return Boolean(paperSs && paperSs === readerSs);
+        });
+        if (bySs) return bySs;
+    }
+
+    if (readerUrl) {
+        const byUrl = papers.find((paper) => {
+            const paperUrl = normalizeReaderLookupUrl(paper.url || "");
+            return Boolean(paperUrl && paperUrl === readerUrl);
+        });
+        if (byUrl) return byUrl;
+    }
+
+    if (readerTitle) {
+        const byTitle = papers.find(
+            (paper) => normalizePaperTitle(paper.title) === readerTitle
+        );
+        if (byTitle) return byTitle;
+    }
+    return null;
+}
+
+function isLikelySamePaper(selectedPaper, externalReader) {
+    if (!selectedPaper || !externalReader) return false;
+
+    const selectedTitle = normalizePaperTitle(selectedPaper.title);
+    const externalTitle = normalizePaperTitle(externalReader.title);
+    if (selectedTitle && externalTitle && selectedTitle === externalTitle) return true;
+
+    const selectedUrl = normalizeReaderLookupUrl(selectedPaper.url || "");
+    const externalUrl = normalizeReaderLookupUrl(externalReader.url || "");
+    if (selectedUrl && externalUrl && selectedUrl === externalUrl) return true;
+
+    const selectedSs = normalizeSemanticScholarId(
+        selectedPaper.semanticScholarPaperId || selectedPaper.paperId
+    );
+    const externalSs = normalizeSemanticScholarId(externalReader.semanticScholarPaperId);
+    return Boolean(selectedSs && externalSs && selectedSs === externalSs);
+}
+
+function findPendingReadingItem({
+    readingItems,
+    readingItemId,
+    annotationKey,
+    selectedThemeId,
+    readerUrl,
+    graphPaper,
+    externalReader,
+}) {
+    if (!Array.isArray(readingItems) || readingItems.length === 0) {
+        return null;
+    }
+    const key = annotationKey || "";
+    const nk = normalizePaperTitle(key);
+    const candidates = readingItems.filter((item) => item.status !== "done");
+    if (!candidates.length) return null;
+
+    if (readingItemId) {
+        const byId = candidates.find((r) => r.id === readingItemId);
+        if (byId) return byId;
+    }
+
+    const urlNorm = normalizeReaderLookupUrl(readerUrl);
+    const ssCandidates = [
+        externalReader?.semanticScholarPaperId,
+        graphPaper?.semanticScholarPaperId,
+    ]
+        .map((s) => String(s || "").trim())
+        .filter(Boolean);
+
+    const scoredCandidates = [];
+    for (const item of candidates) {
+        let score = 0;
+        if (selectedThemeId && item.linkedThemeId === selectedThemeId) {
+            score += 4;
+        }
+        if (item.linkedPaperTitle === key || item.title === key) {
+            score += 10;
+        }
+        if (normalizePaperTitle(item.linkedPaperTitle || "") === nk) {
+            score += 10;
+        }
+        if (normalizePaperTitle(item.title || "") === nk) {
+            score += 10;
+        }
+        const itemUrlNorm = normalizeReaderLookupUrl(item.url || "");
+        if (urlNorm && itemUrlNorm && urlNorm === itemUrlNorm) {
+            score += 14;
+        }
+        const itemSs = String(item.semanticScholarPaperId || "").trim();
+        if (itemSs && ssCandidates.some((cid) => cid === itemSs)) {
+            score += 16;
+        }
+        scoredCandidates.push({ item, score });
+    }
+    scoredCandidates.sort((left, right) => right.score - left.score);
+    const winner = scoredCandidates[0];
+    if (!winner || winner.score <= 0) return null;
+    if (scoredCandidates.length > 1 && scoredCandidates[1].score === winner.score) {
+        return null;
+    }
+    return winner.item;
 }
 
 const MAX_PAPER_NOTE_CHARS = 250000;
@@ -71,6 +194,11 @@ export default function PaperWorkbenchList({
     onRequestSimilarPapers,
     onAddRecommendationToReadingList,
     onResolvePaperMetadata,
+    readingItems = [],
+    onMarkReadingItemDone,
+    onTrackIngestingItem,
+    onUntrackIngestingItem,
+    selectedThemeId = null,
     desktopConfig = {},
 }) {
     const [selectedPaperTitle, setSelectedPaperTitle] = useState(null);
@@ -88,7 +216,10 @@ export default function PaperWorkbenchList({
     const [readerResolveError, setReaderResolveError] = useState("");
     const [manualReaderUrl, setManualReaderUrl] = useState("");
     const [manualReaderUrlError, setManualReaderUrlError] = useState("");
+    const [isMarkingReaderDone, setIsMarkingReaderDone] = useState(false);
+    const [markReaderDoneError, setMarkReaderDoneError] = useState("");
     const flashTimerRef = useRef(null);
+    const migratedAliasPairsRef = useRef(new Set());
 
     useEffect(() => {
         if (!requestedPaperTitle) return;
@@ -111,6 +242,9 @@ export default function PaperWorkbenchList({
                     );
                 }, 1000);
             }
+        } else {
+            // Avoid leaking stale selected paper context into reader identity resolution.
+            setSelectedPaperTitle(null);
         }
         return () => {
             if (flashTimerRef.current) {
@@ -131,10 +265,14 @@ export default function PaperWorkbenchList({
 
     useEffect(() => {
         if (!requestedReaderItem || requestedReaderNonce <= 0) return;
+        setMarkReaderDoneError("");
         setExternalReaderItem({
+            readingItemId: requestedReaderItem.readingItemId || null,
+            semanticScholarPaperId: requestedReaderItem.semanticScholarPaperId || null,
             title: requestedReaderItem.title || "Untitled paper",
             annotationKey:
                 requestedReaderItem.annotationKey ||
+                requestedReaderItem.semanticScholarPaperId ||
                 requestedReaderItem.title ||
                 requestedReaderItem.url ||
                 null,
@@ -148,15 +286,112 @@ export default function PaperWorkbenchList({
     }, [requestedReaderItem, requestedReaderNonce]);
 
     const activeReader = externalReaderItem || selectedPaper;
-    const activeReaderAnnotationKey =
-        externalReaderItem?.annotationKey || selectedPaper?.title || null;
+    const matchedReaderPaper = useMemo(
+        () => findMatchingPaperForReader(papers, externalReaderItem),
+        [externalReaderItem, papers]
+    );
+    const selectedPaperFromUrlSs = normalizeSemanticScholarId(
+        extractSemanticScholarPaperIdFromUrl(selectedPaper?.url || "")
+    );
+    const selectedPaperSs = normalizeSemanticScholarId(
+        selectedPaper?.semanticScholarPaperId || selectedPaper?.paperId || selectedPaperFromUrlSs
+    );
+    const externalReaderFromUrlSs = normalizeSemanticScholarId(
+        extractSemanticScholarPaperIdFromUrl(externalReaderItem?.url || "")
+    );
+    const externalReaderSs = normalizeSemanticScholarId(
+        externalReaderItem?.semanticScholarPaperId || externalReaderFromUrlSs
+    );
+    const sameAsSelectedPaper =
+        Boolean(
+            selectedPaper &&
+                externalReaderItem &&
+                (isLikelySamePaper(selectedPaper, externalReaderItem) ||
+                    (selectedPaperSs && externalReaderSs && selectedPaperSs === externalReaderSs))
+        );
+    const activeReaderAnnotationKey = externalReaderItem
+        ? resolvePaperAnnotationKey({
+              paperTitle: matchedReaderPaper?.title || (sameAsSelectedPaper ? selectedPaper?.title : null),
+              semanticScholarPaperId:
+                  externalReaderItem.semanticScholarPaperId ||
+                  matchedReaderPaper?.semanticScholarPaperId ||
+                  matchedReaderPaper?.paperId ||
+                  (sameAsSelectedPaper
+                      ? selectedPaper?.semanticScholarPaperId || selectedPaper?.paperId
+                      : null),
+              url:
+                  externalReaderItem.url ||
+                  matchedReaderPaper?.url ||
+                  (sameAsSelectedPaper ? selectedPaper?.url : ""),
+              fallbackTitle: externalReaderItem.title,
+              fallbackKey: externalReaderItem.annotationKey,
+              allowUrlFallback: false,
+          })
+        : resolvePaperAnnotationKey({
+              paperTitle: selectedPaper?.title,
+              semanticScholarPaperId:
+                  selectedPaper?.semanticScholarPaperId || selectedPaper?.paperId,
+              url: selectedPaper?.url,
+              allowUrlFallback: false,
+          });
     const activeReaderAnnotation = activeReaderAnnotationKey
         ? getPaperAnnotation(activeReaderAnnotationKey)
         : null;
     const readerUrl = (activeReader?.url || activeReaderAnnotation?.sourceUrl || "").trim();
+    const pendingToReadItem = useMemo(
+        () =>
+            findPendingReadingItem({
+                readingItems,
+                readingItemId: externalReaderItem?.readingItemId || null,
+                annotationKey: activeReaderAnnotationKey,
+                selectedThemeId,
+                readerUrl,
+                graphPaper: selectedPaper,
+                externalReader: externalReaderItem,
+            }),
+        [
+            activeReaderAnnotationKey,
+            externalReaderItem,
+            readerUrl,
+            readingItems,
+            selectedPaper,
+            selectedThemeId,
+        ]
+    );
+    const showToReadReaderActions = Boolean(
+        pendingToReadItem && typeof onMarkReadingItemDone === "function"
+    );
     const useDesktopInAppBrowser = Boolean(
         desktopConfig?.isDesktop && desktopConfig?.supportsInAppBrowser
     );
+    const useRichNotesEditor = isRichPaperNotesEditorEnabled();
+
+    const closePaperReader = useCallback(() => {
+        setIsPaperReaderOpen(false);
+        setMarkReaderDoneError("");
+    }, []);
+
+    const handleMarkReadingDone = useCallback(async () => {
+        if (!pendingToReadItem || !onMarkReadingItemDone) return;
+        setMarkReaderDoneError("");
+        setIsMarkingReaderDone(true);
+        try {
+            onTrackIngestingItem?.(pendingToReadItem);
+            await onMarkReadingItemDone(pendingToReadItem);
+            setExternalReaderItem(null);
+            setIsPaperReaderOpen(false);
+        } catch (error) {
+            setMarkReaderDoneError(error?.message || "Could not ingest paper.");
+        } finally {
+            onUntrackIngestingItem?.(pendingToReadItem.id);
+            setIsMarkingReaderDone(false);
+        }
+    }, [
+        onMarkReadingItemDone,
+        onTrackIngestingItem,
+        onUntrackIngestingItem,
+        pendingToReadItem,
+    ]);
 
     useEffect(() => {
         setIsReaderFrameLoaded(false);
@@ -175,12 +410,12 @@ export default function PaperWorkbenchList({
         if (!isPaperReaderOpen) return undefined;
         const handleEscape = (event) => {
             if (event.key === "Escape") {
-                setIsPaperReaderOpen(false);
+                closePaperReader();
             }
         };
         window.addEventListener("keydown", handleEscape);
         return () => window.removeEventListener("keydown", handleEscape);
-    }, [isPaperReaderOpen]);
+    }, [closePaperReader, isPaperReaderOpen]);
 
     useEffect(() => {
         if (!isPaperReaderOpen || externalReaderItem || !selectedPaper) return;
@@ -217,8 +452,22 @@ export default function PaperWorkbenchList({
                     sourceUrl: resolvedUrl,
                 });
                 setExternalReaderItem({
+                    readingItemId: pendingToReadItem?.id || null,
+                    semanticScholarPaperId:
+                        resolved?.semanticScholarPaperId ||
+                        selectedPaper.semanticScholarPaperId ||
+                        null,
                     title: resolved?.title || selectedPaper.title || "Untitled paper",
-                    annotationKey: activeReaderAnnotationKey,
+                    annotationKey: resolvePaperAnnotationKey({
+                        paperTitle: selectedPaper?.title,
+                        semanticScholarPaperId:
+                            resolved?.semanticScholarPaperId ||
+                            selectedPaper?.semanticScholarPaperId,
+                        url: resolvedUrl || selectedPaper?.url,
+                        fallbackTitle: resolved?.title || selectedPaper?.title,
+                        fallbackKey: activeReaderAnnotationKey,
+                        allowUrlFallback: false,
+                    }),
                     url: resolvedUrl,
                     authors:
                         Array.isArray(resolved?.authors) && resolved.authors.length > 0
@@ -257,6 +506,7 @@ export default function PaperWorkbenchList({
         onUpdatePaperAnnotation,
         readerUrl,
         selectedPaper,
+        pendingToReadItem?.id,
     ]);
 
     useEffect(() => {
@@ -277,12 +527,64 @@ export default function PaperWorkbenchList({
         readerUrl,
     ]);
 
+    useEffect(() => {
+        if (!isPaperReaderOpen || !externalReaderItem) return;
+        const canonicalKey =
+            matchedReaderPaper?.title || (sameAsSelectedPaper ? selectedPaper?.title : null);
+        if (!canonicalKey) return;
+        const aliasKey = externalReaderItem.annotationKey;
+        if (!canonicalKey || !aliasKey || canonicalKey === aliasKey) return;
+
+        const migrationPair = `${aliasKey}=>${canonicalKey}`;
+        if (migratedAliasPairsRef.current.has(migrationPair)) return;
+
+        const canonicalAnnotation = getPaperAnnotation(canonicalKey) || {};
+        const aliasAnnotation = getPaperAnnotation(aliasKey) || {};
+        const canonicalNotes = String(canonicalAnnotation.notesMarkdown || "");
+        const aliasNotes = String(aliasAnnotation.notesMarkdown || "");
+        if (canonicalNotes.trim() || !aliasNotes.trim()) return;
+
+        onUpdatePaperAnnotation(canonicalKey, {
+            notesMarkdown: aliasNotes,
+            sourceUrl:
+                canonicalAnnotation.sourceUrl ||
+                aliasAnnotation.sourceUrl ||
+                externalReaderItem.url ||
+                selectedPaper.url ||
+                "",
+        });
+        migratedAliasPairsRef.current.add(migrationPair);
+    }, [
+        externalReaderItem,
+        getPaperAnnotation,
+        isPaperReaderOpen,
+        matchedReaderPaper,
+        onUpdatePaperAnnotation,
+        selectedPaper,
+    ]);
+
+    useEffect(() => {
+        if (!isPaperReaderOpen || !activeReaderAnnotationKey) return;
+        backupPaperNoteSnapshot(
+            activeReaderAnnotationKey,
+            activeReaderAnnotation?.notesMarkdown || ""
+        );
+    }, [
+        activeReaderAnnotation?.notesMarkdown,
+        activeReaderAnnotationKey,
+        isPaperReaderOpen,
+    ]);
+
     const setPaperNotes = (
         paperTitle,
         nextValue,
         { rejectMessage = `Notes are limited to ${MAX_PAPER_NOTE_CHARS.toLocaleString()} characters.` } = {}
     ) => {
         if (!paperTitle) return false;
+        if ((activeReaderAnnotation?.notesMarkdown || "") === nextValue) {
+            setNoteEditorError("");
+            return true;
+        }
         if (nextValue.length > MAX_PAPER_NOTE_CHARS) {
             setNoteEditorError(rejectMessage);
             return false;
@@ -317,6 +619,11 @@ export default function PaperWorkbenchList({
             sourceUrl: normalizedUrl,
         });
         setExternalReaderItem((previous) => ({
+            readingItemId: previous?.readingItemId ?? null,
+            semanticScholarPaperId:
+                previous?.semanticScholarPaperId ||
+                selectedPaper?.semanticScholarPaperId ||
+                null,
             title: previous?.title || selectedPaper?.title || activeReader?.title || "Untitled paper",
             annotationKey: activeReaderAnnotationKey,
             url: normalizedUrl,
@@ -633,6 +940,7 @@ export default function PaperWorkbenchList({
                                     setManualReaderUrl("");
                                     setManualReaderUrlError("");
                                     setReaderResolveError("");
+                                    setMarkReaderDoneError("");
                                     setIsPaperReaderOpen(true);
                                 }}
                             >
@@ -660,21 +968,49 @@ export default function PaperWorkbenchList({
                     aria-label="Paper reader and notes"
                     onMouseDown={(event) => {
                         if (event.target === event.currentTarget) {
-                            setIsPaperReaderOpen(false);
+                            closePaperReader();
                         }
                     }}
                 >
                     <div className="paper-note-modal paper-reader-modal">
                         <div className="paper-note-modal-header">
                             <h3>Paper reader</h3>
-                            <button
-                                type="button"
-                                className="topic-search-close-button"
-                                onClick={() => setIsPaperReaderOpen(false)}
-                            >
-                                Done
-                            </button>
+                            <div className="paper-note-modal-header-actions">
+                                {showToReadReaderActions ? (
+                                    <>
+                                        <button
+                                            type="button"
+                                            className="topic-search-close-button"
+                                            onClick={closePaperReader}
+                                            disabled={isMarkingReaderDone}
+                                        >
+                                            Close
+                                        </button>
+                                        <button
+                                            type="button"
+                                            className="paper-reader-mark-done-button"
+                                            onClick={handleMarkReadingDone}
+                                            disabled={isMarkingReaderDone}
+                                        >
+                                            {isMarkingReaderDone ? "Marking…" : "Mark as done"}
+                                        </button>
+                                    </>
+                                ) : (
+                                    <button
+                                        type="button"
+                                        className="topic-search-close-button"
+                                        onClick={closePaperReader}
+                                    >
+                                        Done
+                                    </button>
+                                )}
+                            </div>
                         </div>
+                        {markReaderDoneError && (
+                            <p className="validation-error paper-reader-mark-done-error">
+                                {markReaderDoneError}
+                            </p>
+                        )}
                         <div className="paper-reader-modal-body">
                             <section className="paper-reader-pane">
                                 <p className="paper-note-modal-subtitle">{activeReader.title}</p>
@@ -784,20 +1120,33 @@ export default function PaperWorkbenchList({
                                         </span>
                                     </div>
                                 </div>
-                                <textarea
-                                    id="annotation-modal-input"
-                                    className="paper-note-modal-textarea"
-                                    value={activeReaderAnnotation?.notesMarkdown || ""}
-                                    onChange={(event) =>
-                                        setPaperNotes(
-                                            activeReaderAnnotationKey,
-                                            event.target.value
-                                        )
-                                    }
-                                    onKeyDown={handleNoteKeyDown}
-                                    onPaste={handleNotePaste}
-                                    placeholder="Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets."
-                                />
+                                {useRichNotesEditor ? (
+                                    <PaperNotesEditor
+                                        id="annotation-modal-input"
+                                        markdownValue={activeReaderAnnotation?.notesMarkdown || ""}
+                                        onMarkdownChange={(nextMarkdown) =>
+                                            setPaperNotes(activeReaderAnnotationKey, nextMarkdown)
+                                        }
+                                        onError={setNoteEditorError}
+                                        maxChars={MAX_PAPER_NOTE_CHARS}
+                                        placeholder="Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets."
+                                    />
+                                ) : (
+                                    <textarea
+                                        id="annotation-modal-input"
+                                        className="paper-note-modal-textarea"
+                                        value={activeReaderAnnotation?.notesMarkdown || ""}
+                                        onChange={(event) =>
+                                            setPaperNotes(
+                                                activeReaderAnnotationKey,
+                                                event.target.value
+                                            )
+                                        }
+                                        onKeyDown={handleNoteKeyDown}
+                                        onPaste={handleNotePaste}
+                                        placeholder="Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets."
+                                    />
+                                )}
                                 {noteEditorError && (
                                     <p className="validation-error">{noteEditorError}</p>
                                 )}

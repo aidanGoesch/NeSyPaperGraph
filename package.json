@@ -4,10 +4,11 @@
   "scripts": {
     "start": "cd frontend && npm install && npm start",
     "install-deps": "cd backend && pip install -r requirements.txt && cd ../frontend && npm install",
-    "dev": "concurrently \"cd backend && uvicorn main:app --reload\" \"cd frontend && npm start\"",
+    "dev": "concurrently \"npm run backend:dev\" \"cd frontend && npm start\"",
+    "backend:dev": "cd backend && (../.venv-test/bin/python -m uvicorn main:app --reload || ./.venv/bin/python -m uvicorn main:app --reload || python3 -m uvicorn main:app --reload)",
     "frontend:dev": "cd frontend && BROWSER=none npm start",
     "frontend:build": "cd frontend && npm run build",
-    "desktop:dev": "concurrently \"npm run frontend:dev\" \"wait-on tcp:3000 && cross-env ELECTRON_RENDERER_URL=http://localhost:3000 electron .\"",
+    "desktop:dev": "concurrently -k \"npm run backend:dev\" \"npm run frontend:dev\" \"wait-on tcp:3000 tcp:8000 && cross-env ELECTRON_RENDERER_URL=http://localhost:3000 DESKTOP_EXTERNAL_API_BASE_URL=http://127.0.0.1:8000 electron .\"",
     "desktop:build:frontend": "npm run frontend:build",
     "desktop:build:sidecar": "node desktop/scripts/build-sidecar.js",
     "desktop:build:mac": "npm run desktop:build:frontend && npm run desktop:build:sidecar && electron-builder --mac",

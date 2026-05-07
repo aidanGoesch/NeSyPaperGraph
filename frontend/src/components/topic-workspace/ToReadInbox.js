@@ -38,6 +38,9 @@ export default function ToReadInbox({
     onResolveReadingUrl,
     onMarkReadingItemDone,
     onOpenReadingItem,
+    ingestingItems: controlledIngestingItems = null,
+    onTrackIngestingItem = null,
+    onUntrackIngestingItem = null,
 }) {
     const [urlInput, setUrlInput] = useState("");
     const [titleInput, setTitleInput] = useState("");
@@ -48,11 +51,12 @@ export default function ToReadInbox({
     const [addError, setAddError] = useState("");
     const [itemBusyState, setItemBusyState] = useState({});
     const [itemErrors, setItemErrors] = useState({});
-    const [ingestingItems, setIngestingItems] = useState([]);
+    const [localIngestingItems, setLocalIngestingItems] = useState([]);
     const [draggingItemId, setDraggingItemId] = useState(null);
     const [dragOverItemId, setDragOverItemId] = useState(null);
     const dragPreviewRef = useRef(null);
 
+    const ingestingItems = controlledIngestingItems || localIngestingItems;
     const ingestingItemIdSet = useMemo(
         () => new Set(ingestingItems.map((item) => item.id)),
         [ingestingItems]
@@ -88,16 +92,22 @@ export default function ToReadInbox({
     };
 
     const trackIngestingItem = (item) => {
+        if (onTrackIngestingItem) {
+            onTrackIngestingItem(item);
+            return;
+        }
         const label = item.title || item.url || "Untitled item";
-        setIngestingItems((prev) =>
-            prev.some((entry) => entry.id === item.id)
-                ? prev
-                : [...prev, { id: item.id, label }]
+        setLocalIngestingItems((prev) =>
+            prev.some((entry) => entry.id === item.id) ? prev : [...prev, { id: item.id, label }]
         );
     };
 
     const untrackIngestingItem = (itemId) => {
-        setIngestingItems((prev) => prev.filter((entry) => entry.id !== itemId));
+        if (onUntrackIngestingItem) {
+            onUntrackIngestingItem(itemId);
+            return;
+        }
+        setLocalIngestingItems((prev) => prev.filter((entry) => entry.id !== itemId));
     };
 
     const handleAddPaperLink = async () => {

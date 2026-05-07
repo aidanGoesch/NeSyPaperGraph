@@ -68,6 +68,18 @@ def _normalize_title_lookup(title: str | None) -> str:
     return value
 
 
+def _extract_semantic_scholar_id_from_url(url: str) -> str | None:
+    match = re.search(
+        r"semanticscholar\.org/paper/[^/]+/([^/?#]+)",
+        url or "",
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    candidate = match.group(1).strip()
+    return candidate.lower() if candidate else None
+
+
 def prune_jobs(jobs: dict) -> None:
     max_jobs = int(os.getenv("MAX_JOB_HISTORY", "200") or "200")
     ttl_seconds = int(os.getenv("JOB_TTL_SECONDS", "3600") or "3600")
@@ -637,10 +649,27 @@ async def ingest_url_paper(request: Request, payload: IngestUrlRequest):
                 detail="OPENAI_API_KEY environment variable not set",
             )
 
+        request_url = payload.url.strip()
+        request_semantic_scholar_id = (
+            payload.semanticScholarPaperId.strip()
+            if isinstance(payload.semanticScholarPaperId, str)
+            else None
+        )
+        url_semantic_scholar_id = _extract_semantic_scholar_id_from_url(request_url)
+        if (
+            request_semantic_scholar_id
+            and url_semantic_scholar_id
+            and request_semantic_scholar_id.lower() != url_semantic_scholar_id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="semanticScholarPaperId conflicts with url identifier",
+            )
+
         try:
             semantic_payload = SemanticScholarService().hydrate_paper(
-                url=payload.url.strip(),
-                paper_id=payload.semanticScholarPaperId,
+                url=request_url,
+                paper_id=request_semantic_scholar_id,
             )
         except SemanticScholarRateLimitError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
@@ -652,6 +681,14 @@ async def ingest_url_paper(request: Request, payload: IngestUrlRequest):
                 status_code=404,
                 detail="Unable to resolve paper abstract from Semantic Scholar.",
             )
+        ingest_identity = {
+            "request_url": request_url,
+            "request_semantic_scholar_id": request_semantic_scholar_id,
+            "resolved_semantic_scholar_id": (
+                (semantic_payload.get("semanticScholarPaperId") or "").strip() or None
+            ),
+            "resolved_title": (semantic_payload.get("title") or "").strip() or None,
+        }
 
         async with request.app.state.graph_lock:
             graph = request.app.state.graph
@@ -691,6 +728,7 @@ async def ingest_url_paper(request: Request, payload: IngestUrlRequest):
             return {
                 "status": "processed",
                 "paper_title": new_titles[0],
+                "ingest_identity": ingest_identity,
                 "graph": build_graph_payload(updated_graph),
             }
 
@@ -718,6 +756,7 @@ async def ingest_url_paper(request: Request, payload: IngestUrlRequest):
             "status": "skipped",
             "reason": "duplicate_title",
             "paper_title": canonical_duplicate_title or semantic_payload.get("title"),
+            "ingest_identity": ingest_identity,
             "graph": build_graph_payload(updated_graph),
         }
     except HTTPException:

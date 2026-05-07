@@ -17,6 +17,9 @@ const MAX_UPLOAD_BATCH_BYTES = 40 * 1024 * 1024; // 40 MB per request
 const MAX_UPLOAD_BATCH_RETRIES = 3;
 const UPLOAD_BATCH_RETRY_BASE_MS = 1200;
 const MAX_ACTIVATION_TRACE_STEPS = 140;
+const ACTIVATION_FRAME_INTERVAL_MS = 90;
+const ACTIVATION_DECAY_DELAY_MS = 620;
+const ACTIVATION_DECAY_SCORE_MULTIPLIER = 0.82;
 const PROMPT_ACTIVATION_COLORS = [
     "#177cbc",
     "#c15f9e",
@@ -282,6 +285,8 @@ function App() {
         promptIndex: 0,
         seedNodeIds: [],
         focusNodeId: null,
+        traceNodeIds: [],
+        cameraPhase: "idle",
     });
     const graphRef = useRef();
     const topicWorkspaceRef = useRef();
@@ -336,6 +341,8 @@ function App() {
                     promptIndex,
                     seedNodeIds: [],
                     focusNodeId: null,
+                    traceNodeIds: [],
+                    cameraPhase: "idle",
                 });
                 return;
             }
@@ -398,6 +405,14 @@ function App() {
                 const stepTrace = Array.isArray(round?.step_trace)
                     ? round.step_trace.slice(0, MAX_ACTIVATION_TRACE_STEPS)
                     : [];
+                const roundTraceNodeIds = Array.from(
+                    new Set([
+                        ...roundSeedNodeIds,
+                        ...stepTrace
+                            .map((stepItem) => stepItem?.node_id)
+                            .filter(Boolean),
+                    ])
+                );
 
                 seedNodes.forEach((seed) => {
                     const nodeId = seed?.node_id;
@@ -423,6 +438,8 @@ function App() {
                     promptIndex,
                     seedNodeIds: roundSeedNodeIds,
                     focusNodeId: primarySeedNodeId,
+                    traceNodeIds: roundTraceNodeIds,
+                    cameraPhase: "source_focus",
                 });
 
                 let previousNodeId = null;
@@ -473,6 +490,8 @@ function App() {
                         promptIndex,
                         seedNodeIds: roundSeedNodeIds,
                         focusNodeId: primarySeedNodeId,
+                        traceNodeIds: roundTraceNodeIds,
+                        cameraPhase: "playback",
                     });
                 });
             });
@@ -483,7 +502,9 @@ function App() {
                 decayNodes[nodeId] = {
                     ...node,
                     stage: "decay",
-                    score: Number((node.score * 0.35).toFixed(6)),
+                    score: Number(
+                        (node.score * ACTIVATION_DECAY_SCORE_MULTIPLIER).toFixed(6)
+                    ),
                 };
             });
             frames.push({
@@ -507,6 +528,10 @@ function App() {
                     frames[frames.length - 1]?.seedNodeIds || [],
                 focusNodeId:
                     frames[frames.length - 1]?.focusNodeId || null,
+                traceNodeIds:
+                    frames[frames.length - 1]?.traceNodeIds || [],
+                cameraPhase: "zoomed_out_context",
+                frameDelayMs: ACTIVATION_DECAY_DELAY_MS,
             });
 
             persistentActivationRef.current = {
@@ -523,11 +548,17 @@ function App() {
                 maxTraversalCount: fixedMaxTraversalCount,
             };
 
-            frames.forEach((frame, idx) => {
+            let elapsedMs = 0;
+            frames.forEach((frame) => {
+                const frameDelayMs = Math.max(
+                    0,
+                    Number(frame?.frameDelayMs) || ACTIVATION_FRAME_INTERVAL_MS
+                );
                 const timerId = window.setTimeout(() => {
                     setActivationFrame(frame);
-                }, idx * 90);
+                }, elapsedMs);
                 activationPlaybackTimeoutRef.current.push(timerId);
+                elapsedMs += frameDelayMs;
             });
         },
         [clearActivationPlayback]
@@ -1776,7 +1807,11 @@ function App() {
     };
 
     return (
-        <div className={`app ${isDarkMode ? "dark" : "light"}`}>
+        <div
+            className={`app ${isDarkMode ? "dark" : "light"} ${
+                activeView === "graph" ? "graph-view" : "workspace-view"
+            }`}
+        >
             {!runtimeConfigLoaded && (
                 <div className="auth-overlay">
                     <div className="auth-card">
@@ -2235,7 +2270,16 @@ function App() {
                                 {chatHistory.map((entry, index) => (
                                     <div key={index} className="chat-entry">
                                         <div className="question">
-                                            <strong>Q:</strong> {entry.question}
+                                            <div className="question-main">
+                                                <strong className="question-label">
+                                                    Q:
+                                                </strong>
+                                                <span className="question-text">
+                                                    {String(
+                                                        entry.question || ""
+                                                    ).trim()}
+                                                </span>
+                                            </div>
                                             <span className="timestamp">
                                                 {entry.timestamp}
                                             </span>

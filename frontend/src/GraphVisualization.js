@@ -7,6 +7,27 @@ const TOPIC_NODE_MIN_RADIUS = 18;
 const TOPIC_NODE_MAX_RADIUS = 50;
 const TOPIC_SIZE_EXPONENT = 1.35;
 const COLLISION_PADDING = 12;
+const OVERVIEW_SCALE = 0.18;
+const FOCUS_SCALE = 0.72;
+const ACTIVATION_SOURCE_FOCUS_SCALE = 0.56;
+const ACTIVATION_CONTEXT_PADDING = 1200;
+const ACTIVATION_CONTEXT_MIN_SPAN = 820;
+const ACTIVATION_CONTEXT_MIN_SCALE = 0.1;
+const ACTIVATION_CONTEXT_MAX_SCALE = 0.28;
+const ACTIVATION_SOURCE_HOLD_MS = 230;
+const LABEL_HOVER_DELAY_MS = 250;
+const GRAPH_COLORS = {
+  accentBlue: "#177cbc",
+  gray1: "#44454d",
+  gray2: "#31323a",
+  gray3: "#292a2f",
+  gray4: "#232427",
+  gray5: "#1b1c1f",
+  text: "#d8dce6",
+  stroke: "#0f1013",
+};
+const ACTIVATION_COLOR = "#4da3db";
+const HIGHLIGHT_COLOR = "#f97316";
 
 const normalizeToken = (value) => String(value || '').trim().toLowerCase();
 
@@ -96,7 +117,7 @@ const recommendationBrowserUrl = (paper) => {
   return '';
 };
 
-const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, onTopicClick, highlightPath, apiBase, apiFetch, onAddRecommendationToReadingList }, ref) => {
+const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, onTopicClick, highlightPath, activationFrame, hasChatOverlay = false, apiBase, apiFetch, onAddRecommendationToReadingList }, ref) => {
   const svgRef = useRef();
   const containerRef = useRef();
   const [selectedPaper, setSelectedPaper] = useState(null);
@@ -104,7 +125,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
   const [panelPosition, setPanelPosition] = useState({ x: 0, y: 0 });
   const [showSemanticEdges, setShowSemanticEdges] = useState(true);
   const [showMenu, setShowMenu] = useState(false);
-  const [semanticThreshold, setSemanticThreshold] = useState(0.25);
+  const [semanticThreshold, setSemanticThreshold] = useState(0);
   const [similarPapers, setSimilarPapers] = useState([]);
   const [similarState, setSimilarState] = useState('idle');
   const [similarError, setSimilarError] = useState('');
@@ -114,11 +135,138 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
   const simulationRef = useRef(null);
   const nodesRef = useRef([]);
   const zoomRef = useRef(null);
+  const hoveredLabelTimeoutRef = useRef(null);
+  const activationCameraStateRef = useRef({
+    key: "",
+    didSourceFocus: false,
+    didContextFit: false,
+  });
+  const activationCameraTimeoutRef = useRef(null);
+  const [hoveredLabelNodeId, setHoveredLabelNodeId] = useState(null);
   const panelMetrics = { width: 350, maxHeight: 400, margin: 12 };
   const paperByTitle = useMemo(
     () => new Map((data?.papers || []).map((paper) => [paper.title, paper])),
     [data]
   );
+  const palette = {
+    background: GRAPH_COLORS.gray5,
+    link: GRAPH_COLORS.gray1,
+    semanticLink: GRAPH_COLORS.gray2,
+    paper: GRAPH_COLORS.accentBlue,
+    topic: GRAPH_COLORS.gray3,
+    label: GRAPH_COLORS.text,
+    stroke: GRAPH_COLORS.stroke,
+  };
+  const activationNodeMap = activationFrame?.nodes || {};
+  const nodeColors = activationFrame?.nodeColors || {};
+  const traversedEdges = activationFrame?.traversedEdges || {};
+  const edgeColors = activationFrame?.edgeColors || {};
+  const maxTraversalCount = Number(activationFrame?.maxTraversalCount || 0);
+  const activePromptColor = activationFrame?.promptColor || ACTIVATION_COLOR;
+  const activeSeedColor = d3.interpolateRgb(activePromptColor, "#ffffff")(0.35);
+  const getNodeActivation = (nodeId) => activationNodeMap?.[nodeId] || null;
+
+  const getNodeFillColor = (node, highlightedNodeSet = new Set()) => {
+    if (highlightedNodeSet.has(node.id)) {
+      return HIGHLIGHT_COLOR;
+    }
+    const activation = getNodeActivation(node.id);
+    const baseColor = node.type === 'paper' ? palette.paper : palette.topic;
+    if (!activation) return baseColor;
+    const nodePromptColor = nodeColors[node.id] || activePromptColor;
+    if (activation.stage === "seed") {
+      const seedColor = d3.interpolateRgb(nodePromptColor, "#ffffff")(0.35);
+      return d3.interpolateRgb(baseColor, seedColor)(Math.min(1, Math.max(0, activation.score || 0.35)));
+    }
+    return d3.interpolateRgb(baseColor, nodePromptColor)(Math.min(1, Math.max(0, activation.score || 0)));
+  };
+
+  const getNodeStrokeColor = (node, highlightedNodeSet = new Set()) => {
+    if (highlightedNodeSet.has(node.id)) return "#fde68a";
+    const activation = getNodeActivation(node.id);
+    const nodePromptColor = nodeColors[node.id] || activePromptColor;
+    if (activation?.stage === "seed") {
+      return d3.interpolateRgb(nodePromptColor, "#ffffff")(0.25);
+    }
+    if (activation) return nodePromptColor;
+    return palette.stroke;
+  };
+
+  const getNodeStrokeWidth = (node, highlightedNodeSet = new Set()) => {
+    if (highlightedNodeSet.has(node.id)) return 4;
+    const activation = getNodeActivation(node.id);
+    if (!activation) return 1.6;
+    return 2.3 + (Math.min(1, Math.max(0, activation.score || 0)) * 6.2);
+  };
+
+  const getNodeRadius = (node) => {
+    const activation = getNodeActivation(node.id);
+    const baseRadius = node.radius || PAPER_NODE_RADIUS;
+    if (!activation) return baseRadius;
+    return baseRadius + (Math.min(1, Math.max(0, activation.score || 0)) * 8.4);
+  };
+
+  const getLabelOpacity = (node, highlightedNodeSet = new Set()) => {
+    if (hoveredLabelNodeId === node.id) return 1;
+    if (node.type !== "topic") return 0;
+    if (highlightedNodeSet.has(node.id)) return 1;
+    const activation = getNodeActivation(node.id);
+    if (!activation) return 0;
+    return Math.min(1, 0.25 + (Math.max(0, Number(activation.score) || 0) * 0.75));
+  };
+
+  const getEdgeActivationScore = (edge) => {
+    const sourceId = edge?.source?.id || edge?.source;
+    const targetId = edge?.target?.id || edge?.target;
+    const sourceScore = Number(getNodeActivation(sourceId)?.score || 0);
+    const targetScore = Number(getNodeActivation(targetId)?.score || 0);
+    return Math.max(sourceScore, targetScore);
+  };
+
+  const getEdgeTraversalRatio = (edge) => {
+    const sourceId = edge?.source?.id || edge?.source;
+    const targetId = edge?.target?.id || edge?.target;
+    const edgeKey = [String(sourceId || ""), String(targetId || "")].sort().join("___");
+    const traversalCount = Number(traversedEdges[edgeKey] || 0);
+    if (maxTraversalCount <= 0) return 0;
+    // Boost lower traversal counts so activation remains visible when zoomed out.
+    return Math.min(1, Math.sqrt(traversalCount / maxTraversalCount));
+  };
+
+  const getEdgeVisualActivationRatio = (edge) => {
+    const traversalRatio = getEdgeTraversalRatio(edge);
+    const activationRatio = Math.min(1, Math.max(0, getEdgeActivationScore(edge) || 0));
+    return Math.max(traversalRatio, activationRatio * 0.55);
+  };
+
+  const getEdgeStrokeColor = (edge, isHighlightedPathEdge) => {
+    if (isHighlightedPathEdge) return "#fde68a";
+    const sourceId = edge?.source?.id || edge?.source;
+    const targetId = edge?.target?.id || edge?.target;
+    const edgeKey = [String(sourceId || ""), String(targetId || "")].sort().join("___");
+    const traversalRatio = getEdgeVisualActivationRatio(edge);
+    const baseColor = edge.type === 'semantic' ? palette.semanticLink : palette.link;
+    if (traversalRatio <= 0) return baseColor;
+    const edgePromptColor = edgeColors[edgeKey] || activePromptColor;
+    return d3.interpolateRgb(baseColor, edgePromptColor)(Math.min(1, traversalRatio));
+  };
+
+  const getEdgeStrokeWidth = (edge, isHighlightedPathEdge) => {
+    if (isHighlightedPathEdge) return 8;
+    const traversalRatio = getEdgeVisualActivationRatio(edge);
+    const baseWidth = edge.type === 'semantic' ? 2.2 : 1.8;
+    return baseWidth + (traversalRatio * 10.8);
+  };
+
+  const getEdgeOpacity = (edge, isHighlightedPathEdge) => {
+    if (isHighlightedPathEdge) return 0.95;
+    const traversalRatio = getEdgeVisualActivationRatio(edge);
+    if (edge.type === 'semantic') {
+      if (!showSemanticEdges || Number(edge.weight || 0) < semanticThreshold) return 0;
+      return Math.min(0.97, 0.34 + (traversalRatio * 0.56));
+    }
+    return Math.min(0.96, 0.3 + (traversalRatio * 0.6));
+  };
 
   const toSelectedPaper = (paper) => ({
     title: paper?.title || "",
@@ -260,12 +408,39 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     return (papers || []).filter((paper) => connectedTitles.has(paper.title));
   };
 
+  function getViewportMetrics() {
+    const container = containerRef.current;
+    if (!container) {
+      return {
+        width: 0,
+        height: 0,
+        rightInset: 0,
+        mapWidth: 0,
+        centerX: 0,
+        centerY: 0,
+      };
+    }
+    const width = container.clientWidth;
+    const height = container.clientHeight;
+    const rightInset = hasChatOverlay ? Math.min(430, width * 0.36) : 0;
+    const mapWidth = Math.max(120, width - rightInset);
+    return {
+      width,
+      height,
+      rightInset,
+      mapWidth,
+      centerX: mapWidth / 2,
+      centerY: height / 2,
+    };
+  }
+
   const clampPanelToContainer = (x, y) => {
     const container = containerRef.current;
     if (!container) return { x, y };
+    const viewport = getViewportMetrics();
     const maxX = Math.max(
       panelMetrics.margin,
-      container.clientWidth - panelMetrics.width - panelMetrics.margin
+      viewport.mapWidth - panelMetrics.width - panelMetrics.margin
     );
     const maxY = Math.max(
       panelMetrics.margin,
@@ -283,6 +458,75 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       transformOverride || d3.zoomTransform(d3.select(svgRef.current).node());
     const [x, y] = transform.apply([node.x, node.y]);
     return clampPanelToContainer(x + 20, y - 10);
+  };
+
+  const getOverviewTransformForSize = (centerX, centerY) => {
+    const cx = centerX;
+    const cy = centerY;
+    return d3.zoomIdentity
+      .translate(cx, cy)
+      .scale(OVERVIEW_SCALE)
+      .translate(-cx, -cy);
+  };
+
+  const transitionToTransform = (transform, durationMs = 650) => {
+    if (!zoomRef.current || !svgRef.current || !transform) return;
+    const svg = d3.select(svgRef.current);
+    svg.interrupt();
+    svg.transition().duration(durationMs).call(zoomRef.current.transform, transform);
+  };
+
+  const resetOverviewZoom = (durationMs = 650) => {
+    const viewport = getViewportMetrics();
+    transitionToTransform(
+      getOverviewTransformForSize(viewport.centerX, viewport.centerY),
+      durationMs
+    );
+  };
+
+  const zoomToNodes = (nodeIds, options = {}) => {
+    if (!zoomRef.current || !containerRef.current || !Array.isArray(nodeIds) || nodeIds.length === 0) {
+      return;
+    }
+    const {
+      durationMs = 700,
+      padding = 720,
+      minSpan = 260,
+      minScale = 0.2,
+      maxScale = 0.72,
+    } = options;
+    const targetNodes = nodesRef.current.filter((node) => nodeIds.includes(node.id));
+    if (targetNodes.length === 0) return;
+
+    const viewport = getViewportMetrics();
+    const width = viewport.mapWidth;
+    const height = viewport.height;
+    const minX = Math.min(...targetNodes.map((node) => node.x));
+    const maxX = Math.max(...targetNodes.map((node) => node.x));
+    const minY = Math.min(...targetNodes.map((node) => node.y));
+    const maxY = Math.max(...targetNodes.map((node) => node.y));
+    const spanX = Math.max(minSpan, maxX - minX + padding);
+    const spanY = Math.max(minSpan, maxY - minY + padding);
+    const scale = Math.max(
+      minScale,
+      Math.min(maxScale, Math.min(width / spanX, height / spanY))
+    );
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    const transform = d3.zoomIdentity
+      .translate(viewport.centerX - centerX * scale, viewport.centerY - centerY * scale)
+      .scale(scale);
+    transitionToTransform(transform, durationMs);
+  };
+
+  const focusNodeWithZoom = (node, durationMs = 750, scale = FOCUS_SCALE) => {
+    if (!node || !containerRef.current) return;
+    const viewport = getViewportMetrics();
+    const newX = -node.x * scale + viewport.centerX;
+    const newY = -node.y * scale + viewport.centerY;
+    const transform = d3.zoomIdentity.translate(newX, newY).scale(scale);
+    transitionToTransform(transform, durationMs);
+    return transform;
   };
 
   const pinNode = (node) => {
@@ -312,20 +556,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       
       selectedNodeRef.current = topicNode;
       pinNode(topicNode);
-      
-      // Navigate to topic location
-      const svg = d3.select(svgRef.current);
-      const container = containerRef.current;
-      const width = container.clientWidth;
-      const height = container.clientHeight;
-      const scale = 1.5;
-      const newX = -topicNode.x * scale + width / 2;
-      const newY = -topicNode.y * scale + height / 2;
-      const targetTransform = d3.zoomIdentity.translate(newX, newY).scale(scale);
-      
-      svg.transition()
-        .duration(750)
-        .call(zoomRef.current.transform, targetTransform);
+      const targetTransform = focusNodeWithZoom(topicNode);
       
       // Show topic panel near node, constrained inside container.
       const nextPanelPosition = getPanelPositionForNode(topicNode, targetTransform);
@@ -353,20 +584,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       
       selectedNodeRef.current = paperNode;
       pinNode(paperNode);
-      
-      // Navigate to paper location
-      const svg = d3.select(svgRef.current);
-      const container = containerRef.current;
-      const width = container.clientWidth;
-      const height = container.clientHeight;
-      const scale = 1.5;
-      const newX = -paperNode.x * scale + width / 2;
-      const newY = -paperNode.y * scale + height / 2;
-      const targetTransform = d3.zoomIdentity.translate(newX, newY).scale(scale);
-      
-      svg.transition()
-        .duration(750)
-        .call(zoomRef.current.transform, targetTransform);
+      const targetTransform = focusNodeWithZoom(paperNode);
       
       // Show paper panel near node, constrained inside container.
       const nextPanelPosition = getPanelPositionForNode(paperNode, targetTransform);
@@ -378,7 +596,10 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
         setSelectedTopic(null);
         setSelectedPaper(toSelectedPaper(paper));
       }
-    }
+    },
+    resetOverviewZoom: () => {
+      resetOverviewZoom();
+    },
   }));
 
   useEffect(() => {
@@ -393,9 +614,10 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
 
     const width = container.clientWidth;
     const height = container.clientHeight;
+    const viewport = getViewportMetrics();
 
     svg.attr("width", width).attr("height", height)
-      .style("background-color", isDarkMode ? "#2a2a2a" : "white")
+      .style("background-color", palette.background)
       .style("transition", "background-color 0.5s ease");
 
     // Update existing elements if simulation exists
@@ -403,12 +625,12 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       svg.selectAll("line")
         .transition()
         .duration(500)
-        .attr("stroke", d => d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000"));
+        .attr("stroke", d => d.type === 'semantic' ? palette.semanticLink : palette.link);
       
       svg.selectAll("text")
         .transition()
         .duration(500)
-        .attr("fill", isDarkMode ? "#ccc" : "#333");
+        .attr("fill", palette.label);
       
       return;
     }
@@ -484,7 +706,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
           return Math.max(60, 150 - degree * 5);
         }))
       .force("charge", d3.forceManyBody().strength(-400))
-      .force("center", d3.forceCenter(width / 2, height / 2))
+      .force("center", d3.forceCenter(viewport.centerX, viewport.centerY))
       .force("collision", d3.forceCollide().radius((d) => (d.radius || PAPER_NODE_RADIUS) + COLLISION_PADDING))
       .alphaDecay(0.01);
 
@@ -506,30 +728,21 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     zoomRef.current = zoom;
 
     svg.call(zoom);
+    svg.call(
+      zoom.transform,
+      getOverviewTransformForSize(viewport.centerX, viewport.centerY)
+    );
 
     const link = g.append("g")
       .selectAll("line")
       .data(links)
       .enter().append("line")
-      .attr("stroke", d => {
-        if (isEdgeInHighlightedPath(d)) {
-          return "#FFD600";
-        }
-        
-        return d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000");
-      })
-      .attr("stroke-width", d => {
-        if (isEdgeInHighlightedPath(d)) {
-          return 6;
-        }
-        
-        return d.type === 'semantic' ? ((d.weight - 0.25) * 4) : 4;
-      })
-      .attr("stroke-opacity", d => {
-        if (d.type === 'semantic') {
-          return (d.weight >= semanticThreshold && showSemanticEdges) ? 0.6 : 0;
-        }
-        return 0.6;
+      .attr("stroke", d => getEdgeStrokeColor(d, isEdgeInHighlightedPath(d)))
+      .attr("stroke-width", d => getEdgeStrokeWidth(d, isEdgeInHighlightedPath(d)))
+      .attr("stroke-opacity", d => getEdgeOpacity(d, isEdgeInHighlightedPath(d)))
+      .style("filter", d => {
+        const traversalRatio = getEdgeVisualActivationRatio(d);
+        return traversalRatio > 0.24 ? `drop-shadow(0 0 2px ${activePromptColor}66)` : "none";
       })
       .style("cursor", d => d.type === 'semantic' ? "pointer" : "default")
       .on("click", function(event, d) {
@@ -543,37 +756,33 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       .selectAll("circle")
       .data(nodes)
       .enter().append("circle")
-      .attr("r", (d) => d.radius || PAPER_NODE_RADIUS)
-      .attr("fill", d => {
-        if (highlightedNodeSet.has(d.id)) {
-          return d.type === 'paper' ? "#FF6B35" : "#FF1744";
-        }
-        return d.type === 'paper' ? "#4CAF50" : "#FF6B6B";
-      })
-      .attr("stroke", d => {
-        if (highlightedNodeSet.has(d.id)) {
-          return "#FFD600";
-        }
-        return "#fff";
-      })
-      .attr("stroke-width", d => {
-        if (highlightedNodeSet.has(d.id)) {
-          return 4;
-        }
-        return 2;
+      .attr("r", (d) => getNodeRadius(d))
+      .attr("fill", d => getNodeFillColor(d, highlightedNodeSet))
+      .attr("stroke", d => getNodeStrokeColor(d, highlightedNodeSet))
+      .attr("stroke-width", d => getNodeStrokeWidth(d, highlightedNodeSet))
+      .style("filter", d => {
+        const activation = getNodeActivation(d.id);
+        if (!activation) return "none";
+        const nodePromptColor = nodeColors[d.id] || activePromptColor;
+        const alpha = Math.min(0.7, 0.22 + (Number(activation.score || 0) * 0.5));
+        const hexAlpha = Math.round(alpha * 255).toString(16).padStart(2, "0");
+        return `drop-shadow(0 0 7px ${nodePromptColor}${hexAlpha})`;
       })
       .style("cursor", "pointer")
       .on("mouseover", function(event, d) {
-        if (d.type === 'paper') {
-          label.filter(labelData => labelData.id === d.id)
-            .style("opacity", 1);
+        if (hoveredLabelTimeoutRef.current) {
+          window.clearTimeout(hoveredLabelTimeoutRef.current);
         }
+        hoveredLabelTimeoutRef.current = window.setTimeout(() => {
+          setHoveredLabelNodeId(d.id);
+        }, LABEL_HOVER_DELAY_MS);
       })
       .on("mouseout", function(event, d) {
-        if (d.type === 'paper') {
-          label.filter(labelData => labelData.id === d.id)
-            .style("opacity", 0);
+        if (hoveredLabelTimeoutRef.current) {
+          window.clearTimeout(hoveredLabelTimeoutRef.current);
+          hoveredLabelTimeoutRef.current = null;
         }
+        setHoveredLabelNodeId((previous) => (previous === d.id ? null : previous));
       })
       .on("click", function(event, d) {
         event.stopPropagation();
@@ -605,13 +814,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
         }
 
         // zoom smoothly toward node
-        const scale = 1.5;
-        const newX = -d.x * scale + width / 2;
-        const newY = -d.y * scale + height / 2;
-
-        svg.transition()
-          .duration(750)
-          .call(zoom.transform, d3.zoomIdentity.translate(newX, newY).scale(scale));
+        focusNodeWithZoom(d);
       })
       .call(d3.drag()
         .on("start", dragstarted)
@@ -625,14 +828,14 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
       .text(d => d.type === 'topic' ? d.id : (d.id.length > 30 ? d.id.substring(0, 30) + '...' : d.id))
       .attr("font-size", d => d.type === 'topic' ? 14 : 10)
       .attr("font-family", "Arial, sans-serif")
-      .attr("fill", isDarkMode ? "#ccc" : "#333")
+      .attr("fill", palette.label)
       .attr("text-anchor", "middle")
       .attr("dy", d => d.type === 'topic' ? 5 : -20)
       .style("pointer-events", "none")
-      .style("opacity", d => d.type === 'topic' ? 1 : 0)
+      .style("opacity", d => getLabelOpacity(d, highlightedNodeSet))
       .style("transition", "opacity 0.3s ease, fill 0.5s ease")
       .style("paint-order", "stroke fill")
-      .style("stroke", isDarkMode ? "#2a2a2a" : "white")
+      .style("stroke", palette.background)
       .style("stroke-width", "3px")
       .style("stroke-linejoin", "round");
 
@@ -709,14 +912,22 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     const handleResize = () => {
       const newWidth = container.clientWidth;
       const newHeight = container.clientHeight;
+      const resizedViewport = getViewportMetrics();
       svg.attr("width", newWidth).attr("height", newHeight);
-      simulation.force("center", d3.forceCenter(newWidth / 2, newHeight / 2));
+      simulation.force(
+        "center",
+        d3.forceCenter(resizedViewport.centerX, resizedViewport.centerY)
+      );
       simulation.alpha(0.3).restart();
     };
 
     window.addEventListener('resize', handleResize);
     return () => {
       window.removeEventListener('resize', handleResize);
+      if (hoveredLabelTimeoutRef.current) {
+        window.clearTimeout(hoveredLabelTimeoutRef.current);
+        hoveredLabelTimeoutRef.current = null;
+      }
       unpinNode();
       if (simulationRef.current) {
         simulationRef.current.stop();
@@ -724,20 +935,33 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     };
   }, [data]);
 
+  useEffect(() => {
+    if (!simulationRef.current || !containerRef.current || !svgRef.current) return;
+    const viewport = getViewportMetrics();
+    simulationRef.current.force(
+      "center",
+      d3.forceCenter(viewport.centerX, viewport.centerY)
+    );
+    // Keep this subtle to avoid a visible hitch when switching views.
+    simulationRef.current.alpha(Math.max(0.08, simulationRef.current.alpha())).restart();
+  }, [hasChatOverlay]);
+
   // Separate effect for theme changes
   useEffect(() => {
     if (!simulationRef.current) return;
     
     const svg = d3.select(svgRef.current);
-    svg.style("background-color", isDarkMode ? "#2a2a2a" : "white");
+    svg.style("background-color", palette.background);
     
     svg.selectAll("line")
-      .attr("stroke", d => d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000"));
+      .attr("stroke", d => getEdgeStrokeColor(d, false))
+      .attr("stroke-width", d => getEdgeStrokeWidth(d, false))
+      .attr("stroke-opacity", d => getEdgeOpacity(d, false));
     
     svg.selectAll("text")
-      .attr("fill", isDarkMode ? "#ccc" : "#333")
-      .style("stroke", isDarkMode ? "#2a2a2a" : "white");
-  }, [isDarkMode]);
+      .attr("fill", palette.label)
+      .style("stroke", palette.background);
+  }, [isDarkMode, palette.background, palette.label, palette.link, palette.semanticLink, semanticThreshold, showSemanticEdges]);
 
   // Update highlighted nodes/edges without recreating simulation.
   useEffect(() => {
@@ -771,24 +995,39 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
 
     g.selectAll("line")
       .attr("stroke", (d) => {
-        if (isEdgeInHighlightedPath(d)) return "#FFD600";
-        return d.type === 'semantic' ? (isDarkMode ? "#888" : "#999") : (isDarkMode ? "#ccc" : "#000");
+        const inPath = isEdgeInHighlightedPath(d);
+        return getEdgeStrokeColor(d, inPath);
       })
       .attr("stroke-width", (d) => {
-        if (isEdgeInHighlightedPath(d)) return 6;
-        return d.type === 'semantic' ? ((d.weight - 0.25) * 4) : 4;
+        const inPath = isEdgeInHighlightedPath(d);
+        return getEdgeStrokeWidth(d, inPath);
+      })
+      .attr("stroke-opacity", (d) => {
+        const inPath = isEdgeInHighlightedPath(d);
+        return getEdgeOpacity(d, inPath);
+      })
+      .style("filter", (d) => {
+        const traversalRatio = getEdgeVisualActivationRatio(d);
+        return traversalRatio > 0.24 ? `drop-shadow(0 0 2px ${activePromptColor}66)` : "none";
       });
 
     g.selectAll("circle")
-      .attr("fill", (d) => {
-        if (highlightedNodeSet.has(d.id)) {
-          return d.type === 'paper' ? "#FF6B35" : "#FF1744";
-        }
-        return d.type === 'paper' ? "#4CAF50" : "#FF6B6B";
-      })
-      .attr("stroke", (d) => (highlightedNodeSet.has(d.id) ? "#FFD600" : "#fff"))
-      .attr("stroke-width", (d) => (highlightedNodeSet.has(d.id) ? 4 : 2));
-  }, [highlightPath, isDarkMode, data]);
+      .attr("fill", (d) => getNodeFillColor(d, highlightedNodeSet))
+      .attr("stroke", (d) => getNodeStrokeColor(d, highlightedNodeSet))
+      .attr("stroke-width", (d) => getNodeStrokeWidth(d, highlightedNodeSet))
+      .attr("r", (d) => getNodeRadius(d))
+      .style("filter", (d) => {
+        const activation = getNodeActivation(d.id);
+        if (!activation) return "none";
+        const nodePromptColor = nodeColors[d.id] || activePromptColor;
+        const alpha = Math.min(0.7, 0.22 + (Number(activation.score || 0) * 0.5));
+        const hexAlpha = Math.round(alpha * 255).toString(16).padStart(2, "0");
+        return `drop-shadow(0 0 7px ${nodePromptColor}${hexAlpha})`;
+      });
+
+    g.selectAll("text")
+      .style("opacity", (d) => getLabelOpacity(d, highlightedNodeSet));
+  }, [highlightPath, isDarkMode, data, activationFrame, palette.link, palette.semanticLink, semanticThreshold, showSemanticEdges, hoveredLabelNodeId]);
 
   // Effect for semantic edges toggle and threshold
   useEffect(() => {
@@ -796,12 +1035,9 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     
     const svg = d3.select(svgRef.current);
     svg.select("g").selectAll("line")
-      .attr("stroke-opacity", d => {
-        if (d.type === 'semantic') {
-          return (d.weight >= semanticThreshold && showSemanticEdges) ? 0.6 : 0;
-        }
-        return 0.6;
-      });
+      .attr("stroke", d => getEdgeStrokeColor(d, false))
+      .attr("stroke-width", d => getEdgeStrokeWidth(d, false))
+      .attr("stroke-opacity", d => getEdgeOpacity(d, false));
     
     // Update simulation forces only for layout
     const links = buildLinks(data.papers, data.edges);
@@ -814,10 +1050,79 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
     simulationRef.current.alpha(0.3).restart();
   }, [semanticThreshold, showSemanticEdges, data, isDarkMode]);
 
+  useEffect(() => {
+    if (!activationFrame || !zoomRef.current) return;
+    if (selectedPaper || selectedTopic) return;
+
+    const roundKey = `${activationFrame.promptIndex || 0}-${activationFrame.roundIndex || 0}`;
+    const cameraState = activationCameraStateRef.current;
+    if (cameraState.key !== roundKey) {
+      cameraState.key = roundKey;
+      cameraState.didSourceFocus = false;
+      cameraState.didContextFit = false;
+      if (activationCameraTimeoutRef.current) {
+        window.clearTimeout(activationCameraTimeoutRef.current);
+        activationCameraTimeoutRef.current = null;
+      }
+    }
+
+    const traceNodeIds = Array.isArray(activationFrame.traceNodeIds) && activationFrame.traceNodeIds.length > 0
+      ? activationFrame.traceNodeIds
+      : (Array.isArray(activationFrame.seedNodeIds) ? activationFrame.seedNodeIds : []);
+    if (traceNodeIds.length === 0) return;
+
+    const cameraPhase = String(activationFrame.cameraPhase || "");
+    if (cameraPhase === "source_focus" && !cameraState.didSourceFocus) {
+      const focusNodeId = activationFrame.focusNodeId || traceNodeIds[0];
+      const focusNode = nodesRef.current.find((candidate) => candidate.id === focusNodeId);
+      if (!focusNode) return;
+      focusNodeWithZoom(focusNode, 220, ACTIVATION_SOURCE_FOCUS_SCALE);
+      cameraState.didSourceFocus = true;
+      activationCameraTimeoutRef.current = window.setTimeout(() => {
+        zoomToNodes(traceNodeIds, {
+          durationMs: 650,
+          padding: ACTIVATION_CONTEXT_PADDING,
+          minSpan: ACTIVATION_CONTEXT_MIN_SPAN,
+          minScale: ACTIVATION_CONTEXT_MIN_SCALE,
+          maxScale: ACTIVATION_CONTEXT_MAX_SCALE,
+        });
+        const latestState = activationCameraStateRef.current;
+        if (latestState.key === roundKey) {
+          latestState.didContextFit = true;
+        }
+        activationCameraTimeoutRef.current = null;
+      }, ACTIVATION_SOURCE_HOLD_MS);
+      return;
+    }
+
+    if (
+      (cameraPhase === "zoomed_out_context" || cameraPhase === "source_focus") &&
+      !cameraState.didContextFit
+    ) {
+      zoomToNodes(traceNodeIds, {
+        durationMs: 650,
+        padding: ACTIVATION_CONTEXT_PADDING,
+        minSpan: ACTIVATION_CONTEXT_MIN_SPAN,
+        minScale: ACTIVATION_CONTEXT_MIN_SCALE,
+        maxScale: ACTIVATION_CONTEXT_MAX_SCALE,
+      });
+      cameraState.didContextFit = true;
+    }
+  }, [activationFrame, selectedPaper, selectedTopic]);
+
+  useEffect(() => {
+    return () => {
+      if (activationCameraTimeoutRef.current) {
+        window.clearTimeout(activationCameraTimeoutRef.current);
+        activationCameraTimeoutRef.current = null;
+      }
+    };
+  }, []);
+
 
 
   return (
-    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative', backgroundColor: 'white' }}>
+    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative', backgroundColor: palette.background }}>
       <div style={{ position: 'absolute', top: '20px', right: '20px', zIndex: 1001 }}>
         <button
           onClick={() => setShowMenu(!showMenu)}
@@ -919,7 +1224,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
           boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
           padding: '20px',
           overflowY: 'auto',
-          zIndex: 1000,
+          zIndex: 1900,
           pointerEvents: 'auto'
         }}>
           <button 
@@ -927,6 +1232,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
               setSelectedPaper(null);
               unpinNode();
               setPanelPosition({ x: 0, y: 0 });
+              resetOverviewZoom();
             }}
             style={{
               position: 'absolute',
@@ -976,19 +1282,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
                     const topicNode = nodesRef.current.find(node => node.type === 'topic' && node.id === topic);
                     if (topicNode && zoomRef.current) {
                       selectedNodeRef.current = topicNode;
-                      
-                      // Navigate to topic location
-                      const svg = d3.select(svgRef.current);
-                      const container = containerRef.current;
-                      const width = container.clientWidth;
-                      const height = container.clientHeight;
-                      const scale = 1.5;
-                      const newX = -topicNode.x * scale + width / 2;
-                      const newY = -topicNode.y * scale + height / 2;
-                      
-                      svg.transition()
-                        .duration(750)
-                        .call(zoomRef.current.transform, d3.zoomIdentity.translate(newX, newY).scale(scale));
+                      focusNodeWithZoom(topicNode);
                       
                       // Find connected papers for topic panel
                       const links = buildLinks(data.papers, data.edges);
@@ -1184,7 +1478,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
           boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
           padding: '20px',
           overflowY: 'auto',
-          zIndex: 1000,
+          zIndex: 1900,
           pointerEvents: 'auto'
         }}>
           <button 
@@ -1192,6 +1486,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
               setSelectedTopic(null);
               unpinNode();
               setPanelPosition({ x: 0, y: 0 });
+              resetOverviewZoom();
             }}
             style={{
               position: 'absolute',
@@ -1230,19 +1525,7 @@ const GraphVisualization = forwardRef(({ data, isDarkMode, onShowArchitecture, o
                 const paperNode = nodesRef.current.find(node => node.id === paper.title);
                 if (paperNode && zoomRef.current) {
                   selectedNodeRef.current = paperNode;
-                  
-                  // Navigate to paper location
-                  const svg = d3.select(svgRef.current);
-                  const container = containerRef.current;
-                  const width = container.clientWidth;
-                  const height = container.clientHeight;
-                  const scale = 1.5;
-                  const newX = -paperNode.x * scale + width / 2;
-                  const newY = -paperNode.y * scale + height / 2;
-                  
-                  svg.transition()
-                    .duration(750)
-                    .call(zoomRef.current.transform, d3.zoomIdentity.translate(newX, newY).scale(scale));
+                  focusNodeWithZoom(paperNode);
                 }
                 
                 setSelectedTopic(null);

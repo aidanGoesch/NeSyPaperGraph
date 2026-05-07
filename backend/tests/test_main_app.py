@@ -70,7 +70,14 @@ def test_search_endpoint_success(client, monkeypatch):
     class FakeAgent:
         def __init__(self, *_args, **_kwargs):
             init_calls["count"] += 1
-            self._last_state = {"sources_used": ["Paper A"]}
+            self._last_state = {
+                "sources_used": ["Paper A"],
+                "answer_structured": {
+                    "segments": [{"text": "Answer text", "claim_id": None}],
+                    "claims": [],
+                    "warnings": [],
+                },
+            }
             self._last_path = {"nodes": ["Paper A", "Topic X"]}
 
         async def answer_question(self, _query):
@@ -89,6 +96,7 @@ def test_search_endpoint_success(client, monkeypatch):
     assert first.status_code == 200
     assert first.json()["status"] == "success"
     assert first.json()["answer"] == "Answer text"
+    assert first.json()["answer_structured"]["segments"][0]["text"] == "Answer text"
     assert init_calls["count"] == 1
 
     # Force graph identity change; cached agent should rebuild.

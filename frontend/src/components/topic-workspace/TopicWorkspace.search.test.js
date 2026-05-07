@@ -11,6 +11,7 @@ jest.mock("./ClusterTree", () => (props) => (
 
 let lastPaperWorkbenchProps = null;
 let lastThemeNotebookProps = null;
+let lastToReadInboxProps = null;
 jest.mock("./PaperWorkbenchList", () => (props) => {
     lastPaperWorkbenchProps = props;
     return <div>PaperWorkbenchList</div>;
@@ -19,7 +20,10 @@ jest.mock("./ThemeNotebook", () => (props) => {
     lastThemeNotebookProps = props;
     return <div>ThemeNotebook</div>;
 });
-jest.mock("./ToReadInbox", () => () => <div>ToReadInbox</div>);
+jest.mock("./ToReadInbox", () => (props) => {
+    lastToReadInboxProps = props;
+    return <div>ToReadInbox</div>;
+});
 jest.mock("./ThemeAssignmentModal", () => () => <div>ThemeAssignmentModal</div>);
 
 const TopicWorkspace = require("./TopicWorkspace").default;
@@ -86,6 +90,7 @@ describe("TopicWorkspace inferred search", () => {
         jest.useFakeTimers();
         lastPaperWorkbenchProps = null;
         lastThemeNotebookProps = null;
+        lastToReadInboxProps = null;
         delete window.desktopBridge;
     });
 
@@ -513,5 +518,230 @@ describe("TopicWorkspace inferred search", () => {
                 status: "reading",
             })
         );
+    });
+
+    test("desktop open event reuses active identity for non-ssid publisher url hops", () => {
+        let onOpen = null;
+        window.desktopBridge = {
+            onOpenInReaderUrl(handler) {
+                onOpen = handler;
+                return () => {
+                    onOpen = null;
+                };
+            },
+        };
+        const workspaceStore = makeWorkspaceStore();
+        workspaceStore.state.readingItems = [
+            {
+                id: "read-1",
+                status: "inbox",
+                title: "Paper Identity",
+                linkedPaperTitle: "Paper Identity",
+                url: "https://www.semanticscholar.org/paper/Paper-Identity/abcd1234",
+                semanticScholarPaperId: "abcd1234",
+                authors: ["A"],
+                year: 2019,
+                venue: "Conf",
+            },
+        ];
+        renderWorkspace({
+            workspaceStore,
+            desktopConfig: {
+                isDesktop: true,
+                supportsInAppBrowser: true,
+            },
+        });
+
+        act(() => {
+            lastToReadInboxProps.onOpenReadingItem(workspaceStore.state.readingItems[0]);
+        });
+        expect(lastPaperWorkbenchProps.requestedReaderItem).toEqual(
+            expect.objectContaining({
+                readingItemId: "read-1",
+                semanticScholarPaperId: "abcd1234",
+            })
+        );
+
+        act(() => {
+            onOpen?.("https://www.wilmabainbridge.com/sharepapers/plm-2019.pdf");
+        });
+        expect(lastPaperWorkbenchProps.requestedReaderItem).toEqual(
+            expect.objectContaining({
+                readingItemId: "read-1",
+                semanticScholarPaperId: "abcd1234",
+                title: "Paper Identity",
+                url: "https://www.wilmabainbridge.com/sharepapers/plm-2019.pdf",
+            })
+        );
+    });
+
+    test("desktop open event reuses identity when semantic scholar id matches", () => {
+        let onOpen = null;
+        window.desktopBridge = {
+            onOpenInReaderUrl(handler) {
+                onOpen = handler;
+                return () => {
+                    onOpen = null;
+                };
+            },
+        };
+        const workspaceStore = makeWorkspaceStore();
+        workspaceStore.state.readingItems = [
+            {
+                id: "read-1",
+                status: "reading",
+                title: "Paper Identity",
+                linkedPaperTitle: "Paper Identity",
+                url: "https://www.semanticscholar.org/paper/Paper-Identity/abcd1234",
+                semanticScholarPaperId: "abcd1234",
+                authors: ["A"],
+                year: 2019,
+                venue: "Conf",
+            },
+        ];
+        renderWorkspace({
+            workspaceStore,
+            desktopConfig: {
+                isDesktop: true,
+                supportsInAppBrowser: true,
+            },
+        });
+
+        act(() => {
+            lastToReadInboxProps.onOpenReadingItem(workspaceStore.state.readingItems[0]);
+        });
+        act(() => {
+            onOpen?.("https://www.semanticscholar.org/paper/Paper-Identity-Variant/abcd1234");
+        });
+        expect(lastPaperWorkbenchProps.requestedReaderItem).toEqual(
+            expect.objectContaining({
+                readingItemId: "read-1",
+                semanticScholarPaperId: "abcd1234",
+                title: "Paper Identity",
+            })
+        );
+    });
+
+    test("desktop open event does not reuse active identity for different semantic scholar paper id", () => {
+        let onOpen = null;
+        window.desktopBridge = {
+            onOpenInReaderUrl(handler) {
+                onOpen = handler;
+                return () => {
+                    onOpen = null;
+                };
+            },
+        };
+        const workspaceStore = makeWorkspaceStore();
+        workspaceStore.state.readingItems = [
+            {
+                id: "read-1",
+                status: "reading",
+                title: "Paper Identity",
+                linkedPaperTitle: "Paper Identity",
+                url: "https://www.semanticscholar.org/paper/Paper-Identity/abcd1234",
+                semanticScholarPaperId: "abcd1234",
+                authors: ["A"],
+                year: 2019,
+                venue: "Conf",
+            },
+        ];
+        renderWorkspace({
+            workspaceStore,
+            desktopConfig: {
+                isDesktop: true,
+                supportsInAppBrowser: true,
+            },
+        });
+
+        act(() => {
+            lastToReadInboxProps.onOpenReadingItem(workspaceStore.state.readingItems[0]);
+        });
+        expect(lastPaperWorkbenchProps.requestedReaderItem).toEqual(
+            expect.objectContaining({
+                readingItemId: "read-1",
+                semanticScholarPaperId: "abcd1234",
+                title: "Paper Identity",
+            })
+        );
+
+        act(() => {
+            onOpen?.("https://www.semanticscholar.org/paper/Other-Paper/efgh5678");
+        });
+        expect(lastPaperWorkbenchProps.requestedReaderItem).toEqual(
+            expect.objectContaining({
+                readingItemId: null,
+                semanticScholarPaperId: "efgh5678",
+                url: "https://www.semanticscholar.org/paper/Other-Paper/efgh5678",
+            })
+        );
+        expect(lastPaperWorkbenchProps.requestedReaderItem.title).not.toBe("Paper Identity");
+    });
+
+    test("markReadingItemDone migrates note content to ingested paper title when source key differs", async () => {
+        const upsertPaperAnnotation = jest.fn();
+        const removeReadingItem = jest.fn();
+        const workspaceStore = {
+            state: {
+                readingItems: [
+                    {
+                        id: "read-1",
+                        status: "inbox",
+                        title: "Memorability alias",
+                        linkedPaperTitle: null,
+                        semanticScholarPaperId: "186336411",
+                        url: "https://www.semanticscholar.org/paper/Foo/186336411",
+                    },
+                ],
+                themeNotes: [],
+                paperAnnotations: {},
+            },
+            actions: {
+                upsertPaperAnnotation,
+                upsertThemeNote: jest.fn(),
+                reorderReadingItem: jest.fn(),
+                addReadingItem: jest.fn(),
+                updateReadingItem: jest.fn(),
+                removeReadingItem,
+                linkPaperToTheme: jest.fn(),
+                setPaperThemeMembership: jest.fn(),
+            },
+            selectors: {
+                getPaperAnnotation: jest.fn((key) => {
+                    if (key === "ssid:186336411") {
+                        return {
+                            paperTitle: "ssid:186336411",
+                            notesMarkdown: "- nested note\n  - detail",
+                            sourceUrl:
+                                "https://www.semanticscholar.org/paper/Foo/186336411",
+                        };
+                    }
+                    if (key === "Memorability: How what we see influences what we remember") {
+                        return {
+                            paperTitle: key,
+                            notesMarkdown: "",
+                            sourceUrl: "",
+                        };
+                    }
+                    return null;
+                }),
+            },
+        };
+        const onIngestReadingItem = jest.fn().mockResolvedValue({
+            paper_title: "Memorability: How what we see influences what we remember",
+        });
+
+        renderWorkspace({ workspaceStore, onIngestReadingItem });
+        await act(async () => {
+            await lastPaperWorkbenchProps.onMarkReadingItemDone(workspaceStore.state.readingItems[0]);
+        });
+
+        expect(upsertPaperAnnotation).toHaveBeenCalledWith(
+            "Memorability: How what we see influences what we remember",
+            expect.objectContaining({
+                notesMarkdown: "- nested note\n  - detail",
+            })
+        );
+        expect(removeReadingItem).toHaveBeenCalledWith("read-1");
     });
 });

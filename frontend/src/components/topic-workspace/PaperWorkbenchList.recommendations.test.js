@@ -99,6 +99,10 @@ function renderListWithAnnotationState(overrides = {}) {
 }
 
 describe("PaperWorkbenchList recommendations", () => {
+    beforeEach(() => {
+        window.localStorage.removeItem("nesy_paper_notes_rich_editor_enabled");
+    });
+
     test("selects requested paper using normalized title matching", async () => {
         renderList({
             requestedPaperTitle: "  neuro-symbolic program synthesis  ",
@@ -170,10 +174,9 @@ describe("PaperWorkbenchList recommendations", () => {
         expect(
             screen.getByRole("dialog", { name: "Paper reader and notes" })
         ).toBeTruthy();
-        const modalTextarea = screen.getByPlaceholderText(
-            "Capture paper-specific insights. Use Tab/Shift+Tab for nested bullets."
-        );
-        fireEvent.change(modalTextarea, { target: { value: "Expanded note text" } });
+        const richEditor = screen.getByRole("textbox", { name: "Paper notes editor" });
+        richEditor.innerHTML = "<p>Expanded note text</p>";
+        fireEvent.input(richEditor);
 
         expect(onUpdatePaperAnnotation).toHaveBeenCalledWith(
             "Neuro-Symbolic Program Synthesis",
@@ -208,6 +211,7 @@ describe("PaperWorkbenchList recommendations", () => {
     });
 
     test("supports tab indentation and enter continuation for bullet notes", () => {
+        window.localStorage.setItem("nesy_paper_notes_rich_editor_enabled", "0");
         const onUpdatePaperAnnotation = jest.fn();
         const onResolvePaperMetadata = jest.fn().mockResolvedValue({
             url: "https://arxiv.org/abs/1706.03762",
@@ -241,6 +245,52 @@ describe("PaperWorkbenchList recommendations", () => {
         );
     });
 
+    test("rich editor invokes bold shortcut command", () => {
+        const onUpdatePaperAnnotation = jest.fn();
+        const originalExecCommand = document.execCommand;
+        const execCommandSpy = jest.fn(() => true);
+        document.execCommand = execCommandSpy;
+        renderList({
+            getPaperAnnotation: jest.fn(() => ({ notesMarkdown: "Seed note" })),
+            onUpdatePaperAnnotation,
+        });
+
+        fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
+        fireEvent.click(screen.getByRole("button", { name: "Seed note" }));
+        const richEditor = screen.getByRole("textbox", { name: "Paper notes editor" });
+
+        fireEvent.keyDown(richEditor, { key: "b", ctrlKey: true });
+        expect(execCommandSpy).toHaveBeenCalledWith("bold", false);
+        document.execCommand = originalExecCommand;
+    });
+
+    test("rich editor turns dash-space into bullet list", () => {
+        const onUpdatePaperAnnotation = jest.fn();
+        const originalExecCommand = document.execCommand;
+        const execCommandSpy = jest.fn(() => true);
+        document.execCommand = execCommandSpy;
+        renderList({
+            getPaperAnnotation: jest.fn(() => ({ notesMarkdown: "Seed note" })),
+            onUpdatePaperAnnotation,
+        });
+
+        fireEvent.click(screen.getByText("Neuro-Symbolic Program Synthesis"));
+        fireEvent.click(screen.getByRole("button", { name: "Seed note" }));
+        const richEditor = screen.getByRole("textbox", { name: "Paper notes editor" });
+        richEditor.innerHTML = "<p>-</p>";
+        const textNode = richEditor.querySelector("p").firstChild;
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.setStart(textNode, textNode.textContent.length);
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+
+        fireEvent.keyDown(richEditor, { key: " ", code: "Space" });
+        expect(execCommandSpy).toHaveBeenCalledWith("insertUnorderedList", false);
+        document.execCommand = originalExecCommand;
+    });
+
     test("uses desktop webview in desktop runtime with browser support", async () => {
         renderList({
             desktopConfig: { isDesktop: true, supportsInAppBrowser: true },
@@ -257,6 +307,173 @@ describe("PaperWorkbenchList recommendations", () => {
             expect(
                 screen.getByTestId("desktop-paper-webview").textContent
             ).toContain("https://example.org/paper")
+        );
+    });
+
+    test("to-read reader shows Mark as done and Close; mark ingests via callback", async () => {
+        const onMarkReadingItemDone = jest
+            .fn()
+            .mockResolvedValue({ paper_title: "Neuro-Symbolic Program Synthesis" });
+        renderList({
+            requestedReaderItem: {
+                readingItemId: "read-item-1",
+                title: "Neuro-Symbolic Program Synthesis",
+                annotationKey: "Neuro-Symbolic Program Synthesis",
+                url: "https://arxiv.org/abs/1111.00001",
+                authors: ["A. Author"],
+                publication_date: "2024",
+                venue: "ICLR",
+                status: "inbox",
+            },
+            requestedReaderNonce: 1,
+            readingItems: [
+                {
+                    id: "read-item-1",
+                    sourceType: "url",
+                    status: "inbox",
+                    title: "Neuro-Symbolic Program Synthesis",
+                    url: "https://arxiv.org/abs/1111.00001",
+                    authors: ["A. Author"],
+                    year: 2024,
+                    venue: "ICLR",
+                    topicHints: [],
+                    linkedPaperTitle: null,
+                    linkedThemeId: null,
+                    semanticScholarPaperId: null,
+                    quickNote: "",
+                    createdAt: "2024-01-01T00:00:00Z",
+                    updatedAt: "2024-01-01T00:00:00Z",
+                },
+            ],
+            onMarkReadingItemDone,
+        });
+
+        await waitFor(() =>
+            expect(screen.getByRole("dialog", { name: "Paper reader and notes" })).toBeTruthy()
+        );
+        expect(screen.getByRole("button", { name: "Mark as done" })).toBeTruthy();
+        expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+        expect(screen.queryByRole("button", { name: "Done" })).toBeNull();
+
+        fireEvent.click(screen.getByRole("button", { name: "Mark as done" }));
+
+        await waitFor(() => expect(onMarkReadingItemDone).toHaveBeenCalledTimes(1));
+        expect(onMarkReadingItemDone.mock.calls[0][0].id).toBe("read-item-1");
+    });
+
+    test("theme queue match by saved URL shows Mark as done when titles differ", async () => {
+        const onMarkReadingItemDone = jest.fn().mockResolvedValue({});
+        const sharedUrl = "https://arxiv.org/abs/2501.09999";
+        renderList({
+            selectedThemeId: "theme-neuro",
+            papers: [
+                {
+                    title: "Graph Title After Ingest",
+                    authors: ["A"],
+                    publication_date: "2024",
+                    abstract: "Abstract",
+                    topics: ["T"],
+                    url: "",
+                },
+            ],
+            readingItems: [
+                {
+                    id: "theme-queue-1",
+                    sourceType: "url",
+                    status: "inbox",
+                    linkedThemeId: "theme-neuro",
+                    linkedPaperTitle: null,
+                    title: "Different Scholar Title",
+                    url: sharedUrl,
+                    authors: [],
+                    year: 2024,
+                    venue: null,
+                    topicHints: [],
+                    semanticScholarPaperId: null,
+                    quickNote: "",
+                    createdAt: "2024-01-01T00:00:00Z",
+                    updatedAt: "2024-01-01T00:00:00Z",
+                },
+            ],
+            getPaperAnnotation: jest.fn(() => ({
+                notesMarkdown: "",
+                sourceUrl: sharedUrl,
+            })),
+            onMarkReadingItemDone,
+            onResolvePaperMetadata: jest.fn(),
+        });
+
+        fireEvent.click(screen.getByText("Graph Title After Ingest"));
+        fireEvent.click(
+            screen.getByRole("button", {
+                name: /No note yet\. Click to open the split paper reader popup\./i,
+            })
+        );
+
+        await waitFor(() =>
+            expect(screen.getByRole("button", { name: "Mark as done" })).toBeTruthy()
+        );
+        fireEvent.click(screen.getByRole("button", { name: "Mark as done" }));
+        await waitFor(() =>
+            expect(onMarkReadingItemDone).toHaveBeenCalledWith(
+                expect.objectContaining({ id: "theme-queue-1" })
+            )
+        );
+    });
+
+    test("migrates alias note to canonical title key for same paper", async () => {
+        const onUpdatePaperAnnotation = jest.fn();
+        renderList({
+            papers: [
+                {
+                    title: "Mesolimbic dopamine release conveys causal associations",
+                    authors: ["A. Author"],
+                    publication_date: "2024",
+                    abstract: "Abstract",
+                    topics: ["Reward"],
+                    url: "https://www.semanticscholar.org/paper/e0e4a9b215cade6d12c0c5579f996f3a4373c127",
+                    semanticScholarPaperId: "e0e4a9b215cade6d12c0c5579f996f3a4373c127",
+                },
+            ],
+            requestedPaperTitle: "Mesolimbic dopamine release conveys causal associations",
+            requestedPaperNonce: 1,
+            requestedReaderItem: {
+                readingItemId: "queue-1",
+                semanticScholarPaperId: "e0e4a9b215cade6d12c0c5579f996f3a4373c127",
+                title: "science.abq6740",
+                annotationKey: "science.abq6740",
+                url: "https://doi.org/10.1126/science.abq6740",
+                status: "inbox",
+            },
+            requestedReaderNonce: 1,
+            getPaperAnnotation: jest.fn((key) => {
+                if (key === "Mesolimbic dopamine release conveys causal associations") {
+                    return {
+                        paperTitle: key,
+                        notesMarkdown: "",
+                        sourceUrl:
+                            "https://www.semanticscholar.org/paper/e0e4a9b215cade6d12c0c5579f996f3a4373c127",
+                    };
+                }
+                if (key === "science.abq6740") {
+                    return {
+                        paperTitle: key,
+                        notesMarkdown: "- recovered alias note",
+                        sourceUrl: "https://doi.org/10.1126/science.abq6740",
+                    };
+                }
+                return null;
+            }),
+            onUpdatePaperAnnotation,
+        });
+
+        await waitFor(() =>
+            expect(onUpdatePaperAnnotation).toHaveBeenCalledWith(
+                "Mesolimbic dopamine release conveys causal associations",
+                expect.objectContaining({
+                    notesMarkdown: "- recovered alias note",
+                })
+            )
         );
     });
 
@@ -394,5 +611,293 @@ describe("PaperWorkbenchList recommendations", () => {
             )
         ).toBe("https://arxiv.org/abs/2501.00001");
         expect(onResolvePaperMetadata).toHaveBeenCalledTimes(1);
+    });
+
+    test("reader annotation key prefers selected paper title over transient external key", async () => {
+        const onUpdatePaperAnnotation = jest.fn();
+        renderList({
+            papers: [
+                {
+                    title: "Canonical Graph Paper",
+                    authors: ["A. Author"],
+                    publication_date: "2024",
+                    abstract: "Abstract",
+                    topics: ["T"],
+                    url: "https://graph.example/paper",
+                    semanticScholarPaperId: "paper-123",
+                },
+            ],
+            requestedPaperTitle: "Canonical Graph Paper",
+            requestedPaperNonce: 1,
+            requestedReaderItem: {
+                readingItemId: "read-1",
+                title: "Publisher Redirect",
+                annotationKey: "https://publisher.example/download?token=abc",
+                url: "https://publisher.example/pdf/123",
+                semanticScholarPaperId: "paper-123",
+                status: "reading",
+            },
+            requestedReaderNonce: 1,
+            readingItems: [
+                {
+                    id: "read-1",
+                    sourceType: "url",
+                    status: "reading",
+                    title: "Publisher Redirect",
+                    linkedPaperTitle: "Canonical Graph Paper",
+                    linkedThemeId: null,
+                    url: "https://publisher.example/pdf/123",
+                    authors: [],
+                    year: 2024,
+                    venue: null,
+                    topicHints: [],
+                    semanticScholarPaperId: "paper-123",
+                    quickNote: "",
+                    createdAt: "2024-01-01T00:00:00Z",
+                    updatedAt: "2024-01-01T00:00:00Z",
+                },
+            ],
+            getPaperAnnotation: jest.fn((key) => ({
+                paperTitle: key,
+                notesMarkdown: "",
+                sourceUrl: "",
+            })),
+            onUpdatePaperAnnotation,
+        });
+
+        await waitFor(() =>
+            expect(onUpdatePaperAnnotation).toHaveBeenCalledWith(
+                "Canonical Graph Paper",
+                expect.objectContaining({ sourceUrl: "https://publisher.example/pdf/123" })
+            )
+        );
+    });
+
+    test("mark as done blocks ambiguous pending matches instead of picking first item", async () => {
+        const onMarkReadingItemDone = jest.fn().mockResolvedValue({});
+        renderList({
+            papers: [
+                {
+                    title: "Canonical Graph Paper",
+                    authors: ["A. Author"],
+                    publication_date: "2024",
+                    abstract: "Abstract",
+                    topics: ["T"],
+                    url: "https://graph.example/paper",
+                },
+            ],
+            selectedThemeId: "theme-1",
+            getPaperAnnotation: jest.fn(() => ({
+                notesMarkdown: "",
+                sourceUrl: "https://resolved.example/paper",
+            })),
+            readingItems: [
+                {
+                    id: "candidate-1",
+                    sourceType: "url",
+                    status: "inbox",
+                    title: "Candidate A",
+                    linkedPaperTitle: null,
+                    linkedThemeId: "theme-1",
+                    url: "https://resolved.example/paper",
+                    authors: [],
+                    year: 2024,
+                    venue: null,
+                    topicHints: [],
+                    semanticScholarPaperId: null,
+                    quickNote: "",
+                    createdAt: "2024-01-01T00:00:00Z",
+                    updatedAt: "2024-01-01T00:00:00Z",
+                },
+                {
+                    id: "candidate-2",
+                    sourceType: "url",
+                    status: "inbox",
+                    title: "Candidate B",
+                    linkedPaperTitle: null,
+                    linkedThemeId: "theme-1",
+                    url: "https://resolved.example/paper",
+                    authors: [],
+                    year: 2024,
+                    venue: null,
+                    topicHints: [],
+                    semanticScholarPaperId: null,
+                    quickNote: "",
+                    createdAt: "2024-01-01T00:00:00Z",
+                    updatedAt: "2024-01-01T00:00:00Z",
+                },
+            ],
+            onResolvePaperMetadata: jest.fn(),
+            onMarkReadingItemDone,
+        });
+
+        fireEvent.click(screen.getByText("Canonical Graph Paper"));
+        fireEvent.click(
+            screen.getByRole("button", {
+                name: /No note yet\. Click to open the split paper reader popup\./i,
+            })
+        );
+
+        await waitFor(() =>
+            expect(screen.queryByRole("button", { name: "Mark as done" })).toBeNull()
+        );
+        expect(onMarkReadingItemDone).not.toHaveBeenCalled();
+    });
+
+    test("reader mark-as-done closes modal and drives shared ingesting tracker callbacks", async () => {
+        const onMarkReadingItemDone = jest.fn().mockResolvedValue({ paper_title: "Paper One" });
+        const onTrackIngestingItem = jest.fn();
+        const onUntrackIngestingItem = jest.fn();
+        renderList({
+            requestedReaderItem: {
+                readingItemId: "read-item-1",
+                title: "Paper One",
+                annotationKey: "Paper One",
+                url: "https://arxiv.org/abs/1111.00001",
+                status: "inbox",
+            },
+            requestedReaderNonce: 1,
+            readingItems: [
+                {
+                    id: "read-item-1",
+                    sourceType: "url",
+                    status: "inbox",
+                    title: "Paper One",
+                    linkedPaperTitle: null,
+                    linkedThemeId: null,
+                    url: "https://arxiv.org/abs/1111.00001",
+                    authors: [],
+                    year: 2024,
+                    venue: null,
+                    topicHints: [],
+                    semanticScholarPaperId: null,
+                    quickNote: "",
+                    createdAt: "2024-01-01T00:00:00Z",
+                    updatedAt: "2024-01-01T00:00:00Z",
+                },
+            ],
+            onMarkReadingItemDone,
+            onTrackIngestingItem,
+            onUntrackIngestingItem,
+        });
+
+        await waitFor(() =>
+            expect(screen.getByRole("dialog", { name: "Paper reader and notes" })).toBeTruthy()
+        );
+
+        fireEvent.click(screen.getByRole("button", { name: "Mark as done" }));
+
+        await waitFor(() => expect(onMarkReadingItemDone).toHaveBeenCalledTimes(1));
+        expect(onTrackIngestingItem).toHaveBeenCalledWith(
+            expect.objectContaining({ id: "read-item-1" })
+        );
+        expect(onUntrackIngestingItem).toHaveBeenCalledWith("read-item-1");
+        await waitFor(() =>
+            expect(screen.queryByRole("dialog", { name: "Paper reader and notes" })).toBeNull()
+        );
+    });
+
+    test("external reader for different semantic scholar id does not use currently selected paper key", async () => {
+        const onUpdatePaperAnnotation = jest.fn();
+        renderList({
+            papers: [
+                {
+                    title: "Selected Paper",
+                    authors: ["A. Author"],
+                    publication_date: "2024",
+                    abstract: "Abstract",
+                    topics: ["T"],
+                    url: "https://www.semanticscholar.org/paper/Selected/abcd1234",
+                    semanticScholarPaperId: "abcd1234",
+                },
+            ],
+            requestedPaperTitle: "Selected Paper",
+            requestedPaperNonce: 1,
+            requestedReaderItem: {
+                readingItemId: null,
+                title: "Other paper title",
+                annotationKey: "https://www.semanticscholar.org/paper/Other/efgh5678",
+                semanticScholarPaperId: "efgh5678",
+                url: "https://www.semanticscholar.org/paper/Other/efgh5678",
+                status: "reading",
+            },
+            requestedReaderNonce: 1,
+            getPaperAnnotation: jest.fn((key) => ({
+                paperTitle: key,
+                notesMarkdown: "",
+                sourceUrl: "",
+            })),
+            onUpdatePaperAnnotation,
+        });
+
+        await waitFor(() =>
+            expect(onUpdatePaperAnnotation).toHaveBeenCalledWith(
+                "efgh5678",
+                expect.objectContaining({
+                    sourceUrl: "https://www.semanticscholar.org/paper/Other/efgh5678",
+                })
+            )
+        );
+        expect(onUpdatePaperAnnotation).not.toHaveBeenCalledWith(
+            "Selected Paper",
+            expect.anything()
+        );
+    });
+
+    test("does not migrate alias notes into selected paper when external reader is a different paper", async () => {
+        const onUpdatePaperAnnotation = jest.fn();
+        renderList({
+            papers: [
+                {
+                    title: "Selected Paper",
+                    authors: ["A. Author"],
+                    publication_date: "2024",
+                    abstract: "Abstract",
+                    topics: ["T"],
+                    url: "https://www.semanticscholar.org/paper/Selected/abcd1234",
+                    semanticScholarPaperId: "abcd1234",
+                },
+            ],
+            requestedPaperTitle: "Selected Paper",
+            requestedPaperNonce: 1,
+            requestedReaderItem: {
+                readingItemId: null,
+                title: "Other paper title",
+                annotationKey: "https://www.semanticscholar.org/paper/Other/efgh5678",
+                semanticScholarPaperId: "efgh5678",
+                url: "https://www.semanticscholar.org/paper/Other/efgh5678",
+                status: "reading",
+            },
+            requestedReaderNonce: 1,
+            getPaperAnnotation: jest.fn((key) => {
+                if (key === "Selected Paper") {
+                    return { paperTitle: key, notesMarkdown: "", sourceUrl: "" };
+                }
+                if (key === "https://www.semanticscholar.org/paper/Other/efgh5678") {
+                    return {
+                        paperTitle: key,
+                        notesMarkdown: "- other paper notes",
+                        sourceUrl: "https://www.semanticscholar.org/paper/Other/efgh5678",
+                    };
+                }
+                return { paperTitle: key, notesMarkdown: "", sourceUrl: "" };
+            }),
+            onUpdatePaperAnnotation,
+        });
+
+        await waitFor(() =>
+            expect(onUpdatePaperAnnotation).toHaveBeenCalledWith(
+                "efgh5678",
+                expect.objectContaining({
+                    sourceUrl: "https://www.semanticscholar.org/paper/Other/efgh5678",
+                })
+            )
+        );
+        expect(onUpdatePaperAnnotation).not.toHaveBeenCalledWith(
+            "Selected Paper",
+            expect.objectContaining({
+                notesMarkdown: "- other paper notes",
+            })
+        );
     });
 });

@@ -1,0 +1,30 @@
+{
+  "status": "ok",
+  "source": {
+    "reading_items": 17,
+    "theme_notes": 2,
+    "annotations_v1": 26,
+    "annotations_v2": 26,
+    "annotation_archive": 0,
+    "graph_nodes": 865,
+    "graph_edges": 3023,
+    "payload_hash_workspace": "93a7e5b69eb5bf488518f029ca35bc406db6949aaf329904559ffe0c7b2c32e4",
+    "payload_hash_graph": "929139d89c1dcfe08c081cb6e7d283b6bbe85119ee3dc5f065d4982909a2d964"
+  },
+  "target": {
+    "reading_items": 17,
+    "theme_notes": 2,
+    "annotations_v1": 26,
+    "annotations_v2": 26,
+    "annotation_archive": 0,
+    "graph_nodes": 865,
+    "graph_edges": 3023,
+    "payload_hash_workspace": "93a7e5b69eb5bf488518f029ca35bc406db6949aaf329904559ffe0c7b2c32e4",
+    "payload_hash_graph": "929139d89c1dcfe08c081cb6e7d283b6bbe85119ee3dc5f065d4982909a2d964"
+  },
+  "projection_counts": {
+    "papers": 26,
+    "paper_links": 13,
+    "paper_notes": 26
+  }
+}

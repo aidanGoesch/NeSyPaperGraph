@@ -1,9 +1,14 @@
+import json
 import os
-from typing import TypedDict, List, Tuple
+import re
+import uuid
+from typing import TypedDict, List, Tuple, Any
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
+from services.graph_activation_service import GraphActivationService, ActivationConfig
+from services.llm_service import OpenAILLMClient
 
 load_dotenv()
 
@@ -13,6 +18,7 @@ class AgentState(TypedDict):
     answer: str
     search_results: list
     sources_used: list
+    answer_structured: dict
 
 class QuestionAgent:
     def __init__(self, graph_data=None, graph_obj=None):
@@ -25,6 +31,333 @@ class QuestionAgent:
         self.graph_obj = graph_obj
         self.conversation_history = []  # Store conversation context
         self.graph = self._build_graph()
+        self._embedding_client = None
+
+    def _default_structured_answer(self, answer_text: str, warning: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "segments": [{"text": str(answer_text or ""), "claim_id": None}],
+            "claims": [],
+            "warnings": [],
+        }
+        if warning:
+            payload["warnings"].append(str(warning))
+        return payload
+
+    @staticmethod
+    def _coerce_claim(claim: Any) -> dict[str, Any] | None:
+        if not isinstance(claim, dict):
+            return None
+        claim_id = str(claim.get("id") or f"claim_{uuid.uuid4().hex[:8]}")
+        claim_text = str(claim.get("text") or "").strip()
+        purpose = str(claim.get("purpose") or "").strip()
+        relation_to_question = str(claim.get("relation_to_question") or "").strip()
+        citations = claim.get("citations")
+        if (
+            not claim_text
+            or not purpose
+            or not relation_to_question
+            or not isinstance(citations, list)
+        ):
+            return None
+        normalized_citations = []
+        for citation in citations:
+            if not isinstance(citation, dict):
+                continue
+            paper_title = str(citation.get("paper_title") or "").strip()
+            excerpt = str(citation.get("excerpt") or "").strip()
+            if not paper_title or not excerpt:
+                continue
+            normalized_citations.append(
+                {
+                    "paper_title": paper_title,
+                    "excerpt": excerpt,
+                }
+            )
+        if not normalized_citations:
+            return None
+        return {
+            "id": claim_id,
+            "text": claim_text,
+            "purpose": purpose,
+            "relation_to_question": relation_to_question,
+            "citations": normalized_citations,
+        }
+
+    def _validate_structured_answer(self, payload: Any) -> tuple[bool, str]:
+        if not isinstance(payload, dict):
+            return False, "response is not a JSON object"
+        segments = payload.get("segments")
+        claims = payload.get("claims")
+        if not isinstance(segments, list) or len(segments) == 0:
+            return False, "segments must be a non-empty array"
+        if not isinstance(claims, list):
+            return False, "claims must be an array"
+
+        claim_ids = {str(c.get("id")) for c in claims if isinstance(c, dict) and c.get("id")}
+        for segment in segments:
+            if not isinstance(segment, dict):
+                return False, "segment entry is not an object"
+            text = str(segment.get("text") or "")
+            if not text.strip():
+                return False, "segment text cannot be empty"
+            claim_id = segment.get("claim_id")
+            if claim_id is not None and str(claim_id) not in claim_ids:
+                return False, "segment references unknown claim_id"
+
+        for claim in claims:
+            normalized = self._coerce_claim(claim)
+            if normalized is None:
+                return False, "each claim must contain text, purpose, relation_to_question, and at least one citation with paper_title + excerpt"
+        return True, ""
+
+    def _normalize_structured_answer(
+        self, payload: dict[str, Any], fallback_answer: str = ""
+    ) -> dict[str, Any]:
+        claims_raw = payload.get("claims") if isinstance(payload.get("claims"), list) else []
+        normalized_claims: list[dict[str, Any]] = []
+        for claim in claims_raw:
+            normalized = self._coerce_claim(claim)
+            if normalized:
+                normalized_claims.append(normalized)
+        claim_id_set = {claim["id"] for claim in normalized_claims}
+
+        segments_raw = payload.get("segments") if isinstance(payload.get("segments"), list) else []
+        normalized_segments: list[dict[str, Any]] = []
+        for segment in segments_raw:
+            if not isinstance(segment, dict):
+                continue
+            text = str(segment.get("text") or "")
+            if not text.strip():
+                continue
+            claim_id = segment.get("claim_id")
+            claim_id_value = str(claim_id) if claim_id is not None else None
+            if claim_id_value not in claim_id_set:
+                claim_id_value = None
+            normalized_segments.append({"text": text, "claim_id": claim_id_value})
+
+        if not normalized_segments:
+            normalized_segments = [{"text": fallback_answer or "", "claim_id": None}]
+
+        warnings = payload.get("warnings")
+        normalized_warnings = (
+            [str(item) for item in warnings if str(item).strip()]
+            if isinstance(warnings, list)
+            else []
+        )
+        return {
+            "segments": normalized_segments,
+            "claims": normalized_claims,
+            "warnings": normalized_warnings,
+        }
+
+    @staticmethod
+    def _structured_answer_to_text(answer_structured: dict[str, Any] | None) -> str:
+        if not isinstance(answer_structured, dict):
+            return ""
+        segments = answer_structured.get("segments")
+        if not isinstance(segments, list):
+            return ""
+        return "".join(str(segment.get("text") or "") for segment in segments if isinstance(segment, dict)).strip()
+
+    def _build_structured_answer(
+        self, question: str, context: str, base_system_message: str
+    ) -> tuple[str, dict[str, Any]]:
+        structured_instructions = (
+            f"{base_system_message.strip()}\n\n"
+            "Output requirements:\n"
+            "1) Respond with valid JSON only. No markdown code fences.\n"
+            "2) Keep the answer concise and directly answer the user question first.\n"
+            "3) JSON schema:\n"
+            "{\n"
+            '  "segments": [{"text": "string", "claim_id": "string|null"}],\n'
+            '  "claims": [{"id": "string", "text": "string", "purpose": "string", "relation_to_question": "string", "citations": [{"paper_title": "string", "excerpt": "string"}]}],\n'
+            '  "warnings": ["string"]\n'
+            "}\n"
+            "4) Every substantive claim must map to a claim_id segment and include at least one citation with a direct excerpt.\n"
+            "5) Every claim must include a clear purpose and an explicit explanation of how it helps answer the user's question.\n"
+            "6) In prose, follow each claim quickly with relevance to the user's question.\n"
+            "7) If context is insufficient, keep claims empty and place a short note in warnings."
+        )
+        user_prompt = f"Context: {context}\n\nQuestion: {question}"
+        initial_response = self.llm.invoke(
+            [
+                SystemMessage(content=structured_instructions),
+                HumanMessage(content=user_prompt),
+            ]
+        )
+        initial_content = str(initial_response.content or "").strip()
+
+        parsed_payload = None
+        parse_error = ""
+        try:
+            parsed_payload = json.loads(initial_content)
+        except Exception as exc:
+            parse_error = f"invalid JSON: {exc}"
+
+        is_valid = False
+        validation_error = parse_error
+        if parsed_payload is not None:
+            is_valid, validation_error = self._validate_structured_answer(parsed_payload)
+
+        if is_valid:
+            normalized = self._normalize_structured_answer(parsed_payload, fallback_answer="")
+            normalized = self._ensure_clickable_claims(normalized, context=context)
+            plain_answer = self._structured_answer_to_text(normalized)
+            return plain_answer, normalized
+
+        repair_prompt = (
+            "Repair the previous response into valid JSON with the required schema.\n"
+            f"Validation error: {validation_error or 'unknown'}\n"
+            "Do not add new facts not present in Context.\n"
+            "Return JSON only."
+        )
+        repaired_response = self.llm.invoke(
+            [
+                SystemMessage(content=structured_instructions),
+                HumanMessage(content=user_prompt),
+                HumanMessage(
+                    content=f"Previous invalid response:\n{initial_content}\n\n{repair_prompt}"
+                ),
+            ]
+        )
+        repaired_content = str(repaired_response.content or "").strip()
+
+        try:
+            repaired_payload = json.loads(repaired_content)
+            repaired_valid, repaired_error = self._validate_structured_answer(repaired_payload)
+            if repaired_valid:
+                normalized = self._normalize_structured_answer(repaired_payload, fallback_answer="")
+                normalized = self._ensure_clickable_claims(normalized, context=context)
+                plain_answer = self._structured_answer_to_text(normalized)
+                if validation_error:
+                    normalized["warnings"].append("Output required one repair pass before validation.")
+                return plain_answer, normalized
+            failure_reason = repaired_error
+        except Exception as exc:
+            failure_reason = f"repair JSON parse failed: {exc}"
+
+        fallback_text = initial_content or repaired_content or "I could not produce a structured answer."
+        warning = (
+            "Structured claim-citation validation failed after one repair pass; "
+            f"showing best-effort answer ({failure_reason})."
+        )
+        fallback_structured = self._default_structured_answer(fallback_text, warning=warning)
+        fallback_structured = self._ensure_clickable_claims(fallback_structured, context=context)
+        return fallback_text, fallback_structured
+
+    @staticmethod
+    def _extract_context_citations(context: str) -> list[dict[str, str]]:
+        if not context or "Paper summaries for grounding:" not in context:
+            return []
+        pattern = re.compile(
+            r"-\s*(?P<title>.+?)\s*\(activation=.*?\)\s*\n\s*Topics:.*?\n\s*Summary:\s*(?P<summary>.*?)(?=\n-\s|\Z)",
+            re.DOTALL,
+        )
+        citations: list[dict[str, str]] = []
+        for match in pattern.finditer(context):
+            title = str(match.group("title") or "").strip()
+            summary = " ".join(str(match.group("summary") or "").split()).strip()
+            if not title or not summary:
+                continue
+            citations.append(
+                {
+                    "paper_title": title,
+                    "excerpt": summary[:360],
+                }
+            )
+        return citations
+
+    def _ensure_clickable_claims(
+        self, answer_structured: dict[str, Any], context: str
+    ) -> dict[str, Any]:
+        if not isinstance(answer_structured, dict):
+            return answer_structured
+        existing_claims = answer_structured.get("claims")
+        if isinstance(existing_claims, list) and len(existing_claims) > 0:
+            return answer_structured
+
+        segments = answer_structured.get("segments")
+        if not isinstance(segments, list) or len(segments) == 0:
+            return answer_structured
+        first_text = ""
+        first_segment_index = 0
+        for idx, segment in enumerate(segments):
+            if not isinstance(segment, dict):
+                continue
+            text = str(segment.get("text") or "").strip()
+            if text:
+                first_text = text
+                first_segment_index = idx
+                break
+        if not first_text:
+            return answer_structured
+
+        citations = self._extract_context_citations(context)[:2]
+        if not citations:
+            return answer_structured
+
+        synthesized_claim_id = f"claim_{uuid.uuid4().hex[:8]}"
+        answer_structured["claims"] = [
+            {
+                "id": synthesized_claim_id,
+                "text": first_text[:240],
+                "purpose": "Provide the most grounded available statement from retrieved summaries.",
+                "relation_to_question": "This indicates what the current corpus can support for answering the user question.",
+                "citations": citations,
+            }
+        ]
+        segment_entry = segments[first_segment_index]
+        if isinstance(segment_entry, dict):
+            segment_entry["claim_id"] = synthesized_claim_id
+
+        warnings = answer_structured.get("warnings")
+        if not isinstance(warnings, list):
+            warnings = []
+            answer_structured["warnings"] = warnings
+        warnings.append(
+            "Auto-generated one claim citation mapping from grounding summaries."
+        )
+        return answer_structured
+
+    def _plan_activation_query(
+        self, current_question: str, conversation_history: list[dict[str, str]] | None = None
+    ) -> str:
+        history = conversation_history or []
+        recent = history[-4:]
+        history_lines: list[str] = []
+        for turn in recent:
+            q = str(turn.get("question", "") or "").strip()
+            a = str(turn.get("answer", "") or "").strip()
+            if q:
+                history_lines.append(f"Question: {q[:220]}")
+            if a:
+                history_lines.append(f"Answer gist: {a[:240]}")
+        history_block = "\n".join(history_lines) if history_lines else "(none)"
+        planner_prompt = (
+            "You are planning a graph retrieval query for paper-memory activation.\n"
+            "Return ONLY JSON: {\"retrieval_query\": \"...\"}\n"
+            "Prioritize the current question. Use conversation context only when needed to resolve references.\n"
+            "Focus query terms on entities, concepts, and relation intent likely to retrieve relevant papers."
+        )
+        user_prompt = (
+            f"Current question:\n{current_question}\n\n"
+            f"Recent conversation context:\n{history_block}\n"
+        )
+        try:
+            response = self.llm.invoke(
+                [
+                    SystemMessage(content=planner_prompt),
+                    HumanMessage(content=user_prompt),
+                ]
+            )
+            content = str(response.content or "").strip()
+            parsed = json.loads(content)
+            candidate = str(parsed.get("retrieval_query", "") or "").strip()
+            if candidate:
+                return candidate[:420]
+        except Exception as exc:
+            print(f"Activation query planner fallback: {exc}")
+        return str(current_question or "").strip()
     
     def _get_graph_object(self):
         """Get the actual graph object, either from memory or by loading from S3."""
@@ -926,39 +1259,44 @@ Topics (one per line):"""
         """Generate answer using OpenAI, grounded only in provided context"""
         question = state["question"]
         context = state.get("context", "")
+        state["answer_structured"] = self._default_structured_answer("")
         
         # Handle keyword search results differently - don't send to LLM
         if context.startswith("KEYWORD_RESULTS:") or context.startswith("SEMANTIC_RESULTS:") or context.startswith("SET_COVER_RESULTS:"):
             state["answer"] = "SEARCH_RESULTS"  # Special marker for frontend
+            state["answer_structured"] = self._default_structured_answer("SEARCH_RESULTS")
             return state
         
         # Check if this is a chain reasoning result (already synthesized by LLM)
         if "CHAIN_REASONING_RESULT:" in context:
             # Extract the synthesized explanation
-            state["answer"] = context.replace("CHAIN_REASONING_RESULT:\n\n", "")
+            chain_answer = context.replace("CHAIN_REASONING_RESULT:\n\n", "")
+            state["answer"] = chain_answer
+            state["answer_structured"] = self._default_structured_answer(
+                chain_answer,
+                warning="Chain reasoning answer was not emitted as structured claim-citation JSON.",
+            )
             return state
         
         # Check if context contains paper summaries (for grounding)
         if "Paper summaries for grounding:" in context:
-            system_message = """You are a helpful assistant that answers questions about research papers and academic topics. 
-            
-            IMPORTANT: You must base your response ONLY on the paper summaries provided in the context. Do not use any external knowledge or make assumptions beyond what is explicitly stated in the provided summaries. If the provided summaries don't contain enough information to answer the question, say so clearly.
-            
-            Write your response in flowing paragraphs, not bullet points."""
+            system_message = """You are a helpful assistant that answers questions about research papers and academic topics.
+
+IMPORTANT: You must base your response ONLY on the paper summaries provided in the context. Do not use external knowledge or assumptions beyond what is explicitly stated. If the summaries do not contain enough information, state that clearly."""
         elif "Path found:" in context:
             system_message = """You are a helpful assistant that answers questions about research papers and academic topics.
 
-            IMPORTANT: You must base your response ONLY on the information provided in the context. Explain the connection concisely in flowing paragraphs, not bullet points."""
+IMPORTANT: You must base your response ONLY on the information provided in the context."""
         else:
-            system_message = "You are a helpful assistant that answers questions about research papers and academic topics. Write your response in flowing paragraphs, not bullet points."
-        
-        messages = [
-            SystemMessage(content=system_message),
-            HumanMessage(content=f"Context: {context}\n\nQuestion: {question}")
-        ]
-        
-        response = self.llm.invoke(messages)
-        state["answer"] = response.content
+            system_message = "You are a helpful assistant that answers questions about research papers and academic topics."
+
+        answer_text, answer_structured = self._build_structured_answer(
+            question=question,
+            context=context,
+            base_system_message=system_message,
+        )
+        state["answer"] = answer_text
+        state["answer_structured"] = answer_structured
         
         return state
     
@@ -1042,6 +1380,207 @@ Topics (one per line):"""
         
         # If no path, return None (no diagram for chat)
         return None
+
+    def _get_embedding_client(self):
+        if self._embedding_client is not None:
+            return self._embedding_client
+        try:
+            self._embedding_client = OpenAILLMClient()
+        except Exception as exc:
+            print(f"Embedding client unavailable: {exc}")
+            self._embedding_client = False
+        return self._embedding_client
+
+    def _embed_text(self, text: str) -> list[float]:
+        client = self._get_embedding_client()
+        if not client:
+            return []
+        try:
+            return client.generate_embedding(text)
+        except Exception as exc:
+            print(f"Embedding generation failed: {exc}")
+            return []
+
+    def _build_grounding_context(
+        self, activated_nodes: list[dict[str, Any]], max_papers: int = 6
+    ) -> tuple[str, list[str]]:
+        paper_nodes = [
+            item for item in activated_nodes if item.get("node_type") == "paper"
+        ][: max(1, max_papers)]
+        if not paper_nodes or not self.graph_obj:
+            return "Insufficient paper context from current activation.", []
+
+        context_lines = ["Paper summaries for grounding:"]
+        sources: list[str] = []
+        for paper_activation in paper_nodes:
+            node_id = paper_activation.get("node_id")
+            node_data = self.graph_obj.graph.nodes.get(node_id, {})
+            paper = node_data.get("data")
+            if not paper:
+                continue
+            title = str(getattr(paper, "title", node_id) or node_id)
+            summary = str(getattr(paper, "summary", "") or "No summary available.")
+            topics = ", ".join(getattr(paper, "topics", []) or [])
+            score = paper_activation.get("score", 0.0)
+            context_lines.append(
+                f"- {title} (activation={score:.2f})\n  Topics: {topics}\n  Summary: {summary}"
+            )
+            sources.append(title)
+        if len(context_lines) == 1:
+            return "Insufficient paper context from current activation.", []
+        return "\n".join(context_lines), sources
+
+    @staticmethod
+    def _estimate_confidence(answer: str, activated_nodes: list[dict[str, Any]]) -> float:
+        paper_nodes = [
+            item for item in activated_nodes if item.get("node_type") == "paper"
+        ]
+        if not paper_nodes:
+            return 0.2
+        top_nodes = paper_nodes[:4]
+        avg_score = sum(float(item.get("score", 0.0)) for item in top_nodes) / max(
+            1, len(top_nodes)
+        )
+        coverage = min(1.0, len(paper_nodes) / 4.0)
+        confidence = 0.3 + (0.45 * avg_score) + (0.25 * coverage)
+
+        lower_answer = (answer or "").lower()
+        if any(
+            phrase in lower_answer
+            for phrase in [
+                "don't have enough",
+                "do not have enough",
+                "insufficient",
+                "not enough information",
+            ]
+        ):
+            confidence *= 0.6
+        return max(0.0, min(0.99, round(confidence, 4)))
+
+    @staticmethod
+    def _formulate_followup_query(
+        question: str, activated_nodes: list[dict[str, Any]]
+    ) -> str:
+        topic_focus = [
+            item.get("node_id")
+            for item in activated_nodes
+            if item.get("node_type") == "topic"
+        ][:3]
+        if not topic_focus:
+            return f"Expand retrieval context for: {question}"
+        return f"{question}\nFocus follow-up retrieval on: {', '.join(topic_focus)}"
+
+    async def answer_question_with_activation(
+        self,
+        question: str,
+        conversation_history: list[dict[str, str]] | None = None,
+        confidence_threshold: float = 0.62,
+        max_rounds: int = 2,
+        seed_count: int = 6,
+    ) -> dict[str, Any]:
+        if hasattr(self, "_last_path"):
+            delattr(self, "_last_path")
+
+        graph_obj = self._get_graph_object()
+        activation_service = GraphActivationService(graph_obj, self._embed_text)
+        running_history = list(conversation_history or self.conversation_history or [])
+        rounds: list[dict[str, Any]] = []
+        final_answer = ""
+        final_sources: list[str] = []
+        confidence = 0.0
+        query_used = question
+
+        for round_index in range(max(1, max_rounds)):
+            activation_query = self._plan_activation_query(
+                current_question=query_used,
+                conversation_history=running_history,
+            )
+            activation_payload = activation_service.activate(
+                question=query_used,
+                conversation_history=running_history,
+                retrieval_query_text=activation_query,
+                config=ActivationConfig(
+                    seed_count=max(1, seed_count),
+                    surfer_steps=90 + (round_index * 20),
+                    restart_probability=0.22,
+                    rng_seed=7 + round_index,
+                    max_activated_nodes=80,
+                ),
+            )
+            context, sources_used = self._build_grounding_context(
+                activation_payload.get("activated_nodes", [])
+            )
+            workflow_state = {
+                "question": question,
+                "context": context,
+                "answer": "",
+                "search_results": [],
+                "sources_used": list(sources_used),
+                "answer_structured": self._default_structured_answer(""),
+            }
+            workflow_state = self._generate_answer(workflow_state)
+            round_answer = str(workflow_state.get("answer", "") or "")
+            round_answer_structured = workflow_state.get("answer_structured") or self._default_structured_answer(round_answer)
+            round_confidence = self._estimate_confidence(
+                round_answer, activation_payload.get("activated_nodes", [])
+            )
+            rounds.append(
+                {
+                    "round_index": round_index + 1,
+                    "query_used": activation_query,
+                    "seed_nodes": activation_payload.get("seed_nodes", []),
+                    "activated_nodes": activation_payload.get("activated_nodes", []),
+                    "step_trace": activation_payload.get("step_trace", []),
+                    "sources_used": sources_used,
+                    "answer": round_answer,
+                    "answer_structured": round_answer_structured,
+                    "confidence": round_confidence,
+                }
+            )
+
+            final_answer = round_answer
+            final_sources = sources_used
+            confidence = round_confidence
+
+            if confidence >= confidence_threshold:
+                break
+
+            query_used = self._formulate_followup_query(
+                question, activation_payload.get("activated_nodes", [])
+            )
+            running_history.append({"question": query_used})
+
+        needs_more_context = confidence < confidence_threshold
+
+        self._last_state = {
+            "answer": final_answer,
+            "answer_structured": rounds[-1].get("answer_structured")
+            if rounds
+            else self._default_structured_answer(final_answer),
+            "search_results": [],
+            "sources_used": final_sources,
+            "activation_rounds": rounds,
+            "confidence": confidence,
+            "needs_more_context": needs_more_context,
+        }
+        self.conversation_history.append(
+            {
+                "question": question,
+                "answer": final_answer,
+                "type": "activation_chat",
+            }
+        )
+        if len(self.conversation_history) > 5:
+            self.conversation_history = self.conversation_history[-5:]
+
+        return {
+            "final_answer": final_answer,
+            "answer_structured": self._last_state["answer_structured"],
+            "confidence": confidence,
+            "needs_more_context": needs_more_context,
+            "rounds": rounds,
+            "sources_used": final_sources,
+        }
     
     async def answer_question(self, question: str) -> str:
         """Main method to answer a question"""
@@ -1055,7 +1594,8 @@ Topics (one per line):"""
             "context": "",
             "answer": "",
             "search_results": [],
-            "sources_used": []
+            "sources_used": [],
+            "answer_structured": self._default_structured_answer(""),
         }
         
         result = self.graph.invoke(initial_state)

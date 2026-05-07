@@ -1,11 +1,21 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ValidationError
 
-from models.workspace import WorkspaceState, default_workspace_state, utc_now_iso
+from models.workspace import (
+    WORKSPACE_SCHEMA_VERSION,
+    WorkspaceState,
+    default_workspace_state,
+    utc_now_iso,
+)
 from api.recommendations import (
     PaperRecommendationsRequest,
     ThemeRecommendationsRequest,
     build_theme_recommendations_payload,
+)
+from services.paper_identity_service import (
+    merge_workspace_annotations_v2,
+    project_v2_to_legacy_annotations,
+    upgrade_workspace_state,
 )
 from services.semantic_scholar_service import (
     SemanticScholarError,
@@ -79,29 +89,37 @@ def _canonicalize_workspace_state(
             )
         theme_notes.append(current_data)
 
-    previous_annotations = previous.paperAnnotations
-    annotations = {}
-    for paper_title, annotation in incoming.paperAnnotations.items():
-        current_data = annotation.model_dump()
-        canonical_title = current_data.get("paperTitle") or paper_title
-        current_data["paperTitle"] = canonical_title
-        previous_annotation = previous_annotations.get(canonical_title)
-        if previous_annotation is None:
-            current_data["updatedAt"] = now
-        else:
-            previous_data = previous_annotation.model_dump()
-            current_data["updatedAt"] = (
-                previous_data.get("updatedAt")
-                if _timestamps_equal(current_data, previous_data)
-                else now
-            )
-        annotations[canonical_title] = current_data
-
     return WorkspaceState(
+        workspaceSchemaVersion=WORKSPACE_SCHEMA_VERSION,
         readingItems=reading_items,
         themeNotes=theme_notes,
-        paperAnnotations=annotations,
+        paperAnnotations=incoming.paperAnnotations,
+        paperAnnotationsV2=incoming.paperAnnotationsV2,
+        annotationMigrationArchive=incoming.annotationMigrationArchive,
     )
+
+
+def _validate_v2_identity_integrity(state: WorkspaceState) -> None:
+    for identity_key, annotation in state.paperAnnotationsV2.items():
+        if identity_key != annotation.paperIdentityKey:
+            raise ValueError(
+                f"paperAnnotationsV2 key '{identity_key}' does not match "
+                f"annotation.paperIdentityKey '{annotation.paperIdentityKey}'"
+            )
+
+    alias_to_identity: dict[str, str] = {}
+    for identity_key, annotation in state.paperAnnotationsV2.items():
+        for alias in annotation.sourceUrlAliases:
+            normalized = (alias or "").strip()
+            if not normalized:
+                continue
+            existing = alias_to_identity.get(normalized)
+            if existing and existing != identity_key:
+                raise ValueError(
+                    f"sourceUrl alias collision detected for '{normalized}' "
+                    f"between '{existing}' and '{identity_key}'"
+                )
+            alias_to_identity[normalized] = identity_key
 
 
 @router.get("/workspace/state")
@@ -110,7 +128,11 @@ def get_workspace_state():
         state_payload = load_workspace_state()
         if state_payload is None:
             return default_workspace_state().model_dump()
-        return WorkspaceState.model_validate(state_payload).model_dump()
+        state = WorkspaceState.model_validate(state_payload)
+        upgraded_state = upgrade_workspace_state(state)
+        if upgraded_state.model_dump() != state.model_dump():
+            save_workspace_state(upgraded_state.model_dump())
+        return upgraded_state.model_dump()
     except ValidationError as exc:
         raise HTTPException(
             status_code=500,
@@ -127,16 +149,38 @@ def get_workspace_state():
 def put_workspace_state(state: WorkspaceState):
     try:
         existing_payload = load_workspace_state()
-        previous_state = (
+        previous_state_raw = (
             WorkspaceState.model_validate(existing_payload)
             if existing_payload
             else default_workspace_state()
         )
-        canonical_state = _canonicalize_workspace_state(state, previous_state)
+        previous_state = upgrade_workspace_state(previous_state_raw)
+        incoming_state = upgrade_workspace_state(state, project_legacy_annotations=False)
+        _validate_v2_identity_integrity(incoming_state)
+
+        merged_v2_annotations, merged_archive = merge_workspace_annotations_v2(
+            previous_state=previous_state,
+            incoming_state=incoming_state,
+            incoming_v2_annotations=state.paperAnnotationsV2,
+            now_iso=utc_now_iso(),
+        )
+        canonical_state = _canonicalize_workspace_state(
+            WorkspaceState(
+                workspaceSchemaVersion=WORKSPACE_SCHEMA_VERSION,
+                readingItems=incoming_state.readingItems,
+                themeNotes=incoming_state.themeNotes,
+                paperAnnotations=project_v2_to_legacy_annotations(merged_v2_annotations),
+                paperAnnotationsV2=merged_v2_annotations,
+                annotationMigrationArchive=merged_archive,
+            ),
+            previous_state,
+        )
         save_workspace_state(canonical_state.model_dump())
         return canonical_state.model_dump()
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:

@@ -35,6 +35,8 @@ signal.signal(signal.SIGINT, signal_handler)
 
 class SearchRequest(BaseModel):
     query: str
+    activation_mode: bool = False
+    conversation_history: list[dict[str, str]] = Field(default_factory=list)
 
 
 class TopicSearchRequest(BaseModel):
@@ -272,6 +274,27 @@ async def search(request: SearchRequest):
     print(f"Received search query: {request.query}")
     
     try:
+        if request.activation_mode and hasattr(
+            app.state.agent, "answer_question_with_activation"
+        ):
+            structured = await app.state.agent.answer_question_with_activation(
+                request.query,
+                conversation_history=request.conversation_history,
+            )
+            return {
+                "query": request.query,
+                "answer": structured.get("final_answer", ""),
+                "final_answer": structured.get("final_answer", ""),
+                "answer_structured": structured.get("answer_structured"),
+                "confidence": structured.get("confidence", 0.0),
+                "needs_more_context": structured.get("needs_more_context", False),
+                "rounds": structured.get("rounds", []),
+                "sources_used": structured.get("sources_used", []),
+                "mermaid": app.state.agent.get_mermaid_diagram(),
+                "path": getattr(app.state.agent, "_last_path", None),
+                "status": "success",
+            }
+
         answer = await app.state.agent.answer_question(request.query)
         
         # Get mermaid diagram for chat (may be None if no path)
@@ -281,12 +304,16 @@ async def search(request: SearchRequest):
         sources_used = []
         if hasattr(app.state.agent, '_last_state') and app.state.agent._last_state.get('sources_used'):
             sources_used = app.state.agent._last_state['sources_used']
+        answer_structured = None
+        if hasattr(app.state.agent, "_last_state"):
+            answer_structured = app.state.agent._last_state.get("answer_structured")
         
         # Check if this is a search results response
         if answer == "SEARCH_RESULTS" and hasattr(app.state.agent, '_last_state') and app.state.agent._last_state.get('search_results'):
             return {
                 "query": request.query,
                 "search_results": app.state.agent._last_state['search_results'],
+                "answer_structured": answer_structured,
                 "mermaid": chat_mermaid,
                 "path": getattr(app.state.agent, '_last_path', None),
                 "sources_used": sources_used,
@@ -296,6 +323,7 @@ async def search(request: SearchRequest):
         return {
             "query": request.query, 
             "answer": answer, 
+            "answer_structured": answer_structured,
             "mermaid": chat_mermaid,
             "path": getattr(app.state.agent, '_last_path', None),
             "sources_used": sources_used,

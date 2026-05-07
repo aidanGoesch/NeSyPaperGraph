@@ -14,6 +14,13 @@ import ThemeNotebook from "./ThemeNotebook";
 import ToReadInbox from "./ToReadInbox";
 import ThemeAssignmentModal from "./ThemeAssignmentModal";
 import { buildTopicClusters } from "../../utils/clustering";
+import {
+    normalizePaperTitle,
+    normalizeReaderLookupUrl,
+    normalizeSemanticScholarId,
+    resolvePaperAnnotationKey,
+    extractSemanticScholarPaperIdFromUrl,
+} from "./readerIdentity";
 
 const INITIAL_PAPER_RENDER_LIMIT = 150;
 const PAPER_RENDER_BATCH_SIZE = 150;
@@ -57,8 +64,76 @@ function normalizeToken(value) {
     return String(value || "").trim().toLowerCase();
 }
 
-function normalizePaperTitle(value) {
-    return String(value || "").trim().toLowerCase();
+function findMatchingGraphPaperForReadingItem(item, graphPapers = []) {
+    if (!item || !Array.isArray(graphPapers) || graphPapers.length === 0) return null;
+    const itemSs = normalizeSemanticScholarId(item.semanticScholarPaperId);
+    const itemUrl = normalizeReaderLookupUrl(item.url);
+    const itemTitle = normalizePaperTitle(item.linkedPaperTitle || item.title);
+
+    if (itemSs) {
+        const bySs = graphPapers.find((paper) => {
+            const paperSs = normalizeSemanticScholarId(
+                paper.semanticScholarPaperId || paper.paperId
+            );
+            return paperSs && paperSs === itemSs;
+        });
+        if (bySs) return bySs;
+    }
+
+    if (itemUrl) {
+        const byUrl = graphPapers.find((paper) => {
+            const paperUrl = normalizeReaderLookupUrl(paper.url);
+            return paperUrl && paperUrl === itemUrl;
+        });
+        if (byUrl) return byUrl;
+    }
+
+    if (itemTitle) {
+        const byTitle = graphPapers.find(
+            (paper) => normalizePaperTitle(paper.title) === itemTitle
+        );
+        if (byTitle) return byTitle;
+    }
+    return null;
+}
+
+function findPendingReadingItemMatch(item, readingItems = []) {
+    if (!item || !Array.isArray(readingItems) || readingItems.length === 0) return null;
+    const candidates = readingItems.filter((entry) => entry.status !== "done");
+    if (!candidates.length) return null;
+
+    if (item.id) {
+        const byId = candidates.find((entry) => entry.id === item.id);
+        if (byId) return byId;
+    }
+
+    const itemSs = normalizeSemanticScholarId(item.semanticScholarPaperId);
+    if (itemSs) {
+        const bySs = candidates.filter(
+            (entry) => normalizeSemanticScholarId(entry.semanticScholarPaperId) === itemSs
+        );
+        if (bySs.length === 1) return bySs[0];
+    }
+
+    const itemUrl = normalizeReaderLookupUrl(item.url);
+    if (itemUrl) {
+        const byUrl = candidates.filter(
+            (entry) => normalizeReaderLookupUrl(entry.url) === itemUrl
+        );
+        if (byUrl.length === 1) return byUrl[0];
+    }
+
+    const itemTitle = normalizePaperTitle(item.linkedPaperTitle || item.title);
+    if (itemTitle) {
+        const byTitle = candidates.filter((entry) => {
+            const linkedTitle = normalizePaperTitle(entry.linkedPaperTitle);
+            const plainTitle = normalizePaperTitle(entry.title);
+            return linkedTitle === itemTitle || plainTitle === itemTitle;
+        });
+        if (byTitle.length === 1) return byTitle[0];
+    }
+
+    return null;
 }
 
 function deriveReaderTitleFromUrl(url) {
@@ -205,7 +280,6 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
 
     const [selectedClusterId, setSelectedClusterId] = useState(null);
     const [selectedTreeNode, setSelectedTreeNode] = useState(null);
-    const [hasAutoSelectedCluster, setHasAutoSelectedCluster] = useState(false);
     const [selectedThemeId, setSelectedThemeId] = useState(null);
     const [requestedPaperTitle, setRequestedPaperTitle] = useState(null);
     const [requestedPaperNonce, setRequestedPaperNonce] = useState(0);
@@ -228,17 +302,11 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
     const [topicActionMode, setTopicActionMode] = useState("search");
     const [isResultOverlayOpen, setIsResultOverlayOpen] = useState(false);
     const [selectedSearchResult, setSelectedSearchResult] = useState(null);
+    const [ingestingItems, setIngestingItems] = useState([]);
     const workspaceRef = useRef(null);
     const topGridRef = useRef(null);
     const lastTopGridWidthRef = useRef(0);
     const topicSearchTimerRef = useRef(null);
-
-    useEffect(() => {
-        if (!hasAutoSelectedCluster && !selectedClusterId && clusters.length > 0) {
-            setSelectedClusterId(clusters[0].id);
-            setHasAutoSelectedCluster(true);
-        }
-    }, [clusters, hasAutoSelectedCluster, selectedClusterId]);
 
     const selectedCluster =
         clusters.find((cluster) => cluster.id === selectedClusterId) || null;
@@ -252,6 +320,19 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
         ? state.readingItems.filter((item) => item.linkedThemeId === selectedThemeId)
         : [];
     const hasActiveFilter = Boolean(selectedClusterId || selectedTreeNode);
+    const trackIngestingItem = useCallback((item) => {
+        if (!item?.id) return;
+        const label = item.title || item.url || "Untitled item";
+        setIngestingItems((previous) =>
+            previous.some((entry) => entry.id === item.id)
+                ? previous
+                : [...previous, { id: item.id, label }]
+        );
+    }, []);
+    const untrackIngestingItem = useCallback((itemId) => {
+        if (!itemId) return;
+        setIngestingItems((previous) => previous.filter((entry) => entry.id !== itemId));
+    }, []);
 
     useEffect(() => {
         setPaperRenderLimit(INITIAL_PAPER_RENDER_LIMIT);
@@ -723,23 +804,146 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
         }
     }, []);
 
+    const markReadingItemDone = useCallback(
+        async (item) => {
+            const result = await onIngestReadingItem(item);
+            if (result?.paper_title) {
+                const sourceAnnotationKey = resolvePaperAnnotationKey({
+                    paperTitle: item.linkedPaperTitle || item.title || null,
+                    semanticScholarPaperId: item.semanticScholarPaperId || null,
+                    url: item.url || null,
+                    fallbackTitle: item.title || null,
+                    fallbackKey: item.id || null,
+                });
+                const normalizedSsid = normalizeSemanticScholarId(item.semanticScholarPaperId);
+                const normalizedUrl = normalizeReaderLookupUrl(item.url || "");
+                const candidateSourceKeys = Array.from(
+                    new Set(
+                        [
+                            sourceAnnotationKey,
+                            normalizedSsid || null,
+                            normalizedSsid ? `ssid:${normalizedSsid}` : null,
+                            item.linkedPaperTitle || null,
+                            item.title || null,
+                            normalizedUrl || null,
+                            item.url || null,
+                            item.id || null,
+                        ].filter(Boolean)
+                    )
+                ).filter((key) => key !== result.paper_title);
+
+                const targetAnnotation = selectors.getPaperAnnotation(result.paper_title) || null;
+                const targetNotes = String(targetAnnotation?.notesMarkdown || "");
+                if (!targetNotes.trim()) {
+                    for (const candidateKey of candidateSourceKeys) {
+                        const candidateAnnotation =
+                            selectors.getPaperAnnotation(candidateKey) || null;
+                        const candidateNotes = String(candidateAnnotation?.notesMarkdown || "");
+                        if (!candidateNotes.trim()) continue;
+                        actions.upsertPaperAnnotation(result.paper_title, {
+                            notesMarkdown: candidateNotes,
+                            sourceUrl:
+                                targetAnnotation?.sourceUrl ||
+                                candidateAnnotation?.sourceUrl ||
+                                item.url ||
+                                "",
+                        });
+                        break;
+                    }
+                }
+            }
+            if (item.linkedThemeId && result?.paper_title) {
+                actions.linkPaperToTheme(item.linkedThemeId, result.paper_title);
+            }
+            actions.removeReadingItem(item.id);
+            if (result?.paper_title) {
+                openPaperInWorkbench(result.paper_title, { flash: true });
+            }
+            return result;
+        },
+        [actions, onIngestReadingItem, openPaperInWorkbench, selectors]
+    );
+
     const openReadingItemInPopup = useCallback((item) => {
         if (!item || item.status === "done") return;
-        const readerTitle = item.linkedPaperTitle || item.title || deriveReaderTitleFromUrl(item.url);
-        if (readerTitle) {
-            openPaperInWorkbench(readerTitle);
+        const matchedReadingItem = findPendingReadingItemMatch(item, state.readingItems);
+        const matchedGraphPaper = findMatchingGraphPaperForReadingItem(
+            item,
+            graphData?.papers || []
+        );
+        const canonicalReaderTitle =
+            matchedGraphPaper?.title ||
+            item.linkedPaperTitle ||
+            item.title ||
+            deriveReaderTitleFromUrl(item.url);
+        if (canonicalReaderTitle) {
+            openPaperInWorkbench(canonicalReaderTitle);
         }
         setRequestedReaderItem({
-            title: readerTitle || "Untitled paper",
-            annotationKey: readerTitle || item.url || null,
-            url: item.url || "",
-            authors: Array.isArray(item.authors) ? item.authors : [],
-            publication_date: item.year ? String(item.year) : "",
-            venue: item.venue || "",
+            readingItemId: item.id || matchedReadingItem?.id || null,
+            semanticScholarPaperId:
+                item.semanticScholarPaperId ||
+                matchedReadingItem?.semanticScholarPaperId ||
+                matchedGraphPaper?.semanticScholarPaperId ||
+                null,
+            title: canonicalReaderTitle || "Untitled paper",
+            annotationKey: resolvePaperAnnotationKey({
+                paperTitle: canonicalReaderTitle,
+                semanticScholarPaperId:
+                    item.semanticScholarPaperId ||
+                    matchedReadingItem?.semanticScholarPaperId ||
+                    matchedGraphPaper?.semanticScholarPaperId,
+                url: item.url || matchedReadingItem?.url || matchedGraphPaper?.url,
+                fallbackTitle: item.title,
+                fallbackKey: item.id,
+            }),
+            url: item.url || matchedReadingItem?.url || matchedGraphPaper?.url || "",
+            authors:
+                Array.isArray(item.authors) && item.authors.length > 0
+                    ? item.authors
+                    : matchedReadingItem?.authors?.length
+                      ? matchedReadingItem.authors
+                    : matchedGraphPaper?.authors || [],
+            publication_date:
+                item.year != null
+                    ? String(item.year)
+                    : matchedReadingItem?.year != null
+                      ? String(matchedReadingItem.year)
+                    : matchedGraphPaper?.publication_date || "",
+            venue: item.venue || matchedReadingItem?.venue || matchedGraphPaper?.venue || "",
             status: item.status || "inbox",
         });
         setRequestedReaderNonce((prev) => prev + 1);
-    }, [openPaperInWorkbench]);
+    }, [graphData?.papers, openPaperInWorkbench, state.readingItems]);
+
+    const selectThemePaper = useCallback(
+        (paperTitle) => {
+            if (!paperTitle) return;
+            const normalizedTarget = normalizePaperTitle(paperTitle);
+            const queueItem =
+                selectedThemeId &&
+                state.readingItems.find(
+                    (item) =>
+                        item.linkedThemeId === selectedThemeId &&
+                        item.status !== "done" &&
+                        (item.linkedPaperTitle === paperTitle ||
+                            item.title === paperTitle ||
+                            normalizePaperTitle(item.linkedPaperTitle || "") === normalizedTarget ||
+                            normalizePaperTitle(item.title || "") === normalizedTarget)
+                );
+            if (queueItem) {
+                openReadingItemInPopup(queueItem);
+                return;
+            }
+            openPaperInWorkbench(paperTitle);
+        },
+        [
+            openPaperInWorkbench,
+            openReadingItemInPopup,
+            selectedThemeId,
+            state.readingItems,
+        ]
+    );
 
     useEffect(() => {
         if (!desktopConfig?.isDesktop) return undefined;
@@ -748,14 +952,45 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
 
         const unsubscribe = bridge.onOpenInReaderUrl((url) => {
             if (!url || typeof url !== "string") return;
+            const activeReaderItem = requestedReaderItem;
+            const nextUrlNorm = normalizeReaderLookupUrl(url);
+            const nextUrlSs = normalizeSemanticScholarId(extractSemanticScholarPaperIdFromUrl(url));
+            const activeSs = normalizeSemanticScholarId(
+                activeReaderItem?.semanticScholarPaperId ||
+                    extractSemanticScholarPaperIdFromUrl(activeReaderItem?.url || "")
+            );
+            const activeUrlNorm = normalizeReaderLookupUrl(activeReaderItem?.url || "");
+            const shouldReuseActiveIdentity = Boolean(
+                activeReaderItem &&
+                    !(nextUrlSs && activeSs && nextUrlSs !== activeSs) &&
+                    (Boolean(activeReaderItem.readingItemId) ||
+                        (nextUrlSs && activeSs && nextUrlSs === activeSs) ||
+                        (!nextUrlSs && activeUrlNorm && activeUrlNorm === nextUrlNorm))
+            );
             openReadingItemInPopup({
-                title: deriveReaderTitleFromUrl(url),
-                linkedPaperTitle: null,
+                id: shouldReuseActiveIdentity ? activeReaderItem?.readingItemId || null : null,
+                title: shouldReuseActiveIdentity
+                    ? activeReaderItem?.title || deriveReaderTitleFromUrl(url)
+                    : deriveReaderTitleFromUrl(url),
+                linkedPaperTitle: shouldReuseActiveIdentity
+                    ? activeReaderItem?.linkedPaperTitle || activeReaderItem?.title || null
+                    : null,
                 url,
-                authors: [],
-                year: null,
-                venue: null,
-                status: "reading",
+                semanticScholarPaperId: shouldReuseActiveIdentity
+                    ? activeReaderItem?.semanticScholarPaperId || nextUrlSs || null
+                    : nextUrlSs || null,
+                authors:
+                    shouldReuseActiveIdentity && Array.isArray(activeReaderItem?.authors)
+                        ? activeReaderItem.authors
+                        : [],
+                year:
+                    shouldReuseActiveIdentity && activeReaderItem?.publication_date != null
+                        ? Number.parseInt(String(activeReaderItem.publication_date), 10) || null
+                        : null,
+                venue: shouldReuseActiveIdentity ? activeReaderItem?.venue || null : null,
+                status: shouldReuseActiveIdentity
+                    ? activeReaderItem?.status || "reading"
+                    : "reading",
             });
         });
 
@@ -764,7 +999,7 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                 unsubscribe();
             }
         };
-    }, [desktopConfig?.isDesktop, openReadingItemInPopup]);
+    }, [desktopConfig?.isDesktop, openReadingItemInPopup, requestedReaderItem]);
 
     return (
         <div
@@ -1095,6 +1330,11 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                         onRequestSimilarPapers={requestPaperRecommendations}
                         onAddRecommendationToReadingList={addRecommendationToReadingList}
                         onResolvePaperMetadata={onResolvePaperMetadata}
+                        readingItems={state.readingItems}
+                        onMarkReadingItemDone={markReadingItemDone}
+                        onTrackIngestingItem={trackIngestingItem}
+                        onUntrackIngestingItem={untrackIngestingItem}
+                        selectedThemeId={selectedThemeId}
                         desktopConfig={desktopConfig}
                     />
                     <div
@@ -1111,9 +1351,8 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                         onSelectTheme={setSelectedThemeId}
                         onUpsertTheme={actions.upsertThemeNote}
                         onReorderReadingItem={actions.reorderReadingItem}
-                        onSelectThemePaper={(paperTitle) => {
-                            openPaperInWorkbench(paperTitle);
-                        }}
+                        onSelectThemePaper={selectThemePaper}
+                        onOpenThemeQueueItem={openReadingItemInPopup}
                         onRequestThemeRecommendations={requestThemeRecommendations}
                         onAddRecommendationToReadingList={
                             addThemeRecommendationToReadingList
@@ -1138,17 +1377,11 @@ const TopicWorkspace = forwardRef(function TopicWorkspace({
                 onReorderReadingItem={actions.reorderReadingItem}
                 onFocusPaper={onFocusPaper}
                 onResolveReadingUrl={onResolveReadingUrl}
-                onMarkReadingItemDone={async (item) => {
-                    const result = await onIngestReadingItem(item);
-                    if (item.linkedThemeId && result?.paper_title) {
-                        actions.linkPaperToTheme(item.linkedThemeId, result.paper_title);
-                    }
-                    actions.removeReadingItem(item.id);
-                    if (result?.paper_title) {
-                        openPaperInWorkbench(result.paper_title, { flash: true });
-                    }
-                }}
+                onMarkReadingItemDone={markReadingItemDone}
                 onOpenReadingItem={openReadingItemInPopup}
+                ingestingItems={ingestingItems}
+                onTrackIngestingItem={trackIngestingItem}
+                onUntrackIngestingItem={untrackIngestingItem}
             />
             {isThemeModalOpen && themeModalPaperTitle && (
                 <ThemeAssignmentModal

@@ -197,3 +197,83 @@ def test_ingest_url_duplicate_returns_canonical_existing_title(client, monkeypat
     payload = response.json()
     assert payload["status"] == "skipped"
     assert payload["paper_title"] == "Attention Is All You Need (ArXiv mirror)"
+
+
+def test_ingest_url_response_echoes_identity_fields_for_debugging(client, monkeypatch):
+    import api.graph as graph_api
+
+    class _FakeSemanticScholarService:
+        def hydrate_paper(self, url: str, paper_id: str | None = None):
+            assert paper_id == "paper-123"
+            return {
+                "url": url,
+                "semanticScholarPaperId": "paper-123",
+                "title": "Attention Is All You Need",
+                "authors": ["Ashish Vaswani"],
+                "year": 2017,
+                "venue": "NeurIPS",
+                "abstract": "Transformer abstract",
+            }
+
+    class _FakeClient:
+        def generate_embeddings(self, texts):
+            return [[0.1, 0.2, 0.3] for _ in texts]
+
+        def generate_topic_synonyms(self, topics):
+            return {topic: [] for topic in topics}
+
+    class _FakeTopicExtractor:
+        def __init__(self, _client):
+            pass
+
+        def extract_topics(self, text, current_topics=None, max_chars=8000):
+            _ = text
+            _ = current_topics
+            _ = max_chars
+            return ["Attention Mechanisms"]
+
+    monkeypatch.setattr(graph_api, "SemanticScholarService", _FakeSemanticScholarService)
+    monkeypatch.setattr(graph_api, "OpenAILLMClient", _FakeClient)
+    monkeypatch.setattr(graph_api, "TopicExtractor", _FakeTopicExtractor)
+    monkeypatch.setattr("services.verification.verify_bipartite", lambda *args, **kwargs: True)
+    monkeypatch.setattr("services.verification.find_optimal_topic_merge", lambda *_: {})
+
+    client.app.state.graph = PaperGraph()
+    response = client.post(
+        "/api/graph/ingest-url",
+        json={
+            "url": "https://arxiv.org/abs/1706.03762",
+            "semanticScholarPaperId": "paper-123",
+            "title": "Input title",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ingest_identity"] == {
+        "request_url": "https://arxiv.org/abs/1706.03762",
+        "request_semantic_scholar_id": "paper-123",
+        "resolved_semantic_scholar_id": "paper-123",
+        "resolved_title": "Attention Is All You Need",
+    }
+
+
+def test_ingest_url_rejects_malformed_semantic_scholar_id_conflict(client, monkeypatch):
+    import api.graph as graph_api
+
+    class _FakeSemanticScholarService:
+        def hydrate_paper(self, url: str, paper_id: str | None = None):
+            _ = url
+            _ = paper_id
+            raise AssertionError("hydrate_paper should not be called for malformed conflicts")
+
+    monkeypatch.setattr(graph_api, "SemanticScholarService", _FakeSemanticScholarService)
+    response = client.post(
+        "/api/graph/ingest-url",
+        json={
+            "url": "https://www.semanticscholar.org/paper/Some-Title/paper-abc",
+            "semanticScholarPaperId": "paper-def",
+        },
+    )
+    assert response.status_code == 400
+    payload = response.json()
+    assert "semanticScholarPaperId conflicts with url identifier" in payload["detail"]

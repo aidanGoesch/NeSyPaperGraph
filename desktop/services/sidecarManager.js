@@ -20,6 +20,15 @@ function createHttpGetJson() {
     };
 }
 
+function parsePortFromUrl(url) {
+    try {
+        const parsed = new URL(url);
+        return Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+    } catch (_error) {
+        return null;
+    }
+}
+
 async function findOpenPort() {
     return new Promise((resolve, reject) => {
         const server = net.createServer();
@@ -42,6 +51,7 @@ function resolvePaths(app) {
         backendDir,
         packagedSidecar,
         backendVenvPython: path.join(backendDir, ".venv", "bin", "python"),
+        backendTestVenvPython: path.join(rootDir, ".venv-test", "bin", "python"),
         logFile: path.join(app.getPath("logs"), "sidecar.log"),
         dataDir: path.join(app.getPath("userData"), "data"),
     };
@@ -62,6 +72,20 @@ class SidecarManager {
 
     async start(extraEnv = {}) {
         this.lastExtraEnv = extraEnv;
+        const externalApiBaseUrl = String(
+            process.env.DESKTOP_EXTERNAL_API_BASE_URL || ""
+        ).trim();
+        if (externalApiBaseUrl) {
+            await this.waitForHealthyExternal(externalApiBaseUrl);
+            const diagnostics = await this.safeExternalDiagnostics(externalApiBaseUrl);
+            this.port = parsePortFromUrl(externalApiBaseUrl);
+            return {
+                apiBaseUrl: externalApiBaseUrl,
+                sidecarPort: this.port,
+                diagnostics,
+            };
+        }
+
         fs.mkdirSync(path.dirname(this.paths.logFile), { recursive: true });
         fs.mkdirSync(this.paths.dataDir, { recursive: true });
 
@@ -106,9 +130,11 @@ class SidecarManager {
             });
         }
 
-        const pythonExecutable = fs.existsSync(this.paths.backendVenvPython)
-            ? this.paths.backendVenvPython
-            : "python3";
+        const pythonExecutable = fs.existsSync(this.paths.backendTestVenvPython)
+            ? this.paths.backendTestVenvPython
+            : fs.existsSync(this.paths.backendVenvPython)
+              ? this.paths.backendVenvPython
+              : "python3";
         return spawn(
             pythonExecutable,
             ["-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", String(this.port)],
@@ -158,10 +184,39 @@ class SidecarManager {
         throw new Error("Timed out waiting for local backend health.");
     }
 
+    async waitForHealthyExternal(apiBaseUrl, timeoutMs = 45000) {
+        const healthUrl = `${apiBaseUrl.replace(/\/$/, "")}/health`;
+        const startedAt = Date.now();
+        while (Date.now() - startedAt < timeoutMs) {
+            try {
+                const payload = await this.getJson(healthUrl);
+                if (payload?.status === "ok") {
+                    return;
+                }
+            } catch (_error) {
+                // retry until timeout
+            }
+            await sleep(500);
+        }
+        throw new Error(
+            `Timed out waiting for external backend health at ${healthUrl}.`
+        );
+    }
+
     async safeDiagnostics() {
         try {
             return await this.getJson(
                 `http://127.0.0.1:${this.port}/api/runtime/diagnostics`
+            );
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    async safeExternalDiagnostics(apiBaseUrl) {
+        try {
+            return await this.getJson(
+                `${apiBaseUrl.replace(/\/$/, "")}/api/runtime/diagnostics`
             );
         } catch (_error) {
             return null;

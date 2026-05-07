@@ -19,6 +19,7 @@ export default function ThemeNotebook({
     onUpsertTheme,
     onReorderReadingItem,
     onSelectThemePaper,
+    onOpenThemeQueueItem,
     onRequestThemeRecommendations,
     onAddRecommendationToReadingList,
 }) {
@@ -169,7 +170,9 @@ export default function ThemeNotebook({
             </div>
             <div className="theme-selector-row">
                 <button
-                    className="new-theme-button"
+                    className={`new-theme-button ${
+                        activeDraft?.isNew ? "is-save-mode" : "is-plus-mode"
+                    } ${hasValidTitle ? "is-ready" : "is-waiting"}`}
                     type="button"
                     onClick={() => {
                         if (activeDraft?.isNew) {
@@ -186,8 +189,15 @@ export default function ThemeNotebook({
                         });
                     }}
                     disabled={Boolean(activeDraft?.isNew) && !hasValidTitle}
+                    aria-label={activeDraft?.isNew ? "Save new theme" : "Create new theme"}
                 >
-                    {activeDraft?.isNew ? "Save New Theme" : "New Theme"}
+                    <span className="new-theme-button-spacer" aria-hidden="true">
+                        Save Theme
+                    </span>
+                    <span className="new-theme-button-label new-theme-button-plus">+</span>
+                    <span className="new-theme-button-label new-theme-button-save">
+                        Save Theme
+                    </span>
                 </button>
                 <div className="theme-tabs theme-tabs-horizontal">
                     {themeNotes.map((note) => (
@@ -301,9 +311,14 @@ export default function ThemeNotebook({
                                     >
                                         :::
                                     </button>
-                                    <span className="theme-queue-title">
+                                    <button
+                                        type="button"
+                                        className="theme-queue-title-button"
+                                        onClick={() => onOpenThemeQueueItem?.(item)}
+                                        disabled={!onOpenThemeQueueItem || item.status === "done"}
+                                    >
                                         {item.title || "Untitled item"}
-                                    </span>
+                                    </button>
                                     {item.url && (
                                         <a
                                             href={item.url}

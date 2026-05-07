@@ -9,6 +9,14 @@ import boto3
 from botocore.exceptions import ClientError
 from services.graph_serialization import deserialize_graph, serialize_graph
 from services.observability import timed_block, log_memory
+from services.postgres_storage_service import (
+    DOCUMENT_KEY_GRAPH,
+    DOCUMENT_KEY_WORKSPACE,
+    load_document as load_postgres_document,
+    postgres_enabled,
+    save_document as save_postgres_document,
+    sync_workspace_projection,
+)
 
 GRAPH_KEY = "saved_graph.json"
 WORKSPACE_STATE_KEY = "workspace_state.json"
@@ -71,21 +79,30 @@ def _local_backups_dir() -> Path:
     return path
 
 
-def _workspace_counts(payload: dict | None) -> tuple[int, int, int]:
+def _workspace_counts(payload: dict | None) -> tuple[int, int, int, int]:
     data = payload or {}
     reading_items = data.get("readingItems")
     theme_notes = data.get("themeNotes")
-    annotations = data.get("paperAnnotations")
+    annotations_v1 = data.get("paperAnnotations")
+    annotations_v2 = data.get("paperAnnotationsV2")
     return (
         len(reading_items) if isinstance(reading_items, list) else 0,
         len(theme_notes) if isinstance(theme_notes, list) else 0,
-        len(annotations) if isinstance(annotations, dict) else 0,
+        len(annotations_v1) if isinstance(annotations_v1, dict) else 0,
+        len(annotations_v2) if isinstance(annotations_v2, dict) else 0,
     )
 
 
 def _is_effectively_empty_workspace(payload: dict | None) -> bool:
-    reading_count, theme_count, annotation_count = _workspace_counts(payload)
-    return reading_count == 0 and theme_count == 0 and annotation_count == 0
+    reading_count, theme_count, annotation_count_v1, annotation_count_v2 = _workspace_counts(
+        payload
+    )
+    return (
+        reading_count == 0
+        and theme_count == 0
+        and annotation_count_v1 == 0
+        and annotation_count_v2 == 0
+    )
 
 
 def _iter_backup_files(filename: str) -> list[Path]:
@@ -195,6 +212,16 @@ def _decode_json_blob(blob: bytes, content_encoding: str = "") -> dict:
 
 def load_graph():
     """Download and deserialize the graph from S3 or local JSON."""
+    if postgres_enabled():
+        payload = load_postgres_document(DOCUMENT_KEY_GRAPH)
+        if payload is None:
+            return None
+        return deserialize_graph(payload)
+    return load_graph_legacy()
+
+
+def load_graph_legacy():
+    """Download and deserialize the graph from S3 or local JSON."""
     if _s3_is_configured():
         bucket_name = os.environ["S3_BUCKET_NAME"]
         client = _s3_client()
@@ -223,6 +250,16 @@ def load_graph():
 def save_graph(graph):
     """Serialize and upload the graph to S3 or local JSON."""
     payload = serialize_graph(graph)
+    if postgres_enabled():
+        save_postgres_document(DOCUMENT_KEY_GRAPH, payload)
+        log_memory("postgres_graph_saved")
+        return
+    save_graph_legacy(graph)
+
+
+def save_graph_legacy(graph):
+    """Serialize and upload the graph to S3 or local JSON."""
+    payload = serialize_graph(graph)
     if _s3_is_configured():
         bucket_name = os.environ["S3_BUCKET_NAME"]
         client = _s3_client()
@@ -244,6 +281,13 @@ def save_graph(graph):
 
 
 def load_workspace_state():
+    """Load workspace state from S3 or local JSON."""
+    if postgres_enabled():
+        return load_postgres_document(DOCUMENT_KEY_WORKSPACE)
+    return load_workspace_state_legacy()
+
+
+def load_workspace_state_legacy():
     """Load workspace state from S3 or local JSON."""
     if _s3_is_configured():
         bucket_name = os.environ["S3_BUCKET_NAME"]
@@ -279,6 +323,15 @@ def save_workspace_state(state):
                 f"Existing counts={existing_counts}. Set ALLOW_EMPTY_WORKSPACE_OVERWRITE=true "
                 "to bypass."
             )
+    if postgres_enabled():
+        save_postgres_document(DOCUMENT_KEY_WORKSPACE, state)
+        sync_workspace_projection(state)
+        return
+    save_workspace_state_legacy(state)
+
+
+def save_workspace_state_legacy(state):
+    """Persist workspace state to S3 or local JSON."""
     if _s3_is_configured():
         bucket_name = os.environ["S3_BUCKET_NAME"]
         client = _s3_client()

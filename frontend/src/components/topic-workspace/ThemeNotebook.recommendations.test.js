@@ -18,6 +18,7 @@ function renderNotebook(overrides = {}) {
         onUpsertTheme: jest.fn((draft) => ({ ...draft, id: draft.id || "theme-1" })),
         onReorderReadingItem: jest.fn(),
         onSelectThemePaper: jest.fn(),
+        onOpenThemeQueueItem: jest.fn(),
         onRequestThemeRecommendations: jest.fn().mockResolvedValue([]),
         ...overrides,
     };
@@ -52,6 +53,37 @@ describe("ThemeNotebook recommendations", () => {
 
         await waitFor(() =>
             expect(screen.getByText(/Theme recommendations failed/i)).toBeTruthy()
+        );
+    });
+
+    test("queue title click notifies open handler", () => {
+        const onOpenThemeQueueItem = jest.fn();
+        renderNotebook({
+            themeQueueItems: [
+                {
+                    id: "queue-1",
+                    sourceType: "url",
+                    status: "inbox",
+                    linkedThemeId: "theme-1",
+                    linkedPaperTitle: null,
+                    title: "Queued Paper Alpha",
+                    url: "https://example.org/p",
+                    authors: [],
+                    year: 2024,
+                    venue: null,
+                    topicHints: [],
+                    semanticScholarPaperId: null,
+                    quickNote: "",
+                    createdAt: "2024-01-01T00:00:00Z",
+                    updatedAt: "2024-01-01T00:00:00Z",
+                },
+            ],
+            onOpenThemeQueueItem,
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Queued Paper Alpha" }));
+        expect(onOpenThemeQueueItem).toHaveBeenCalledWith(
+            expect.objectContaining({ id: "queue-1" })
         );
     });
 

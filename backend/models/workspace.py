@@ -3,6 +3,8 @@ from typing import Dict, List, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+WORKSPACE_SCHEMA_VERSION = 2
+
 
 class ThemeSections(BaseModel):
     notes: str = ""
@@ -53,10 +55,48 @@ class PaperAnnotation(BaseModel):
     updatedAt: str | None = None
 
 
+class PaperAnnotationV2(BaseModel):
+    paperIdentityKey: str
+    paperTitle: str = ""
+    semanticScholarPaperId: str | None = None
+    normalizedTitle: str = ""
+    canonicalSourceUrl: str = ""
+    sourceUrlAliases: List[str] = Field(default_factory=list)
+    notesMarkdown: str = ""
+    topicLinks: List[str] = Field(default_factory=list)
+    status: str = "unread"
+    migratedFromKeys: List[str] = Field(default_factory=list)
+    selectedPrimarySource: str | None = None
+    createdAt: str | None = None
+    updatedAt: str | None = None
+
+    @field_validator("paperIdentityKey")
+    @classmethod
+    def validate_paper_identity_key(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("paperIdentityKey must be non-empty")
+        return cleaned
+
+
+class AnnotationMigrationArchiveEntry(BaseModel):
+    archiveId: str
+    paperIdentityKey: str
+    originalKey: str
+    archivedAt: str
+    reason: str = "migration_conflict_non_primary"
+    annotation: PaperAnnotation
+
+
 class WorkspaceState(BaseModel):
     readingItems: List[ReadingItem] = Field(default_factory=list)
     themeNotes: List[ThemeNote] = Field(default_factory=list)
+    workspaceSchemaVersion: int = WORKSPACE_SCHEMA_VERSION
     paperAnnotations: Dict[str, PaperAnnotation] = Field(default_factory=dict)
+    paperAnnotationsV2: Dict[str, PaperAnnotationV2] = Field(default_factory=dict)
+    annotationMigrationArchive: List[AnnotationMigrationArchiveEntry] = Field(
+        default_factory=list
+    )
 
 
 def utc_now_iso() -> str:
@@ -64,4 +104,4 @@ def utc_now_iso() -> str:
 
 
 def default_workspace_state() -> WorkspaceState:
-    return WorkspaceState()
+    return WorkspaceState(workspaceSchemaVersion=WORKSPACE_SCHEMA_VERSION)
